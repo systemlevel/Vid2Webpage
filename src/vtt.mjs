@@ -19,6 +19,11 @@ function timestampMs(match, hour, minute, second, millisecond) {
   );
 }
 
+function validClock(match) {
+  return Number(match[2]) <= 59 && Number(match[3]) <= 59 &&
+    Number(match[6]) <= 59 && Number(match[7]) <= 59;
+}
+
 function cleanText(lines) {
   return lines
     .join(" ")
@@ -48,6 +53,7 @@ function parseBlocks(text) {
 
     const timing = TIMING.exec(block[timingIndex].trim());
     if (!timing) continue;
+    if (!validClock(timing)) continue;
 
     const startMs = timestampMs(timing, timing[1], timing[2], timing[3], timing[4]);
     const endMs = timestampMs(timing, timing[5], timing[6], timing[7], timing[8]);
