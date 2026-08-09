@@ -188,8 +188,9 @@ a matching source manifest resumes and skips validated artifacts. An existing
 output without a `v2w` manifest, or with a different source fingerprint, is
 rejected rather than overwritten or mixed.
 
-`index.html` is written last. Its presence therefore never serves as proof of
-completion until the manifest also records a complete run.
+`index.html` is written after every page asset. The manifest's final atomic
+update to `status: "complete"` is the last write and is the only completion
+marker; the presence of `index.html` alone never proves a complete run.
 
 ## Failure Behavior
 
