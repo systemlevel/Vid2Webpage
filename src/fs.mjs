@@ -1,18 +1,23 @@
-import { copyFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { copyFile, open, rename, rm, stat, writeFile } from "node:fs/promises";
 
 function temporaryPath(filePath) {
-  return `${filePath}.part-${process.pid}`;
+  return `${filePath}.part-${process.pid}-${randomUUID()}`;
 }
 
 async function publishAtomically(filePath, publish) {
   const temporary = temporaryPath(filePath);
+  let created = false;
   let published = false;
   try {
+    const handle = await open(temporary, "wx");
+    created = true;
+    await handle.close();
     await publish(temporary);
     await rename(temporary, filePath);
     published = true;
   } finally {
-    if (!published) await rm(temporary, { force: true });
+    if (created && !published) await rm(temporary, { force: true });
   }
 }
 
