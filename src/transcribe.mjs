@@ -1,4 +1,5 @@
-import { readFile, rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { TranscriptQualityError, TranscriptionError } from "./errors.mjs";
@@ -9,6 +10,7 @@ import { parseVtt } from "./vtt.mjs";
 
 const MLX_MODELS = {
   "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
+  "mlx-community/whisper-large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
 };
 
 const DEFAULT_VOCAB_PATH = new URL("./vocab.txt", import.meta.url);
@@ -28,9 +30,13 @@ export function buildMlxArgs({
   model,
   vocabPrompt,
 }) {
+  const resolvedModel = MLX_MODELS[model];
+  if (!resolvedModel) {
+    throw new TranscriptionError(`Unsupported MLX model: ${model}`);
+  }
   const args = [
     audioPath,
-    "--model", MLX_MODELS[model] ?? model,
+    "--model", resolvedModel,
     "--output-dir", cacheDir,
     "--output-name", outputName,
     "--output-format", "vtt",
@@ -39,21 +45,43 @@ export function buildMlxArgs({
   return args;
 }
 
-export function buildWhisperCppArgs({ wavPath, cacheDir, modelPath, tools }) {
+export function buildWhisperCppArgs({
+  wavPath,
+  cacheDir,
+  modelPath,
+  outputName = "transcript-cpp",
+  tools,
+}) {
   return [
     "-m", modelPath ?? tools?.whisperModelPath,
     "-f", wavPath,
     "-ovtt",
-    "-of", path.join(cacheDir, "transcript-cpp"),
+    "-of", path.join(cacheDir, outputName),
     "-np",
   ];
 }
 
 async function inspectVtt(filePath) {
-  if (!(await isNonEmptyFile(filePath))) return null;
-  const cues = parseVtt(await readFile(filePath, "utf8"));
-  if (!cues.some((cue) => cue.text.trim())) return null;
-  return { cues, quality: inspectTranscript(cues) };
+  let contents;
+  try {
+    contents = await readFile(filePath, "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return { usable: false, reason: `missing VTT: ${filePath}` };
+    }
+    return { usable: false, reason: `unreadable VTT ${filePath}: ${error.message}` };
+  }
+  if (contents.length === 0) {
+    return { usable: false, reason: `empty VTT: ${filePath}` };
+  }
+  const cues = parseVtt(contents);
+  if (!cues.some((cue) => cue.text.trim())) {
+    return {
+      usable: false,
+      reason: `VTT has no parseable nonempty cues: ${filePath}`,
+    };
+  }
+  return { usable: true, cues, quality: inspectTranscript(cues) };
 }
 
 async function runSafely(run, command, args) {
@@ -85,33 +113,35 @@ export async function transcribeTimed({
   vocabPrompt = "",
 }) {
   const canonicalPath = path.join(cacheDir, "transcript.vtt");
+  const invocationId = randomUUID();
   const diagnostics = [];
   let firstRunnerError = null;
 
   if (tools.mlx) {
-    const firstPath = path.join(cacheDir, "transcript-first.vtt");
-    await rm(firstPath, { force: true });
+    const firstOutputName = `transcript-first-${invocationId}`;
+    const firstPath = path.join(cacheDir, firstOutputName + ".vtt");
     const firstOutcome = await runSafely(
       run,
       "mlx_whisper",
       buildMlxArgs({
         audioPath,
         cacheDir,
-        outputName: "transcript-first",
+        outputName: firstOutputName,
         model,
         vocabPrompt,
       })
     );
     firstRunnerError = firstOutcome.error;
-    const first = await inspectVtt(firstPath);
+    const firstSucceeded = firstOutcome.result?.code === 0 && !firstOutcome.error;
+    const first = firstSucceeded ? await inspectVtt(firstPath) : null;
 
-    if (first?.quality.clean) {
+    if (first?.usable && first.quality.clean) {
       return publishCandidate(firstPath, canonicalPath, "mlx-whisper", first);
     }
 
-    if (first) {
-      const retryPath = path.join(cacheDir, "transcript-retry.vtt");
-      await rm(retryPath, { force: true });
+    if (first?.usable) {
+      const retryOutputName = `transcript-retry-${invocationId}`;
+      const retryPath = path.join(cacheDir, retryOutputName + ".vtt");
       const retryOutcome = await runSafely(
         run,
         "mlx_whisper",
@@ -119,7 +149,7 @@ export async function transcribeTimed({
           ...buildMlxArgs({
             audioPath,
             cacheDir,
-            outputName: "transcript-retry",
+            outputName: retryOutputName,
             model,
             vocabPrompt,
           }),
@@ -127,27 +157,36 @@ export async function transcribeTimed({
         ]
       );
       if (!firstRunnerError) firstRunnerError = retryOutcome.error;
-      const retry = await inspectVtt(retryPath);
-      if (retry?.quality.clean) {
+      const retrySucceeded = retryOutcome.result?.code === 0 && !retryOutcome.error;
+      const retry = retrySucceeded ? await inspectVtt(retryPath) : null;
+      if (retry?.usable && retry.quality.clean) {
         return publishCandidate(retryPath, canonicalPath, "mlx-whisper", retry);
       }
-      if (retry) {
+      if (retry?.usable) {
         throw new TranscriptQualityError(
           "MLX transcript quality failed: first=" + JSON.stringify(first.quality) +
             "; retry=" + JSON.stringify(retry.quality)
         );
       }
-      diagnostics.push(commandDiagnostic("MLX retry", retryOutcome));
+      diagnostics.push(
+        "MLX first transcript was degraded: " + JSON.stringify(first.quality)
+      );
+      diagnostics.push(
+        retry ? `MLX retry ${retry.reason}` : commandDiagnostic("MLX retry", retryOutcome)
+      );
     }
 
-    diagnostics.push(commandDiagnostic("MLX", firstOutcome));
+    if (!firstSucceeded) {
+      diagnostics.push(commandDiagnostic("MLX", firstOutcome));
+    } else if (!first.usable) {
+      diagnostics.push(`MLX ${first.reason}`);
+    }
   }
 
   if (tools.whisperCpp) {
-    const wavPath = path.join(cacheDir, "transcript.wav");
-    const cppPath = path.join(cacheDir, "transcript-cpp.vtt");
-    await rm(wavPath, { force: true });
-    await rm(cppPath, { force: true });
+    const wavPath = path.join(cacheDir, `transcript-${invocationId}.wav`);
+    const cppOutputName = `transcript-cpp-${invocationId}`;
+    const cppPath = path.join(cacheDir, cppOutputName + ".vtt");
 
     const ffmpegOutcome = await runSafely(run, "ffmpeg", [
       "-y", "-i", audioPath,
@@ -175,16 +214,20 @@ export async function transcribeTimed({
         wavPath,
         cacheDir,
         modelPath: tools.whisperModelPath,
+        outputName: cppOutputName,
       })
     );
-    const cpp = await inspectVtt(cppPath);
-    if (cpp?.quality.clean) {
+    const cppSucceeded = cppOutcome.result?.code === 0 && !cppOutcome.error;
+    const cpp = cppSucceeded ? await inspectVtt(cppPath) : null;
+    if (cpp?.usable && cpp.quality.clean) {
       return publishCandidate(cppPath, canonicalPath, "whisper-cpp", cpp);
     }
     diagnostics.push(
-      cpp
+      cpp?.usable
         ? "whisper.cpp transcript was degraded: " + JSON.stringify(cpp.quality)
-        : commandDiagnostic("whisper.cpp", cppOutcome)
+        : cpp
+          ? `whisper.cpp ${cpp.reason}`
+          : commandDiagnostic("whisper.cpp", cppOutcome)
     );
     throw new TranscriptionError(diagnostics.join("; "), {
       cause: cppOutcome.error ?? firstRunnerError,
