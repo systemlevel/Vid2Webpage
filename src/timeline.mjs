@@ -54,36 +54,61 @@ export function buildCapturePlan({ segments, captionCues, sceneTimes, frameTimes
       reason: "scene",
     })),
   ];
-  const capturesByFrameAndSegment = new Map();
+  const capturesByTimestamp = new Map();
 
   for (const candidate of candidates) {
     const timestampMs = decodedFrameAtOrAfter(candidate.requestedMs, frameTimes);
     const segmentIndex = candidate.segmentIndex ?? owningSegment(timestampMs, segments);
-    const key = `${timestampMs}:${segmentIndex}`;
-    const existing = capturesByFrameAndSegment.get(key);
-    if (existing) {
-      if (!existing.reasons.includes(candidate.reason)) {
-        if (reasonOrder.get(candidate.reason) < reasonOrder.get(existing.reasons[0])) {
-          existing.requestedMs = candidate.requestedMs;
-        }
-        existing.reasons.push(candidate.reason);
-      }
-      continue;
+    const priority = reasonOrder.get(candidate.reason);
+    let capture = capturesByTimestamp.get(timestampMs);
+    if (!capture) {
+      capture = {
+        requestedMs: candidate.requestedMs,
+        requestedPriority: priority,
+        timestampMs,
+        reasons: [],
+        associationsBySegment: new Map(),
+      };
+      capturesByTimestamp.set(timestampMs, capture);
     }
-    capturesByFrameAndSegment.set(key, {
-      requestedMs: candidate.requestedMs,
-      timestampMs,
-      reasons: [candidate.reason],
-      segmentIndex,
-    });
+    if (priority < capture.requestedPriority) {
+      capture.requestedMs = candidate.requestedMs;
+      capture.requestedPriority = priority;
+    }
+    if (!capture.reasons.includes(candidate.reason)) capture.reasons.push(candidate.reason);
+
+    let association = capture.associationsBySegment.get(segmentIndex);
+    if (!association) {
+      association = {
+        segmentIndex,
+        requestedMs: candidate.requestedMs,
+        requestedPriority: priority,
+        reasons: [],
+      };
+      capture.associationsBySegment.set(segmentIndex, association);
+    }
+    if (priority < association.requestedPriority) {
+      association.requestedMs = candidate.requestedMs;
+      association.requestedPriority = priority;
+    }
+    if (!association.reasons.includes(candidate.reason)) association.reasons.push(candidate.reason);
   }
 
-  return [...capturesByFrameAndSegment.values()]
-    .sort((a, b) => a.timestampMs - b.timestampMs || a.segmentIndex - b.segmentIndex)
+  return [...capturesByTimestamp.values()]
+    .sort((a, b) => a.timestampMs - b.timestampMs)
     .map((capture) => {
       capture.reasons.sort((a, b) => reasonOrder.get(a) - reasonOrder.get(b));
       return {
-        ...capture,
+        requestedMs: capture.requestedMs,
+        timestampMs: capture.timestampMs,
+        reasons: capture.reasons,
+        associations: [...capture.associationsBySegment.values()]
+          .sort((a, b) => a.segmentIndex - b.segmentIndex)
+          .map(({ segmentIndex, requestedMs, reasons }) => ({
+            segmentIndex,
+            requestedMs,
+            reasons: reasons.sort((a, b) => reasonOrder.get(a) - reasonOrder.get(b)),
+          })),
         filename: `${String(capture.timestampMs).padStart(9, "0")}-${capture.reasons[0]}.jpg`,
       };
     });

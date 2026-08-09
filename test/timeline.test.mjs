@@ -18,14 +18,30 @@ test("keeps every segment midpoint and adds caption and scene captures", () => {
     durationMs: 16000,
   });
   assert.deepEqual(
-    plan.map(({ timestampMs, reasons, segmentIndex }) => ({
-      timestampMs, reasons, segmentIndex,
+    plan.map(({ timestampMs, reasons, associations }) => ({
+      timestampMs, reasons, associations,
     })),
     [
-      { timestampMs: 2000, reasons: ["caption"], segmentIndex: 0 },
-      { timestampMs: 4000, reasons: ["primary"], segmentIndex: 0 },
-      { timestampMs: 5250, reasons: ["scene"], segmentIndex: 0 },
-      { timestampMs: 12000, reasons: ["primary"], segmentIndex: 1 },
+      {
+        timestampMs: 2000,
+        reasons: ["caption"],
+        associations: [{ segmentIndex: 0, requestedMs: 2000, reasons: ["caption"] }],
+      },
+      {
+        timestampMs: 4000,
+        reasons: ["primary"],
+        associations: [{ segmentIndex: 0, requestedMs: 4000, reasons: ["primary"] }],
+      },
+      {
+        timestampMs: 5250,
+        reasons: ["scene"],
+        associations: [{ segmentIndex: 0, requestedMs: 5250, reasons: ["scene"] }],
+      },
+      {
+        timestampMs: 12000,
+        reasons: ["primary"],
+        associations: [{ segmentIndex: 1, requestedMs: 12000, reasons: ["primary"] }],
+      },
     ]
   );
 });
@@ -40,7 +56,13 @@ test("coalesces only candidates on the same decoded frame", () => {
   });
   const atFour = plan.find((capture) => capture.timestampMs === 4000);
   assert.deepEqual(atFour.reasons, ["primary", "caption"]);
+  assert.deepEqual(atFour.associations, [{
+    segmentIndex: 0,
+    requestedMs: 4000,
+    reasons: ["primary", "caption"],
+  }]);
   assert.equal(atFour.filename, "000004000-primary.jpg");
+  assert.equal("segmentIndex" in atFour, false);
 });
 
 test("attaches gap captures to the nearest transcript segment", () => {
@@ -54,10 +76,13 @@ test("attaches gap captures to the nearest transcript segment", () => {
     frameTimes: [0, 1000, 4000, 7000],
     durationMs: 8000,
   });
-  assert.equal(plan.find((capture) => capture.reasons.includes("scene")).segmentIndex, 0);
+  assert.deepEqual(
+    plan.find((capture) => capture.reasons.includes("scene")).associations,
+    [{ segmentIndex: 0, requestedMs: 4000, reasons: ["scene"] }]
+  );
 });
 
-test("preserves each segment primary when midpoints resolve to one decoded frame", () => {
+test("uses one physical capture while preserving segment primaries on a shared frame", () => {
   const plan = buildCapturePlan({
     segments: [
       { startMs: 0, endMs: 1000, text: "one" },
@@ -68,25 +93,17 @@ test("preserves each segment primary when midpoints resolve to one decoded frame
     frameTimes: [0, 2000],
     durationMs: 2001,
   });
-  assert.deepEqual(
-    plan.map(({ timestampMs, reasons, segmentIndex, filename }) => ({
-      timestampMs, reasons, segmentIndex, filename,
-    })),
-    [
-      {
-        timestampMs: 2000,
-        reasons: ["primary"],
-        segmentIndex: 0,
-        filename: "000002000-primary.jpg",
-      },
-      {
-        timestampMs: 2000,
-        reasons: ["primary"],
-        segmentIndex: 1,
-        filename: "000002000-primary.jpg",
-      },
-    ]
-  );
+  assert.deepEqual(plan, [{
+    requestedMs: 500,
+    timestampMs: 2000,
+    reasons: ["primary"],
+    associations: [
+      { segmentIndex: 0, requestedMs: 500, reasons: ["primary"] },
+      { segmentIndex: 1, requestedMs: 1500, reasons: ["primary"] },
+    ],
+    filename: "000002000-primary.jpg",
+  }]);
+  assert.equal(new Set(plan.map((capture) => capture.filename)).size, plan.length);
 });
 
 test("caps scene requests before the next cut and the video end", () => {
@@ -120,17 +137,21 @@ test("clamps required and caption midpoint requests to the video duration", () =
     requestedMs: 999,
     timestampMs: 999,
     reasons: ["primary", "caption"],
-    segmentIndex: 0,
+    associations: [{
+      segmentIndex: 0,
+      requestedMs: 999,
+      reasons: ["primary", "caption"],
+    }],
     filename: "000000999-primary.jpg",
   }]);
 });
 
-test("retains candidates that resolve to distinct adjacent decoded frames", () => {
+test("identical caption text at distinct decoded frames cannot deduplicate captures", () => {
   const plan = buildCapturePlan({
     segments: [{ startMs: 0, endMs: 1000, text: "one" }],
     captionCues: [
-      { startMs: 1999, endMs: 2001, text: "visually similar one" },
-      { startMs: 2000, endMs: 2002, text: "visually similar two" },
+      { startMs: 1999, endMs: 2001, text: "identical caption words" },
+      { startMs: 2000, endMs: 2002, text: "identical caption words" },
     ],
     sceneTimes: [],
     frameTimes: [500, 2000, 2001],
@@ -149,8 +170,8 @@ test("retains candidates that resolve to distinct adjacent decoded frames", () =
 test("merges all supplementary reasons with deterministic priority", () => {
   const plan = buildCapturePlan({
     segments: [{ startMs: 0, endMs: 8000, text: "one" }],
-    captionCues: [{ startMs: 3000, endMs: 5000, text: "timing only" }],
-    sceneTimes: [3750],
+    captionCues: [{ startMs: 3000, endMs: 4800, text: "timing only" }],
+    sceneTimes: [3650],
     frameTimes: [4000],
     durationMs: 8000,
   });
@@ -158,7 +179,90 @@ test("merges all supplementary reasons with deterministic priority", () => {
     requestedMs: 4000,
     timestampMs: 4000,
     reasons: ["primary", "scene", "caption"],
-    segmentIndex: 0,
+    associations: [{
+      segmentIndex: 0,
+      requestedMs: 4000,
+      reasons: ["primary", "scene", "caption"],
+    }],
     filename: "000004000-primary.jpg",
   }]);
+});
+
+test("attaches a supplementary frame contained by a nonzero segment", () => {
+  const plan = buildCapturePlan({
+    segments: [
+      { startMs: 0, endMs: 1000, text: "one" },
+      { startMs: 1000, endMs: 2000, text: "two" },
+    ],
+    captionCues: [{ startMs: 1100, endMs: 1300, text: "timing only" }],
+    sceneTimes: [],
+    frameTimes: [500, 1300, 1500],
+    durationMs: 2000,
+  });
+  assert.deepEqual(
+    plan.find((capture) => capture.timestampMs === 1300).associations,
+    [{ segmentIndex: 1, requestedMs: 1200, reasons: ["caption"] }]
+  );
+});
+
+test("attaches a gap frame closer to the later segment", () => {
+  const plan = buildCapturePlan({
+    segments: [
+      { startMs: 0, endMs: 1000, text: "one" },
+      { startMs: 5000, endMs: 6000, text: "two" },
+    ],
+    captionCues: [],
+    sceneTimes: [3750],
+    frameTimes: [500, 4000, 5500],
+    durationMs: 6000,
+  });
+  assert.deepEqual(
+    plan.find((capture) => capture.reasons.includes("scene")).associations,
+    [{ segmentIndex: 1, requestedMs: 4000, reasons: ["scene"] }]
+  );
+});
+
+test("overlapping segments use the first containing segment deterministically", () => {
+  const plan = buildCapturePlan({
+    segments: [
+      { startMs: 0, endMs: 3000, text: "outer" },
+      { startMs: 1000, endMs: 2000, text: "inner" },
+    ],
+    captionCues: [{ startMs: 1400, endMs: 1600, text: "timing only" }],
+    sceneTimes: [],
+    frameTimes: [1500],
+    durationMs: 3000,
+  });
+  assert.deepEqual(plan[0].associations, [
+    { segmentIndex: 0, requestedMs: 1500, reasons: ["primary", "caption"] },
+    { segmentIndex: 1, requestedMs: 1500, reasons: ["primary"] },
+  ]);
+});
+
+test("resolves to the first decoded frame at or after a request, not the nearest", () => {
+  const plan = buildCapturePlan({
+    segments: [{ startMs: 0, endMs: 1000, text: "one" }],
+    captionCues: [{ startMs: 1000, endMs: 1200, text: "timing only" }],
+    sceneTimes: [],
+    frameTimes: [500, 1000, 3000],
+    durationMs: 4000,
+  });
+  assert.equal(
+    plan.find((capture) => capture.reasons.includes("caption")).timestampMs,
+    3000
+  );
+});
+
+test("falls back to the final decoded frame after the final PTS", () => {
+  const plan = buildCapturePlan({
+    segments: [{ startMs: 0, endMs: 1000, text: "one" }],
+    captionCues: [{ startMs: 3400, endMs: 3600, text: "timing only" }],
+    sceneTimes: [],
+    frameTimes: [500, 3000],
+    durationMs: 4000,
+  });
+  assert.equal(
+    plan.find((capture) => capture.reasons.includes("caption")).timestampMs,
+    3000
+  );
 });
