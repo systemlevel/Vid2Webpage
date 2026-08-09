@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -22,7 +22,17 @@ const probeJson = JSON.stringify({
 });
 
 test("probeMedia returns validated duration, dimensions, and streams", async () => {
-  const run = async () => ({ code: 0, stdout: probeJson, stderr: "" });
+  const run = async (command, args) => {
+    assert.equal(command, "ffprobe");
+    assert.deepEqual(args, [
+      "-v", "error",
+      "-show_entries",
+      "format=duration:stream=index,codec_type,width,height,avg_frame_rate",
+      "-of", "json",
+      "/video.mov",
+    ]);
+    return { code: 0, stdout: probeJson, stderr: "" };
+  };
   assert.deepEqual(await probeMedia("/video.mov", { run }), {
     durationMs: 12345,
     width: 1920,
@@ -99,6 +109,60 @@ test("sidecar SRT is converted to WebVTT", async (t) => {
     },
   });
   assert.equal(result, outputPath);
+});
+
+async function assertSrtInputIsNotOverwritten({ videoPath, srtPath, outputPath }) {
+  const warnings = [];
+  const result = await discoverLocalCaption({
+    videoPath,
+    mediaInfo: { subtitleStreamIndexes: [2] },
+    outputPath,
+    run: async (_command, args) => {
+      await writeFile(args.at(-1), "rewritten captions");
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    logger: { warn: (...args) => warnings.push(args) },
+  });
+  assert.equal(result, null);
+  assert.equal(warnings.length, 1);
+  assert.equal(
+    await readFile(srtPath, "utf8"),
+    "1\n00:00:00,000 --> 00:00:01,000\nOriginal caption\n",
+  );
+}
+
+test("caption conversion refuses to overwrite the selected SRT input", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "v2w-caption-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const videoPath = path.join(dir, "lesson.mov");
+  const srtPath = path.join(dir, "lesson.srt");
+  await writeFile(videoPath, "video");
+  await writeFile(srtPath, "1\n00:00:00,000 --> 00:00:01,000\nOriginal caption\n");
+  await assertSrtInputIsNotOverwritten({ videoPath, srtPath, outputPath: srtPath });
+});
+
+test("caption conversion refuses a symlink output path to the selected SRT input", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "v2w-caption-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const videoPath = path.join(dir, "lesson.mov");
+  const srtPath = path.join(dir, "lesson.srt");
+  const outputPath = path.join(dir, "linked-output.vtt");
+  await writeFile(videoPath, "video");
+  await writeFile(srtPath, "1\n00:00:00,000 --> 00:00:01,000\nOriginal caption\n");
+  await symlink(srtPath, outputPath);
+  await assertSrtInputIsNotOverwritten({ videoPath, srtPath, outputPath });
+});
+
+test("caption conversion refuses a hard-link output path to the selected SRT input", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "v2w-caption-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const videoPath = path.join(dir, "lesson.mov");
+  const srtPath = path.join(dir, "lesson.srt");
+  const outputPath = path.join(dir, "linked-output.vtt");
+  await writeFile(videoPath, "video");
+  await writeFile(srtPath, "1\n00:00:00,000 --> 00:00:01,000\nOriginal caption\n");
+  await link(srtPath, outputPath);
+  await assertSrtInputIsNotOverwritten({ videoPath, srtPath, outputPath });
 });
 
 test("embedded subtitle stream is extracted as WebVTT", async (t) => {

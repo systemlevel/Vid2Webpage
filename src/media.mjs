@@ -142,8 +142,13 @@ export async function discoverLocalCaption({
       : null;
 
   if (!args) return null;
-  if (await pathsReferToSameFile(videoPath, outputPath)) {
-    logger?.warn?.(`Unable to prepare caption timing hints for ${videoPath}`, new Error("Caption output must not overwrite local video"));
+  const overwritesVideo = await pathsReferToSameFile(videoPath, outputPath);
+  const overwritesCaptionInput = inputPath && await pathsReferToSameFile(inputPath, outputPath);
+  if (overwritesVideo || overwritesCaptionInput) {
+    logger?.warn?.(
+      `Unable to prepare caption timing hints for ${videoPath}`,
+      new Error("Caption output must not overwrite local input"),
+    );
     return null;
   }
   try {
