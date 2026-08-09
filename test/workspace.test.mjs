@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -397,4 +397,81 @@ test("rejects empty fingerprints and noncanonical resumed timestamps", async (t)
   await writeFile(workspace.manifestPath, invalidCompletedAt);
   await assert.rejects(openWorkspace(options), OutputConflictError);
   assert.equal(await readFile(workspace.manifestPath, "utf8"), invalidCompletedAt);
+});
+
+test("delayed initialization resumes a newer completed manifest without overwriting it", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-initialization-race-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source,
+  };
+  let allowDelayedOpen;
+  const delayedOpen = new Promise((resolve) => {
+    allowDelayedOpen = resolve;
+  });
+  let delayedBeforeLock;
+  const delayedBeforeLockReached = new Promise((resolve) => {
+    delayedBeforeLock = resolve;
+  });
+  const firstPromise = openWorkspace({
+    ...options,
+    hooks: {
+      async beforeInitializationLock() {
+        delayedBeforeLock();
+        await delayedOpen;
+      },
+    },
+  });
+  await delayedBeforeLockReached;
+
+  const second = await openWorkspace(options);
+  const completed = await second.markComplete(await second.loadManifest());
+  const completedBytes = await readFile(second.manifestPath, "utf8");
+  allowDelayedOpen();
+  const first = await firstPromise;
+
+  assert.deepEqual(await first.loadManifest(), completed);
+  assert.equal(await readFile(first.manifestPath, "utf8"), completedBytes);
+});
+
+test("recovers dead and old incomplete locks but leaves a live owner lock untouched", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-stale-lock-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = await openWorkspace({
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source,
+  });
+  const lockPath = path.join(workspace.outputDir, ".v2w-manifest.lock");
+  let manifest = await workspace.loadManifest();
+  const deadLock = JSON.stringify({
+    token: "dead-owner-token",
+    pid: 99999999,
+    acquiredAt: "2026-08-09T00:00:00.000Z",
+  });
+  await writeFile(lockPath, deadLock);
+  manifest = await workspace.saveManifest(manifest);
+  assert.equal(manifest.revision, 1);
+  await assert.rejects(access(lockPath));
+
+  await writeFile(lockPath, "");
+  await utimes(lockPath, new Date("2026-08-09T00:00:00.000Z"), new Date("2026-08-09T00:00:00.000Z"));
+  manifest = await workspace.saveManifest(manifest);
+  assert.equal(manifest.revision, 2);
+  await assert.rejects(access(lockPath));
+
+  const liveLock = JSON.stringify({
+    token: "live-owner-token",
+    pid: process.pid,
+    acquiredAt: new Date().toISOString(),
+  });
+  await writeFile(lockPath, liveLock);
+  const bytesBeforeBusyFailure = await readFile(workspace.manifestPath, "utf8");
+  await assert.rejects(workspace.saveManifest(manifest), OutputConflictError);
+  assert.equal(await readFile(lockPath, "utf8"), liveLock);
+  assert.equal(await readFile(workspace.manifestPath, "utf8"), bytesBeforeBusyFailure);
 });

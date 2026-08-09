@@ -8,6 +8,7 @@ import { isNonEmptyFile, writeFileAtomic } from "./fs.mjs";
 
 const manifestFilename = "manifest.json";
 const manifestLockFilename = ".v2w-manifest.lock";
+const incompleteLockRecoveryAgeMs = 1000;
 const reasonPriority = new Map([
   ["primary", 0],
   ["scene", 1],
@@ -180,42 +181,108 @@ async function ensureDirectory(directoryPath, description) {
   await mkdir(directoryPath, { recursive: true });
 }
 
-function waitForLock() {
-  return new Promise((resolve) => setTimeout(resolve, 1));
+function lockMetadata(token) {
+  return {
+    token,
+    pid: process.pid,
+    acquiredAt: new Date().toISOString(),
+  };
+}
+
+function parseLockMetadata(lockText) {
+  try {
+    const metadata = JSON.parse(lockText);
+    if (isPlainObject(metadata)
+      && typeof metadata.token === "string" && metadata.token.length > 0
+      && Number.isSafeInteger(metadata.pid) && metadata.pid > 0
+      && isValidTimestamp(metadata.acquiredAt)) {
+      return metadata;
+    }
+  } catch {
+    // Malformed lock contents are recoverable only after the conservative age threshold.
+  }
+  return null;
+}
+
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error.code === "EPERM") return true;
+    if (error.code === "ESRCH") return false;
+    return true;
+  }
+}
+
+async function removeLockIfUnchanged(lockPath, expectedText, expectedInfo) {
+  const currentInfo = await statOrNull(lockPath);
+  if (!currentInfo || !currentInfo.isFile() || currentInfo.isSymbolicLink()
+    || currentInfo.dev !== expectedInfo.dev || currentInfo.ino !== expectedInfo.ino) {
+    return false;
+  }
+  const currentText = await readFile(lockPath, "utf8");
+  if (currentText !== expectedText) return false;
+  await rm(lockPath);
+  return true;
+}
+
+async function recoverOrRejectExistingLock(lockPath) {
+  const lockInfo = await statOrNull(lockPath);
+  if (!lockInfo || !lockInfo.isFile() || lockInfo.isSymbolicLink()) {
+    throw conflict(`Workspace manifest is busy: ${lockPath}`);
+  }
+  const lockText = await readFile(lockPath, "utf8");
+  const metadata = parseLockMetadata(lockText);
+  if (metadata) {
+    if (isProcessAlive(metadata.pid)) {
+      throw conflict(`Workspace manifest is busy: ${lockPath}`);
+    }
+  } else if (Date.now() - lockInfo.mtimeMs < incompleteLockRecoveryAgeMs) {
+    throw conflict(`Workspace manifest is busy: ${lockPath}`);
+  }
+  if (!await removeLockIfUnchanged(lockPath, lockText, lockInfo)) {
+    throw conflict(`Workspace manifest is busy: ${lockPath}`);
+  }
+}
+
+async function releaseOwnedLock(lockPath, token) {
+  const lockInfo = await statOrNull(lockPath);
+  if (!lockInfo || !lockInfo.isFile() || lockInfo.isSymbolicLink()) return;
+  const lockText = await readFile(lockPath, "utf8");
+  if (parseLockMetadata(lockText)?.token === token) {
+    await removeLockIfUnchanged(lockPath, lockText, lockInfo);
+  }
 }
 
 async function acquireMutationLock(lockPath) {
   const token = randomUUID();
-  while (true) {
+  const metadata = JSON.stringify(lockMetadata(token));
+  for (let attempt = 0; attempt < 3; attempt += 1) {
     let handle;
     let ownsLock = false;
     try {
       handle = await open(lockPath, "wx");
       ownsLock = true;
-      await handle.writeFile(token);
+      await handle.writeFile(metadata);
       await handle.close();
       return async () => {
-        try {
-          if (await readFile(lockPath, "utf8") === token) {
-            await rm(lockPath);
-          }
-        } catch (error) {
-          if (error.code !== "ENOENT") throw error;
-        }
+        await releaseOwnedLock(lockPath, token);
       };
     } catch (error) {
       await handle?.close();
       if (ownsLock) {
         try {
-          if (await readFile(lockPath, "utf8") === token) await rm(lockPath);
+          await rm(lockPath);
         } catch (cleanupError) {
           if (cleanupError.code !== "ENOENT") throw cleanupError;
         }
       }
       if (error.code !== "EEXIST") throw error;
-      await waitForLock();
+      await recoverOrRejectExistingLock(lockPath);
     }
   }
+  throw conflict(`Workspace manifest is busy: ${lockPath}`);
 }
 
 async function withMutationLock(lockPath, operation) {
@@ -259,7 +326,7 @@ export function workspaceCacheDir(cacheRoot, fingerprint) {
   return path.join(cacheRoot, fingerprint);
 }
 
-export async function openWorkspace({ cacheRoot, fingerprint, outputDir, source }) {
+export async function openWorkspace({ cacheRoot, fingerprint, outputDir, source, hooks = {} }) {
   if (typeof fingerprint !== "string" || fingerprint.length === 0
     || !isPlainObject(source)
     || typeof source.fingerprint !== "string" || source.fingerprint.length === 0
@@ -273,20 +340,24 @@ export async function openWorkspace({ cacheRoot, fingerprint, outputDir, source 
   await ensureDirectory(cacheDir, "Cache workspace");
   await ensureDirectory(outputDir, "Output path");
 
-  const manifestInfo = await statOrNull(manifestPath);
-  if (manifestInfo && (!manifestInfo.isFile() || manifestInfo.isSymbolicLink())) {
-    throw conflict(`Output manifest is not a safe file: ${manifestPath}`);
-  }
-
-  let manifest;
-  if (manifestInfo) {
-    manifest = await readManifest(manifestPath, fingerprint, imagesDir);
-  } else if ((await readdir(outputDir)).length > 0) {
-    throw conflict(`Refusing to overwrite nonempty output without a v2w manifest: ${outputDir}`);
-  } else {
-    manifest = initialManifest(source);
-    await writeFileAtomic(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-  }
+  await hooks.beforeInitializationLock?.();
+  const manifest = await withMutationLock(manifestLockPath, async () => {
+    const manifestInfo = await statOrNull(manifestPath);
+    if (manifestInfo && (!manifestInfo.isFile() || manifestInfo.isSymbolicLink())) {
+      throw conflict(`Output manifest is not a safe file: ${manifestPath}`);
+    }
+    if (manifestInfo) {
+      return readManifest(manifestPath, fingerprint, imagesDir);
+    }
+    const outputEntries = (await readdir(outputDir))
+      .filter((entry) => entry !== manifestLockFilename);
+    if (outputEntries.length > 0) {
+      throw conflict(`Refusing to overwrite nonempty output without a v2w manifest: ${outputDir}`);
+    }
+    const createdManifest = initialManifest(source);
+    await writeFileAtomic(manifestPath, `${JSON.stringify(createdManifest, null, 2)}\n`);
+    return createdManifest;
+  });
 
   if (manifest.status === "complete") {
     const imagesInfo = await statOrNull(imagesDir);
