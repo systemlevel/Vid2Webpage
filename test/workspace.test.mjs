@@ -50,6 +50,7 @@ test("creates cache, output, images, and an atomic building manifest", async (t)
     transcript: null,
     segments: [],
     images: [],
+    revision: 0,
     createdAt: manifest.createdAt,
     completedAt: null,
   });
@@ -296,4 +297,104 @@ test("rejects contradictory completed lifecycle state without replacing it", asy
 
   await assert.rejects(openWorkspace(options), OutputConflictError);
   assert.equal(await readFile(workspace.manifestPath, "utf8"), contradictory);
+});
+
+test("serializes revisions and rejects stale save, record, and completion attempts", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-stale-revision-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source,
+  };
+  const first = await openWorkspace(options);
+  const second = await openWorkspace(options);
+  const firstManifest = await first.loadManifest();
+  const staleManifest = structuredClone(await second.loadManifest());
+
+  assert.equal(firstManifest.revision, 0);
+  const advanced = await first.recordFrame(firstManifest, capture());
+  assert.equal(advanced.revision, 1);
+  const advancedBytes = await readFile(first.manifestPath, "utf8");
+
+  for (const mutate of [
+    () => second.saveManifest(staleManifest),
+    () => second.recordFrame(staleManifest, capture({ filename: "000005000-primary.jpg", requestedMs: 5000, timestampMs: 5000 })),
+    () => second.markComplete(staleManifest),
+  ]) {
+    await assert.rejects(mutate(), OutputConflictError);
+    assert.equal(await readFile(first.manifestPath, "utf8"), advancedBytes);
+  }
+});
+
+test("concurrent output mutations leave exactly one revision-one terminal or building result", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-concurrent-revision-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source,
+  };
+  const first = await openWorkspace(options);
+  const second = await openWorkspace(options);
+  const firstManifest = await first.loadManifest();
+  const secondManifest = structuredClone(await second.loadManifest());
+
+  const results = await Promise.allSettled([
+    first.recordFrame(firstManifest, capture()),
+    second.markComplete(secondManifest),
+  ]);
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+  assert.equal(results.filter((result) => result.status === "rejected").length, 1);
+  assert.ok(results.some((result) => result.status === "rejected" && result.reason instanceof OutputConflictError));
+
+  const manifest = await (await openWorkspace(options)).loadManifest();
+  assert.equal(manifest.revision, 1);
+  if (manifest.status === "complete") {
+    assert.equal(manifest.images.length, 0);
+  } else {
+    assert.deepEqual(manifest.images.map((image) => image.filename), ["000004000-primary.jpg"]);
+  }
+});
+
+test("rejects empty fingerprints and noncanonical resumed timestamps", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-canonical-manifest-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const outputDir = path.join(root, "output");
+  await assert.rejects(
+    openWorkspace({
+      cacheRoot: path.join(root, "cache"),
+      fingerprint: "",
+      outputDir,
+      source: { ...source, fingerprint: "" },
+    }),
+    OutputConflictError,
+  );
+
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir,
+    source,
+  };
+  const workspace = await openWorkspace(options);
+  const building = await workspace.loadManifest();
+  for (const createdAt of ["1", "2026-02-30T00:00:00.000Z"]) {
+    const invalid = JSON.stringify({ ...building, createdAt });
+    await writeFile(workspace.manifestPath, invalid);
+    await assert.rejects(openWorkspace(options), OutputConflictError);
+    assert.equal(await readFile(workspace.manifestPath, "utf8"), invalid);
+  }
+
+  await writeFile(workspace.manifestPath, `${JSON.stringify(building, null, 2)}\n`);
+  const complete = await workspace.markComplete(building);
+  const invalidCompletedAt = JSON.stringify({
+    ...complete,
+    completedAt: "2026-02-30T00:00:00.000Z",
+  });
+  await writeFile(workspace.manifestPath, invalidCompletedAt);
+  await assert.rejects(openWorkspace(options), OutputConflictError);
+  assert.equal(await readFile(workspace.manifestPath, "utf8"), invalidCompletedAt);
 });
