@@ -1,5 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, open, readFile, readdir, rm } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  readdir,
+  rename,
+  rmdir,
+  unlink,
+} from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
@@ -8,7 +17,8 @@ import { isNonEmptyFile, writeFileAtomic } from "./fs.mjs";
 
 const manifestFilename = "manifest.json";
 const manifestLockFilename = ".v2w-manifest.lock";
-const incompleteLockRecoveryAgeMs = 1000;
+const lockCandidateFilenamePattern = /^\.v2w-manifest\.lock\.candidate-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const lockOwnerFilenamePattern = /^owner-([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/u;
 const reasonPriority = new Map([
   ["primary", 0],
   ["scene", 1],
@@ -189,24 +199,29 @@ function lockMetadata(token) {
   };
 }
 
-function parseLockMetadata(lockText) {
+function lockOwnerFilename(token) {
+  return `owner-${token}.json`;
+}
+
+function parseLockMetadata(lockText, expectedToken) {
   try {
     const metadata = JSON.parse(lockText);
     if (isPlainObject(metadata)
-      && typeof metadata.token === "string" && metadata.token.length > 0
+      && hasExactKeys(metadata, ["token", "pid", "acquiredAt"])
+      && metadata.token === expectedToken
       && Number.isSafeInteger(metadata.pid) && metadata.pid > 0
       && isValidTimestamp(metadata.acquiredAt)) {
       return metadata;
     }
   } catch {
-    // Malformed lock contents are recoverable only after the conservative age threshold.
+    // Canonical lock metadata is published complete, so malformed state is never stolen.
   }
   return null;
 }
 
-function isProcessAlive(pid) {
+function isProcessAlive(pid, killProcess) {
   try {
-    process.kill(pid, 0);
+    killProcess(pid, 0);
     return true;
   } catch (error) {
     if (error.code === "EPERM") return true;
@@ -215,78 +230,187 @@ function isProcessAlive(pid) {
   }
 }
 
-async function removeLockIfUnchanged(lockPath, expectedText, expectedInfo) {
-  const currentInfo = await statOrNull(lockPath);
-  if (!currentInfo || !currentInfo.isFile() || currentInfo.isSymbolicLink()
-    || currentInfo.dev !== expectedInfo.dev || currentInfo.ino !== expectedInfo.ino) {
-    return false;
-  }
-  const currentText = await readFile(lockPath, "utf8");
-  if (currentText !== expectedText) return false;
-  await rm(lockPath);
-  return true;
-}
-
-async function recoverOrRejectExistingLock(lockPath) {
-  const lockInfo = await statOrNull(lockPath);
-  if (!lockInfo || !lockInfo.isFile() || lockInfo.isSymbolicLink()) {
-    throw conflict(`Workspace manifest is busy: ${lockPath}`);
-  }
-  const lockText = await readFile(lockPath, "utf8");
-  const metadata = parseLockMetadata(lockText);
-  if (metadata) {
-    if (isProcessAlive(metadata.pid)) {
-      throw conflict(`Workspace manifest is busy: ${lockPath}`);
-    }
-  } else if (Date.now() - lockInfo.mtimeMs < incompleteLockRecoveryAgeMs) {
-    throw conflict(`Workspace manifest is busy: ${lockPath}`);
-  }
-  if (!await removeLockIfUnchanged(lockPath, lockText, lockInfo)) {
-    throw conflict(`Workspace manifest is busy: ${lockPath}`);
+async function removeEmptyDirectoryOnce(directoryPath) {
+  try {
+    await rmdir(directoryPath);
+    return true;
+  } catch (error) {
+    if (["ENOENT", "ENOTEMPTY", "EEXIST"].includes(error.code)) return false;
+    throw error;
   }
 }
 
-async function releaseOwnedLock(lockPath, token) {
-  const lockInfo = await statOrNull(lockPath);
-  if (!lockInfo || !lockInfo.isFile() || lockInfo.isSymbolicLink()) return;
-  const lockText = await readFile(lockPath, "utf8");
-  if (parseLockMetadata(lockText)?.token === token) {
-    await removeLockIfUnchanged(lockPath, lockText, lockInfo);
+// Owner filenames are per-acquisition identities and are never reused. A stale
+// actor can therefore unlink only its observed generation. It then attempts one
+// nonrecursive rmdir: any replacement generation is nonempty, so it survives.
+async function removeOwnerIdentity(directoryPath, filename, afterUnlink) {
+  let unlinked = false;
+  try {
+    await unlink(path.join(directoryPath, filename));
+    unlinked = true;
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
   }
+  if (unlinked) await afterUnlink?.();
+  await removeEmptyDirectoryOnce(directoryPath);
 }
 
-async function acquireMutationLock(lockPath) {
-  const token = randomUUID();
-  const metadata = JSON.stringify(lockMetadata(token));
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    let handle;
-    let ownsLock = false;
-    try {
-      handle = await open(lockPath, "wx");
-      ownsLock = true;
-      await handle.writeFile(metadata);
+async function prepareLockCandidate(lockPath, token, hooks) {
+  const candidatePath = `${lockPath}.candidate-${token}`;
+  const filename = lockOwnerFilename(token);
+  const metadata = lockMetadata(token);
+  const metadataPath = path.join(candidatePath, filename);
+  const owner = {
+    candidatePath,
+    lockPath,
+    ownerFilename: filename,
+    metadata,
+  };
+  let handle;
+  await mkdir(candidatePath);
+  try {
+    handle = await open(metadataPath, "wx", 0o600);
+    await handle.writeFile(JSON.stringify(metadata));
+    await handle.sync();
+    if (hooks.closeLockMetadata) {
+      await hooks.closeLockMetadata(handle, owner);
+    } else {
       await handle.close();
-      return async () => {
-        await releaseOwnedLock(lockPath, token);
-      };
-    } catch (error) {
-      await handle?.close();
-      if (ownsLock) {
-        try {
-          await rm(lockPath);
-        } catch (cleanupError) {
-          if (cleanupError.code !== "ENOENT") throw cleanupError;
-        }
-      }
-      if (error.code !== "EEXIST") throw error;
-      await recoverOrRejectExistingLock(lockPath);
     }
+    handle = undefined;
+    return owner;
+  } catch (error) {
+    const cleanupErrors = [];
+    try {
+      await handle?.close();
+    } catch (closeError) {
+      cleanupErrors.push(closeError);
+    }
+    try {
+      await removeOwnerIdentity(candidatePath, filename);
+    } catch (cleanupError) {
+      cleanupErrors.push(cleanupError);
+    }
+    if (cleanupErrors.length > 0 && error && typeof error === "object" && error.cause === undefined) {
+      error.cause = cleanupErrors.length === 1
+        ? cleanupErrors[0]
+        : new AggregateError(cleanupErrors, "Lock candidate cleanup failed");
+    }
+    throw error;
   }
-  throw conflict(`Workspace manifest is busy: ${lockPath}`);
 }
 
-async function withMutationLock(lockPath, operation) {
-  const release = await acquireMutationLock(lockPath);
+async function readLockOwner(lockPath) {
+  const lockInfo = await statOrNull(lockPath);
+  if (!lockInfo) return { state: "absent" };
+  if (!lockInfo.isDirectory() || lockInfo.isSymbolicLink()) {
+    throw conflict(`Workspace manifest is busy: ${lockPath}`);
+  }
+
+  let entries;
+  try {
+    entries = await readdir(lockPath);
+  } catch (error) {
+    if (error.code === "ENOENT") return { state: "absent" };
+    throw error;
+  }
+  if (entries.length === 0) return { state: "empty" };
+  if (entries.length !== 1) {
+    throw conflict(`Workspace manifest is busy: ${lockPath}`);
+  }
+
+  const [filename] = entries;
+  const token = lockOwnerFilenamePattern.exec(filename)?.[1];
+  if (!token) throw conflict(`Workspace manifest is busy: ${lockPath}`);
+  const metadataPath = path.join(lockPath, filename);
+  const metadataInfo = await statOrNull(metadataPath);
+  if (!metadataInfo) return { state: "changed" };
+  if (!metadataInfo.isFile() || metadataInfo.isSymbolicLink()) {
+    throw conflict(`Workspace manifest is busy: ${lockPath}`);
+  }
+
+  let lockText;
+  try {
+    lockText = await readFile(metadataPath, "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") return { state: "changed" };
+    throw error;
+  }
+  const metadata = parseLockMetadata(lockText, token);
+  if (!metadata) throw conflict(`Workspace manifest is busy: ${lockPath}`);
+  return {
+    state: "owned",
+    lockPath,
+    ownerFilename: filename,
+    metadata,
+  };
+}
+
+async function recoverOrRejectExistingLock(lockPath, hooks) {
+  const owner = await readLockOwner(lockPath);
+  if (owner.state === "absent" || owner.state === "changed") return;
+  if (owner.state === "empty") {
+    await removeEmptyDirectoryOnce(lockPath);
+    return;
+  }
+  const killProcess = hooks.killProcess ?? ((pid, signal) => process.kill(pid, signal));
+  if (isProcessAlive(owner.metadata.pid, killProcess)) {
+    throw conflict(`Workspace manifest is busy: ${lockPath}`);
+  }
+  await hooks.beforeStaleOwnerUnlink?.(owner);
+  await removeOwnerIdentity(lockPath, owner.ownerFilename, async () => {
+    await hooks.afterStaleOwnerUnlink?.(owner);
+  });
+}
+
+async function releaseOwnedLock(owner) {
+  await removeOwnerIdentity(owner.lockPath, owner.ownerFilename);
+}
+
+function isLockPublicationConflict(error) {
+  return ["EEXIST", "ENOTEMPTY", "ENOTDIR", "EISDIR", "EPERM"].includes(error.code);
+}
+
+async function acquireMutationLock(lockPath, hooks) {
+  const token = randomUUID();
+  const owner = await prepareLockCandidate(lockPath, token, hooks);
+  let published = false;
+  try {
+    await hooks.afterLockCandidatePrepared?.(owner);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await rename(owner.candidatePath, lockPath);
+      } catch (error) {
+        if (!isLockPublicationConflict(error)) throw error;
+        await recoverOrRejectExistingLock(lockPath, hooks);
+        continue;
+      }
+
+      published = true;
+      try {
+        await hooks.afterLockPublished?.(owner);
+      } catch (error) {
+        try {
+          await releaseOwnedLock(owner);
+        } catch (cleanupError) {
+          error.cause = cleanupError;
+        }
+        throw error;
+      }
+      return async () => {
+        await releaseOwnedLock(owner);
+      };
+    }
+    throw conflict(`Workspace manifest is busy: ${lockPath}`);
+  } finally {
+    if (!published) {
+      await removeOwnerIdentity(owner.candidatePath, owner.ownerFilename);
+    }
+  }
+}
+
+async function withMutationLock(lockPath, hooks, operation) {
+  const release = await acquireMutationLock(lockPath, hooks);
   try {
     return await operation();
   } finally {
@@ -341,7 +465,7 @@ export async function openWorkspace({ cacheRoot, fingerprint, outputDir, source,
   await ensureDirectory(outputDir, "Output path");
 
   await hooks.beforeInitializationLock?.();
-  const manifest = await withMutationLock(manifestLockPath, async () => {
+  const manifest = await withMutationLock(manifestLockPath, hooks, async () => {
     const manifestInfo = await statOrNull(manifestPath);
     if (manifestInfo && (!manifestInfo.isFile() || manifestInfo.isSymbolicLink())) {
       throw conflict(`Output manifest is not a safe file: ${manifestPath}`);
@@ -350,7 +474,8 @@ export async function openWorkspace({ cacheRoot, fingerprint, outputDir, source,
       return readManifest(manifestPath, fingerprint, imagesDir);
     }
     const outputEntries = (await readdir(outputDir))
-      .filter((entry) => entry !== manifestLockFilename);
+      .filter((entry) => entry !== manifestLockFilename
+        && !lockCandidateFilenamePattern.test(entry));
     if (outputEntries.length > 0) {
       throw conflict(`Refusing to overwrite nonempty output without a v2w manifest: ${outputDir}`);
     }
@@ -391,7 +516,7 @@ export async function openWorkspace({ cacheRoot, fingerprint, outputDir, source,
     if (callerManifest.status !== "building") {
       throw conflict("Completed output manifests are immutable");
     }
-    return withMutationLock(manifestLockPath, async () => {
+    return withMutationLock(manifestLockPath, hooks, async () => {
       const current = await loadManifest();
       if (current.status !== "building") {
         throw conflict("Completed output manifests are immutable");

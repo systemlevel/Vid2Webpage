@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { access, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -16,6 +18,54 @@ const source = {
   width: 640,
   height: 360,
 };
+
+const manifestLockFilename = ".v2w-manifest.lock";
+const deadOwnerPid = 2147483000;
+const deadOwnerToken = "00000000-0000-4000-8000-000000000001";
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+function processError(code) {
+  return Object.assign(new Error(`process probe failed with ${code}`), { code });
+}
+
+function ownerFilename(token) {
+  return `owner-${token}.json`;
+}
+
+async function createOwnerLock(outputDir, {
+  token = deadOwnerToken,
+  pid = deadOwnerPid,
+  acquiredAt = "2026-08-09T00:00:00.000Z",
+} = {}) {
+  const lockPath = path.join(outputDir, manifestLockFilename);
+  const metadata = { token, pid, acquiredAt };
+  const filename = ownerFilename(token);
+  await mkdir(lockPath);
+  await writeFile(path.join(lockPath, filename), JSON.stringify(metadata));
+  return { lockPath, ownerFilename: filename, metadata };
+}
+
+async function readOwnerLock(lockPath) {
+  const entries = await readdir(lockPath);
+  assert.equal(entries.length, 1);
+  const [filename] = entries;
+  return {
+    ownerFilename: filename,
+    metadata: JSON.parse(await readFile(path.join(lockPath, filename), "utf8")),
+  };
+}
+
+function probeOnlyDeadOwner(pid, signal) {
+  assert.equal(signal, 0);
+  if (pid === deadOwnerPid) throw processError("ESRCH");
+}
 
 function capture({
   filename = "000004000-primary.jpg",
@@ -437,41 +487,416 @@ test("delayed initialization resumes a newer completed manifest without overwrit
   assert.equal(await readFile(first.manifestPath, "utf8"), completedBytes);
 });
 
-test("recovers dead and old incomplete locks but leaves a live owner lock untouched", async (t) => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-stale-lock-"));
+test("a creator killed before lock publication cannot strand first-time initialization", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-killed-candidate-"));
   t.after(() => rm(root, { recursive: true, force: true }));
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source,
+  };
+  const workspaceModuleUrl = new URL("../src/workspace.mjs", import.meta.url).href;
+  const childSource = `
+    import { openWorkspace } from ${JSON.stringify(workspaceModuleUrl)};
+    const options = ${JSON.stringify(options)};
+    await openWorkspace({
+      ...options,
+      hooks: {
+        async afterLockCandidatePrepared(candidate) {
+          process.send({ candidatePath: candidate.candidatePath });
+          await new Promise(() => {});
+        },
+      },
+    });
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", childSource], {
+    stdio: ["ignore", "ignore", "pipe", "ipc"],
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+
+  try {
+    const prepared = await Promise.race([
+      once(child, "message").then(([message]) => message),
+      once(child, "exit").then(([code, signal]) => {
+        throw new Error(`candidate creator exited before its barrier (${code}, ${signal}): ${stderr}`);
+      }),
+    ]);
+    assert.equal(typeof prepared.candidatePath, "string");
+    assert.equal(path.dirname(prepared.candidatePath), options.outputDir);
+    const childExit = once(child, "exit");
+    assert.equal(child.kill("SIGKILL"), true);
+    const [code, signal] = await childExit;
+    assert.equal(code, null);
+    assert.equal(signal, "SIGKILL");
+    await assert.doesNotReject(access(prepared.candidatePath));
+
+    const workspace = await openWorkspace(options);
+    assert.equal((await workspace.loadManifest()).revision, 0);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      const childExit = once(child, "exit");
+      child.kill("SIGKILL");
+      await childExit;
+    }
+  }
+});
+
+test("metadata-close failure cleans only the unpublished candidate", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-candidate-close-failure-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const outputDir = path.join(root, "output");
+  const closeFailure = processError("EIO");
+  let candidatePath;
+
+  await assert.rejects(
+    openWorkspace({
+      cacheRoot: path.join(root, "cache"),
+      fingerprint: source.fingerprint,
+      outputDir,
+      source,
+      hooks: {
+        async closeLockMetadata(handle, candidate) {
+          candidatePath = candidate.candidatePath;
+          await handle.close();
+          throw closeFailure;
+        },
+      },
+    }),
+    (error) => error === closeFailure,
+  );
+
+  assert.equal(typeof candidatePath, "string");
+  await assert.rejects(access(candidatePath));
+  await assert.rejects(access(path.join(outputDir, manifestLockFilename)));
+  assert.deepEqual(await readdir(outputDir), []);
+});
+
+test("two stale reclaimers cannot both own or delete a replacement lock", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-two-reclaimers-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source,
+  };
+  const firstObserved = deferred();
+  const allowFirstUnlink = deferred();
+  const firstPublished = deferred();
+  const allowFirstMutation = deferred();
+  const secondObserved = deferred();
+  const allowSecondUnlink = deferred();
+  let armFirstPublication = false;
+  let publishedFirstOwner;
+  const first = await openWorkspace({
+    ...options,
+    hooks: {
+      killProcess: probeOnlyDeadOwner,
+      async beforeStaleOwnerUnlink({ metadata }) {
+        assert.equal(metadata.token, deadOwnerToken);
+        firstObserved.resolve();
+        await allowFirstUnlink.promise;
+      },
+      async afterLockPublished(owner) {
+        if (!armFirstPublication) return;
+        publishedFirstOwner = owner;
+        firstPublished.resolve();
+        await allowFirstMutation.promise;
+      },
+    },
+  });
+  const second = await openWorkspace({
+    ...options,
+    hooks: {
+      killProcess: probeOnlyDeadOwner,
+      async beforeStaleOwnerUnlink({ metadata }) {
+        assert.equal(metadata.token, deadOwnerToken);
+        secondObserved.resolve();
+        await allowSecondUnlink.promise;
+      },
+    },
+  });
+  const firstManifest = await first.loadManifest();
+  const secondManifest = structuredClone(await second.loadManifest());
+  const { lockPath } = await createOwnerLock(first.outputDir);
+  armFirstPublication = true;
+  const mutations = [
+    first.recordFrame(firstManifest, capture()),
+    second.markComplete(secondManifest),
+  ];
+  const firstResult = mutations[0].then(
+    (value) => ({ status: "fulfilled", value }),
+    (reason) => ({ status: "rejected", reason }),
+  );
+  const secondResult = mutations[1].then(
+    (value) => ({ status: "fulfilled", value }),
+    (reason) => ({ status: "rejected", reason }),
+  );
+  const settled = Promise.allSettled(mutations);
+
+  try {
+    const phase = await Promise.race([
+      Promise.all([firstObserved.promise, secondObserved.promise]).then(() => "both-observed"),
+      settled.then(() => "mutations-settled"),
+    ]);
+    assert.equal(phase, "both-observed", "both reclaimers must reach the stale-identity barrier");
+
+    allowFirstUnlink.resolve();
+    const publicationPhase = await Promise.race([
+      firstPublished.promise.then(() => "first-published"),
+      firstResult.then(() => "first-settled"),
+    ]);
+    assert.equal(publicationPhase, "first-published");
+
+    allowSecondUnlink.resolve();
+    const rejectedSecond = await secondResult;
+    assert.equal(rejectedSecond.status, "rejected");
+    assert.ok(rejectedSecond.reason instanceof OutputConflictError);
+    assert.deepEqual(await readOwnerLock(lockPath), {
+      ownerFilename: publishedFirstOwner.ownerFilename,
+      metadata: publishedFirstOwner.metadata,
+    });
+
+    allowFirstMutation.resolve();
+    const completedFirst = await firstResult;
+    assert.equal(completedFirst.status, "fulfilled");
+    assert.equal(completedFirst.value.revision, 1);
+  } finally {
+    allowFirstUnlink.resolve();
+    allowSecondUnlink.resolve();
+    allowFirstMutation.resolve();
+  }
+
+  const results = await settled;
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+  assert.equal(results.filter((result) => result.status === "rejected").length, 1);
+  assert.ok(results.some((result) => result.status === "rejected"
+    && result.reason instanceof OutputConflictError));
+  const persisted = await first.loadManifest();
+  assert.equal(persisted.revision, 1);
+  await assert.rejects(access(lockPath));
+});
+
+test("a delayed stale reclaimer cannot remove a live replacement owner", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-replacement-lock-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source,
+  };
+  const staleOwnerUnlinked = deferred();
+  const allowStaleReclaimer = deferred();
+  const replacementPublished = deferred();
+  const allowReplacement = deferred();
+  let armReplacement = false;
+  let publishedReplacement;
+  let reclaimMutation;
+  let replacementMutation;
+  const reclaimer = await openWorkspace({
+    ...options,
+    hooks: {
+      killProcess: probeOnlyDeadOwner,
+      async afterStaleOwnerUnlink(observed) {
+        staleOwnerUnlinked.resolve(observed);
+        await allowStaleReclaimer.promise;
+      },
+    },
+  });
+  const replacement = await openWorkspace({
+    ...options,
+    hooks: {
+      async afterLockPublished(owner) {
+        if (!armReplacement) return;
+        publishedReplacement = owner;
+        replacementPublished.resolve();
+        await allowReplacement.promise;
+      },
+    },
+  });
+  const reclaimerManifest = await reclaimer.loadManifest();
+  const replacementManifest = structuredClone(await replacement.loadManifest());
+  const { lockPath } = await createOwnerLock(reclaimer.outputDir);
+
+  try {
+    reclaimMutation = reclaimer.saveManifest(reclaimerManifest);
+    const reclaimResult = reclaimMutation.then(
+      (value) => ({ status: "fulfilled", value }),
+      (reason) => ({ status: "rejected", reason }),
+    );
+    const recoveryPhase = await Promise.race([
+      staleOwnerUnlinked.promise.then(() => "stale-owner-unlinked"),
+      reclaimResult.then(() => "reclaimer-settled"),
+    ]);
+    assert.equal(recoveryPhase, "stale-owner-unlinked");
+
+    armReplacement = true;
+    replacementMutation = replacement.recordFrame(replacementManifest, capture());
+    const replacementResult = replacementMutation.then(
+      (value) => ({ status: "fulfilled", value }),
+      (reason) => ({ status: "rejected", reason }),
+    );
+    const replacementPhase = await Promise.race([
+      replacementPublished.promise.then(() => "replacement-published"),
+      replacementResult.then(() => "replacement-settled"),
+    ]);
+    assert.equal(replacementPhase, "replacement-published");
+
+    allowStaleReclaimer.resolve();
+    const rejectedReclaimer = await reclaimResult;
+    assert.equal(rejectedReclaimer.status, "rejected");
+    assert.ok(rejectedReclaimer.reason instanceof OutputConflictError);
+    assert.deepEqual(await readOwnerLock(lockPath), {
+      ownerFilename: publishedReplacement.ownerFilename,
+      metadata: publishedReplacement.metadata,
+    });
+
+    allowReplacement.resolve();
+    const completedReplacement = await replacementResult;
+    assert.equal(completedReplacement.status, "fulfilled");
+    assert.equal(completedReplacement.value.revision, 1);
+    await assert.rejects(access(lockPath));
+  } finally {
+    allowStaleReclaimer.resolve();
+    allowReplacement.resolve();
+    await Promise.allSettled([reclaimMutation, replacementMutation].filter(Boolean));
+  }
+});
+
+test("lock publication is complete and failed acquisition cleans only its candidate", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-lock-publication-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source,
+  };
+  const candidatePrepared = deferred();
+  const allowCandidatePublication = deferred();
+  const replacementPublished = deferred();
+  const allowReplacement = deferred();
+  let armCandidate = false;
+  let armReplacement = false;
+  let preparedCandidate;
+  let publishedReplacement;
+  let candidateMutation;
+  let replacementMutation;
+  const candidateWorkspace = await openWorkspace({
+    ...options,
+    hooks: {
+      async afterLockCandidatePrepared(candidate) {
+        if (!armCandidate) return;
+        preparedCandidate = candidate;
+        candidatePrepared.resolve();
+        await allowCandidatePublication.promise;
+      },
+    },
+  });
+  const replacementWorkspace = await openWorkspace({
+    ...options,
+    hooks: {
+      async afterLockPublished(owner) {
+        if (!armReplacement) return;
+        publishedReplacement = owner;
+        replacementPublished.resolve();
+        await allowReplacement.promise;
+      },
+    },
+  });
+  const candidateManifest = await candidateWorkspace.loadManifest();
+  const replacementManifest = structuredClone(await replacementWorkspace.loadManifest());
+  const lockPath = path.join(candidateWorkspace.outputDir, manifestLockFilename);
+
+  try {
+    armCandidate = true;
+    candidateMutation = candidateWorkspace.saveManifest(candidateManifest);
+    const candidateResult = candidateMutation.then(
+      (value) => ({ status: "fulfilled", value }),
+      (reason) => ({ status: "rejected", reason }),
+    );
+    const candidatePhase = await Promise.race([
+      candidatePrepared.promise.then(() => "candidate-prepared"),
+      candidateResult.then(() => "candidate-settled"),
+    ]);
+    assert.equal(candidatePhase, "candidate-prepared");
+    await assert.rejects(access(lockPath));
+    assert.deepEqual(await readOwnerLock(preparedCandidate.candidatePath), {
+      ownerFilename: preparedCandidate.ownerFilename,
+      metadata: preparedCandidate.metadata,
+    });
+
+    armReplacement = true;
+    replacementMutation = replacementWorkspace.recordFrame(replacementManifest, capture());
+    const replacementResult = replacementMutation.then(
+      (value) => ({ status: "fulfilled", value }),
+      (reason) => ({ status: "rejected", reason }),
+    );
+    const replacementPhase = await Promise.race([
+      replacementPublished.promise.then(() => "replacement-published"),
+      replacementResult.then(() => "replacement-settled"),
+    ]);
+    assert.equal(replacementPhase, "replacement-published");
+
+    allowCandidatePublication.resolve();
+    const rejectedCandidate = await candidateResult;
+    assert.equal(rejectedCandidate.status, "rejected");
+    assert.ok(rejectedCandidate.reason instanceof OutputConflictError);
+    await assert.rejects(access(preparedCandidate.candidatePath));
+    assert.deepEqual(await readOwnerLock(lockPath), {
+      ownerFilename: publishedReplacement.ownerFilename,
+      metadata: publishedReplacement.metadata,
+    });
+
+    allowReplacement.resolve();
+    const completedReplacement = await replacementResult;
+    assert.equal(completedReplacement.status, "fulfilled");
+    assert.equal(completedReplacement.value.revision, 1);
+    await assert.rejects(access(lockPath));
+
+    await mkdir(lockPath);
+    const afterInterruptedRecovery = await candidateWorkspace.saveManifest(completedReplacement.value);
+    assert.equal(afterInterruptedRecovery.revision, 2);
+    await assert.rejects(access(lockPath));
+  } finally {
+    allowCandidatePublication.resolve();
+    allowReplacement.resolve();
+    await Promise.allSettled([candidateMutation, replacementMutation].filter(Boolean));
+  }
+});
+
+test("EPERM from the liveness probe keeps the complete owner lock busy and unchanged", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-eperm-lock-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const probes = [];
   const workspace = await openWorkspace({
     cacheRoot: path.join(root, "cache"),
     fingerprint: source.fingerprint,
     outputDir: path.join(root, "output"),
     source,
+    hooks: {
+      killProcess(pid, signal) {
+        probes.push([pid, signal]);
+        throw processError("EPERM");
+      },
+    },
   });
-  const lockPath = path.join(workspace.outputDir, ".v2w-manifest.lock");
-  let manifest = await workspace.loadManifest();
-  const deadLock = JSON.stringify({
-    token: "dead-owner-token",
-    pid: 99999999,
-    acquiredAt: "2026-08-09T00:00:00.000Z",
-  });
-  await writeFile(lockPath, deadLock);
-  manifest = await workspace.saveManifest(manifest);
-  assert.equal(manifest.revision, 1);
-  await assert.rejects(access(lockPath));
+  const manifest = await workspace.loadManifest();
+  const manifestBytes = await readFile(workspace.manifestPath, "utf8");
+  const owner = await createOwnerLock(workspace.outputDir);
 
-  await writeFile(lockPath, "");
-  await utimes(lockPath, new Date("2026-08-09T00:00:00.000Z"), new Date("2026-08-09T00:00:00.000Z"));
-  manifest = await workspace.saveManifest(manifest);
-  assert.equal(manifest.revision, 2);
-  await assert.rejects(access(lockPath));
-
-  const liveLock = JSON.stringify({
-    token: "live-owner-token",
-    pid: process.pid,
-    acquiredAt: new Date().toISOString(),
-  });
-  await writeFile(lockPath, liveLock);
-  const bytesBeforeBusyFailure = await readFile(workspace.manifestPath, "utf8");
   await assert.rejects(workspace.saveManifest(manifest), OutputConflictError);
-  assert.equal(await readFile(lockPath, "utf8"), liveLock);
-  assert.equal(await readFile(workspace.manifestPath, "utf8"), bytesBeforeBusyFailure);
+
+  assert.deepEqual(probes, [[deadOwnerPid, 0]]);
+  assert.deepEqual(await readOwnerLock(owner.lockPath), {
+    ownerFilename: owner.ownerFilename,
+    metadata: owner.metadata,
+  });
+  assert.equal(await readFile(workspace.manifestPath, "utf8"), manifestBytes);
 });
