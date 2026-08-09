@@ -58,6 +58,40 @@ test("repetition normalization and minimum boundaries are deterministic", () => 
   assert.equal(detectRepetitionLoop("same line\n".repeat(19)), null);
 });
 
+test("repetition applies exact repeat count, repeat share, and unique share boundaries", () => {
+  const belowCount = [
+    ...Array.from({ length: 9 }, () => "same line"),
+    ...Array.from({ length: 11 }, (_, index) => `unique ${index}`),
+  ].join("\n");
+  assert.equal(detectRepetitionLoop(belowCount), null);
+
+  const exactRepeatShare = [
+    ...Array.from({ length: 10 }, () => "same line"),
+    ...Array.from({ length: 90 }, (_, index) => `unique ${index}`),
+  ].join("\n");
+  assert.equal(detectRepetitionLoop(exactRepeatShare).repeatShare, 0.1);
+
+  const belowRepeatShare = [
+    ...Array.from({ length: 10 }, () => "same line"),
+    ...Array.from({ length: 91 }, (_, index) => `unique ${index}`),
+  ].join("\n");
+  assert.equal(detectRepetitionLoop(belowRepeatShare), null);
+
+  const exactUniqueShare = Array.from({ length: 10 }, (_, index) =>
+    `token ${index}\ntoken ${index}`
+  ).join("\n");
+  assert.equal(detectRepetitionLoop(exactUniqueShare), null);
+
+  const belowUniqueShare = [
+    "token 0",
+    "token 0",
+    "token 0",
+    ...Array.from({ length: 9 }, (_, index) => `token ${index + 1}`),
+    ...Array.from({ length: 9 }, (_, index) => `token ${index + 1}`),
+  ].join("\n");
+  assert.equal(detectRepetitionLoop(belowUniqueShare).uniqueShare, 10 / 21);
+});
+
 test("fragmentation uses nonempty lines and exact threshold boundaries", () => {
   const boundary = [
     ...Array.from({ length: 15 }, () => "word"),
@@ -68,14 +102,34 @@ test("fragmentation uses nonempty lines and exact threshold boundaries", () => {
   assert.equal(detectFragmentation("word\n\n".repeat(39)), null);
 });
 
-test("inspectTranscript returns both findings and clean status", () => {
+test("fragmentation distinguishes the exact mean-word and single-word boundaries", () => {
+  const exactMean = [
+    ...Array.from({ length: 20 }, () => "one two"),
+    ...Array.from({ length: 20 }, () => "one two three four five"),
+  ].join("\n");
+  assert.equal(detectFragmentation(exactMean).wordsPerLine, 3.5);
+
+  const aboveMean = [
+    ...Array.from({ length: 20 }, () => "one two"),
+    ...Array.from({ length: 20 }, () => "one two three four five six"),
+  ].join("\n");
+  assert.equal(detectFragmentation(aboveMean), null);
+
+  const exactSingleWordShare = [
+    ...Array.from({ length: 16 }, () => "word"),
+    ...Array.from({ length: 24 }, () => "one two three four five six"),
+  ].join("\n");
+  assert.equal(detectFragmentation(exactSingleWordShare).singleWordShare, 0.4);
+});
+
+test("inspectTranscript preserves simultaneous loop and fragmentation findings", () => {
   const cues = Array.from({ length: 50 }, (_, index) => ({
     startMs: index,
     endMs: index + 1,
-    text: "word" + index,
+    text: index < 10 ? "Why use the market?" : "word" + index,
   }));
   const result = inspectTranscript(cues);
-  assert.equal(result.loop, null);
+  assert.equal(result.loop.line, "why use the market?");
   assert.ok(result.fragmentation);
   assert.equal(result.clean, false);
 });
