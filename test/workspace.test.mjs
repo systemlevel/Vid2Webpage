@@ -222,3 +222,78 @@ test("marks completion only when explicitly requested and persists it atomically
   assert.match(manifest.completedAt, /^\d{4}-\d{2}-\d{2}T/);
   assert.deepEqual(JSON.parse(await readFile(workspace.manifestPath, "utf8")), manifest);
 });
+
+test("keeps completed workspaces readable and terminal across every mutation API", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-terminal-workspace-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source,
+  };
+  const first = await openWorkspace(options);
+  const building = await first.loadManifest();
+  const complete = await first.markComplete(building);
+  const completedBytes = await readFile(first.manifestPath, "utf8");
+  const resumed = await openWorkspace(options);
+
+  assert.deepEqual(await resumed.loadManifest(), complete);
+  for (const mutate of [
+    () => resumed.saveManifest(building),
+    () => resumed.saveManifest(complete),
+    () => resumed.recordFrame(building, capture()),
+    () => resumed.recordFrame(complete, capture()),
+    () => resumed.markComplete(building),
+    () => resumed.markComplete(complete),
+  ]) {
+    await assert.rejects(mutate(), OutputConflictError);
+    assert.equal(await readFile(resumed.manifestPath, "utf8"), completedBytes);
+  }
+});
+
+test("rejects traversal and malformed physical frame records without persisting them", async (t) => {
+  const workspace = await createWorkspace(t);
+  const manifest = await workspace.loadManifest();
+  const originalBytes = await readFile(workspace.manifestPath, "utf8");
+  const invalidFrames = [
+    capture({ filename: "../outside.jpg" }),
+    capture({ filename: "/tmp/outside.jpg" }),
+    { ...capture(), segmentIndex: 0 },
+    (() => {
+      const frame = capture();
+      delete frame.height;
+      return frame;
+    })(),
+    capture({ associations: [] }),
+    { ...capture(), width: 0 },
+  ];
+
+  for (const frame of invalidFrames) {
+    await assert.rejects(workspace.recordFrame(manifest, frame), OutputConflictError);
+    assert.equal(await readFile(workspace.manifestPath, "utf8"), originalBytes);
+  }
+  await assert.rejects(
+    workspace.canReuseFrame(capture({ filename: "nested/frame.jpg" })),
+    OutputConflictError,
+  );
+});
+
+test("rejects contradictory completed lifecycle state without replacing it", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-contradictory-manifest-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const outputDir = path.join(root, "output");
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir,
+    source,
+  };
+  const workspace = await openWorkspace(options);
+  const manifest = await workspace.loadManifest();
+  const contradictory = JSON.stringify({ ...manifest, status: "complete", completedAt: null });
+  await writeFile(workspace.manifestPath, contradictory);
+
+  await assert.rejects(openWorkspace(options), OutputConflictError);
+  assert.equal(await readFile(workspace.manifestPath, "utf8"), contradictory);
+});

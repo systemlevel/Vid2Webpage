@@ -11,9 +11,36 @@ const reasonPriority = new Map([
   ["scene", 1],
   ["caption", 2],
 ]);
+const frameKeys = [
+  "requestedMs",
+  "timestampMs",
+  "reasons",
+  "associations",
+  "filename",
+  "width",
+  "height",
+];
+const associationKeys = ["segmentIndex", "requestedMs", "reasons"];
 
 function conflict(message) {
   return new OutputConflictError(message);
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasExactKeys(value, keys) {
+  const actual = Object.keys(value).sort();
+  return actual.length === keys.length && actual.every((key, index) => key === [...keys].sort()[index]);
+}
+
+function isValidTimestamp(value) {
+  return typeof value === "string" && !Number.isNaN(Date.parse(value));
+}
+
+function isNonNegativeInteger(value) {
+  return Number.isSafeInteger(value) && value >= 0;
 }
 
 function compareReasons(left, right) {
@@ -21,37 +48,113 @@ function compareReasons(left, right) {
     || left.localeCompare(right);
 }
 
-function sortReasons(reasons) {
+function compareStringArrays(left, right) {
+  for (let index = 0; index < Math.min(left.length, right.length); index += 1) {
+    const comparison = left[index].localeCompare(right[index]);
+    if (comparison !== 0) return comparison;
+  }
+  return left.length - right.length;
+}
+
+function validateReasons(reasons, description) {
+  if (!Array.isArray(reasons) || reasons.length === 0
+    || reasons.some((reason) => typeof reason !== "string" || !reasonPriority.has(reason))
+    || new Set(reasons).size !== reasons.length) {
+    throw conflict(`${description} must contain unique known reasons`);
+  }
   return [...reasons].sort(compareReasons);
 }
 
-function sortAssociations(associations) {
-  return associations
-    .map((association) => ({ ...association, reasons: sortReasons(association.reasons) }))
-    .sort((left, right) => left.segmentIndex - right.segmentIndex
-      || left.requestedMs - right.requestedMs);
+function compareAssociations(left, right) {
+  return left.segmentIndex - right.segmentIndex
+    || left.requestedMs - right.requestedMs
+    || compareStringArrays(left.reasons, right.reasons);
 }
 
-function normalizeFrame(frame) {
+function assertSafeFilename(filename, imagesDir) {
+  if (typeof filename !== "string" || filename.length === 0
+    || path.isAbsolute(filename)
+    || filename !== path.basename(filename)
+    || filename.includes("/")
+    || filename.includes("\\")) {
+    throw conflict(`Frame filename is not a safe basename: ${filename}`);
+  }
+  const resolvedImagesDir = path.resolve(imagesDir);
+  const resolvedImagePath = path.resolve(imagesDir, filename);
+  if (!resolvedImagePath.startsWith(`${resolvedImagesDir}${path.sep}`)) {
+    throw conflict(`Frame filename escapes the images directory: ${filename}`);
+  }
+  return resolvedImagePath;
+}
+
+function validateFrame(frame, imagesDir, { canonical = false } = {}) {
+  if (!isPlainObject(frame) || !hasExactKeys(frame, frameKeys)) {
+    throw conflict("Frame record has an invalid shape");
+  }
+  if (!isNonNegativeInteger(frame.requestedMs) || !isNonNegativeInteger(frame.timestampMs)
+    || !Number.isSafeInteger(frame.width) || frame.width <= 0
+    || !Number.isSafeInteger(frame.height) || frame.height <= 0) {
+    throw conflict("Frame record has invalid timestamps or dimensions");
+  }
+  assertSafeFilename(frame.filename, imagesDir);
+  const sortedReasons = validateReasons(frame.reasons, "Frame reasons");
+  if (!Array.isArray(frame.associations) || frame.associations.length === 0) {
+    throw conflict("Frame record must include associations");
+  }
+  const associations = frame.associations.map((association) => {
+    if (!isPlainObject(association) || !hasExactKeys(association, associationKeys)
+      || !isNonNegativeInteger(association.segmentIndex)
+      || !isNonNegativeInteger(association.requestedMs)) {
+      throw conflict("Frame association has an invalid shape");
+    }
+    return {
+      segmentIndex: association.segmentIndex,
+      requestedMs: association.requestedMs,
+      reasons: validateReasons(association.reasons, "Frame association reasons"),
+    };
+  });
+  const associationReasons = [...new Set(associations.flatMap((association) => association.reasons))]
+    .sort(compareReasons);
+  if (!isDeepStrictEqual(sortedReasons, associationReasons)) {
+    throw conflict("Frame reasons must match the association reason union");
+  }
+
   return {
-    ...frame,
-    reasons: sortReasons(frame.reasons),
-    associations: sortAssociations(frame.associations),
+    requestedMs: frame.requestedMs,
+    timestampMs: frame.timestampMs,
+    reasons: canonical ? sortedReasons : [...frame.reasons],
+    associations: canonical ? associations.sort(compareAssociations) : frame.associations.map((association) => ({
+      segmentIndex: association.segmentIndex,
+      requestedMs: association.requestedMs,
+      reasons: [...association.reasons],
+    })),
+    filename: frame.filename,
+    width: frame.width,
+    height: frame.height,
   };
 }
 
-function isExpectedManifest(manifest, fingerprint) {
-  return manifest
-    && typeof manifest === "object"
-    && manifest.schemaVersion === 1
-    && (manifest.status === "building" || manifest.status === "complete")
-    && manifest.source
-    && typeof manifest.source === "object"
-    && manifest.source.fingerprint === fingerprint
-    && Array.isArray(manifest.segments)
-    && Array.isArray(manifest.images)
-    && typeof manifest.createdAt === "string"
-    && (manifest.completedAt === null || typeof manifest.completedAt === "string");
+function validateManifest(manifest, fingerprint, imagesDir) {
+  if (!isPlainObject(manifest)
+    || manifest.schemaVersion !== 1
+    || !isPlainObject(manifest.source)
+    || typeof manifest.source.fingerprint !== "string"
+    || manifest.source.fingerprint !== fingerprint
+    || !Object.hasOwn(manifest, "transcript")
+    || !(manifest.transcript === null || isPlainObject(manifest.transcript))
+    || !Array.isArray(manifest.segments)
+    || !Array.isArray(manifest.images)
+    || !isValidTimestamp(manifest.createdAt)
+    || !((manifest.status === "building" && manifest.completedAt === null)
+      || (manifest.status === "complete" && isValidTimestamp(manifest.completedAt)))) {
+    throw conflict("Output manifest is incompatible with this source");
+  }
+  for (const image of manifest.images) {
+    if (!isDeepStrictEqual(image, validateFrame(image, imagesDir, { canonical: true }))) {
+      throw conflict("Output manifest contains a noncanonical frame record");
+    }
+  }
+  return manifest;
 }
 
 async function statOrNull(filePath) {
@@ -71,17 +174,18 @@ async function ensureDirectory(directoryPath, description) {
   await mkdir(directoryPath, { recursive: true });
 }
 
-async function readManifest(manifestPath, fingerprint) {
+async function readManifest(manifestPath, fingerprint, imagesDir) {
+  const manifestText = await readFile(manifestPath, "utf8");
   let manifest;
   try {
-    manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-  } catch {
-    throw conflict(`Output manifest is malformed: ${manifestPath}`);
+    manifest = JSON.parse(manifestText);
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw conflict(`Output manifest is malformed: ${manifestPath}`);
+    }
+    throw error;
   }
-  if (!isExpectedManifest(manifest, fingerprint)) {
-    throw conflict(`Output manifest is incompatible with this source: ${manifestPath}`);
-  }
-  return manifest;
+  return validateManifest(manifest, fingerprint, imagesDir);
 }
 
 function initialManifest(source) {
@@ -116,26 +220,50 @@ export async function openWorkspace({ cacheRoot, fingerprint, outputDir, source 
     throw conflict(`Output manifest is not a safe file: ${manifestPath}`);
   }
 
+  let manifest;
   if (manifestInfo) {
-    await readManifest(manifestPath, fingerprint);
+    manifest = await readManifest(manifestPath, fingerprint, imagesDir);
   } else if ((await readdir(outputDir)).length > 0) {
     throw conflict(`Refusing to overwrite nonempty output without a v2w manifest: ${outputDir}`);
   } else {
-    await writeFileAtomic(manifestPath, `${JSON.stringify(initialManifest(source), null, 2)}\n`);
+    manifest = initialManifest(source);
+    await writeFileAtomic(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   }
 
-  await ensureDirectory(imagesDir, "Output images path");
+  if (manifest.status === "complete") {
+    const imagesInfo = await statOrNull(imagesDir);
+    if (!imagesInfo || !imagesInfo.isDirectory() || imagesInfo.isSymbolicLink()) {
+      throw conflict(`Completed output images path is not a safe directory: ${imagesDir}`);
+    }
+  } else {
+    await ensureDirectory(imagesDir, "Output images path");
+  }
 
   async function loadManifest() {
-    return readManifest(manifestPath, fingerprint);
+    return readManifest(manifestPath, fingerprint, imagesDir);
   }
 
-  async function saveManifest(manifest) {
-    if (!isExpectedManifest(manifest, fingerprint)) {
-      throw conflict(`Refusing to save an incompatible manifest: ${manifestPath}`);
+  async function currentBuildingManifest() {
+    const current = await loadManifest();
+    if (current.status !== "building") {
+      throw conflict("Completed output manifests are immutable");
     }
-    await writeFileAtomic(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-    return manifest;
+    return current;
+  }
+
+  async function writeManifest(nextManifest) {
+    validateManifest(nextManifest, fingerprint, imagesDir);
+    await writeFileAtomic(manifestPath, `${JSON.stringify(nextManifest, null, 2)}\n`);
+    return nextManifest;
+  }
+
+  async function saveManifest(nextManifest) {
+    validateManifest(nextManifest, fingerprint, imagesDir);
+    if (nextManifest.status !== "building") {
+      throw conflict("saveManifest only persists building manifests");
+    }
+    await currentBuildingManifest();
+    return writeManifest(nextManifest);
   }
 
   return {
@@ -145,30 +273,40 @@ export async function openWorkspace({ cacheRoot, fingerprint, outputDir, source 
     manifestPath,
     loadManifest,
     saveManifest,
-    async recordFrame(manifest, frame) {
-      const replacement = normalizeFrame(frame);
+    async recordFrame(manifestToUpdate, frame) {
+      validateManifest(manifestToUpdate, fingerprint, imagesDir);
+      if (manifestToUpdate.status !== "building") {
+        throw conflict("Cannot record frames in a completed manifest");
+      }
+      const replacement = validateFrame(frame, imagesDir, { canonical: true });
       const images = [
-        ...manifest.images.filter((image) => image.filename !== replacement.filename),
+        ...manifestToUpdate.images.filter((image) => image.filename !== replacement.filename),
         replacement,
       ].sort((left, right) => left.timestampMs - right.timestampMs
         || left.filename.localeCompare(right.filename));
-      return saveManifest({ ...manifest, images });
+      return saveManifest({ ...manifestToUpdate, images });
     },
-    async markComplete(manifest) {
-      return saveManifest({
-        ...manifest,
+    async markComplete(manifestToComplete) {
+      validateManifest(manifestToComplete, fingerprint, imagesDir);
+      if (manifestToComplete.status !== "building") {
+        throw conflict("Completed output manifests are immutable");
+      }
+      await currentBuildingManifest();
+      return writeManifest({
+        ...manifestToComplete,
         status: "complete",
         completedAt: new Date().toISOString(),
       });
     },
     async canReuseFrame(capture) {
-      const manifest = await loadManifest();
-      const image = manifest.images.find((entry) => entry.filename === capture.filename);
+      const requested = validateFrame(capture, imagesDir);
+      const manifestToCheck = await loadManifest();
+      const image = manifestToCheck.images.find((entry) => entry.filename === requested.filename);
       return Boolean(image)
-        && image.timestampMs === capture.timestampMs
-        && isDeepStrictEqual(image.reasons, capture.reasons)
-        && isDeepStrictEqual(image.associations, capture.associations)
-        && isNonEmptyFile(path.join(imagesDir, capture.filename));
+        && image.timestampMs === requested.timestampMs
+        && isDeepStrictEqual(image.reasons, requested.reasons)
+        && isDeepStrictEqual(image.associations, requested.associations)
+        && isNonEmptyFile(assertSafeFilename(requested.filename, imagesDir));
     },
   };
 }
