@@ -8,10 +8,10 @@ import { runCommand } from "./process.mjs";
 import { inspectTranscript } from "./quality.mjs";
 import { parseVtt } from "./vtt.mjs";
 
-const MLX_MODELS = {
-  "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
-  "mlx-community/whisper-large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
-};
+const MLX_MODELS = new Map([
+  ["large-v3-turbo", "mlx-community/whisper-large-v3-turbo"],
+  ["mlx-community/whisper-large-v3-turbo", "mlx-community/whisper-large-v3-turbo"],
+]);
 
 const DEFAULT_VOCAB_PATH = new URL("./vocab.txt", import.meta.url);
 
@@ -30,7 +30,7 @@ export function buildMlxArgs({
   model,
   vocabPrompt,
 }) {
-  const resolvedModel = MLX_MODELS[model];
+  const resolvedModel = MLX_MODELS.get(model);
   if (!resolvedModel) {
     throw new TranscriptionError(`Unsupported MLX model: ${model}`);
   }

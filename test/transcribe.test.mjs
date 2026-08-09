@@ -94,6 +94,33 @@ test("rejects unsupported MLX models", () => {
   });
 });
 
+test("rejects inherited model keys before runner execution", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "v2w-model-allowlist-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  for (const model of ["toString", "constructor", "__proto__"]) {
+    await t.test(model, async () => {
+      let runnerCalls = 0;
+      await assert.rejects(transcribeTimed({
+        audioPath: "/audio.m4a",
+        cacheDir: dir,
+        tools: { mlx: true, whisperCpp: false },
+        run: async () => {
+          runnerCalls += 1;
+          return { code: 0, stdout: "", stderr: "" };
+        },
+        model,
+        vocabPrompt: "",
+      }), (error) => {
+        assert(error instanceof TranscriptionError);
+        assert.match(error.message, /unsupported mlx model/i);
+        return true;
+      });
+      assert.equal(runnerCalls, 0);
+    });
+  }
+});
+
 test("builds whisper.cpp timed-VTT arguments", () => {
   assert.deepEqual(buildWhisperCppArgs({
     wavPath: "/cache/transcript.wav",
