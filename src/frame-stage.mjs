@@ -352,55 +352,80 @@ function readPriorBackupState(snapshot, imagesDir, fileOps) {
 function recoverPriorBackup(snapshot, imagesDir, manifest, fileOps) {
   const recovery = readPriorBackupState(snapshot, imagesDir, fileOps);
   if (recovery === null) return null;
-  if (recovery === false || !manifest) return false;
+  if (recovery === false || !manifest) return { status: "blocked" };
   const { backupMember, finalPath, state } = recovery;
   const currentFrame = currentManifestFrame(manifest, state.filename);
   let finalInfo;
   try {
     finalInfo = lstatOrNull(finalPath, fileOps);
   } catch {
-    return false;
+    return { status: "blocked" };
   }
 
   const committed = manifest.revision === state.nextRevision
     && isDeepStrictEqual(currentFrame, state.nextFrame);
-  if (committed) {
-    if (!isOwnedRegularFile(finalInfo, state.tempIdentity)) return false;
-    return removeCapturedGeneration(snapshot, fileOps);
+  if (committed && isOwnedRegularFile(finalInfo, state.tempIdentity)) {
+    return removeCapturedGeneration(snapshot, fileOps)
+      ? { status: "removed" }
+      : { status: "blocked" };
+  }
+
+  const transitionedAway = manifest.revision > state.priorRevision
+    && !isDeepStrictEqual(currentFrame, state.priorFrame);
+  if (transitionedAway) {
+    return removeCapturedGeneration(snapshot, fileOps)
+      ? { status: "removed" }
+      : { status: "blocked" };
   }
 
   const priorManifest = state.priorFrame !== null
     && manifest.revision === state.priorRevision
     && isDeepStrictEqual(currentFrame, state.priorFrame);
-  if (!priorManifest) return false;
+  if (!priorManifest) return { status: "blocked" };
+  if (!backupMember) return { status: "blocked" };
   if (state.sourceIdentity
-    && hasFileIdentity(state.backupIdentity, state.sourceIdentity)) return false;
+    && hasFileIdentity(state.backupIdentity, state.sourceIdentity)) {
+    return { status: "blocked" };
+  }
 
   if (!isOwnedRegularFile(finalInfo, state.backupIdentity)) {
     if (!backupMember
-      || !hasFileIdentity(backupMember.identity, state.backupIdentity)) return false;
+      || !hasFileIdentity(backupMember.identity, state.backupIdentity)) {
+      return { status: "blocked" };
+    }
     if (finalInfo) {
       const removablePublished = isOwnedRegularFile(finalInfo, state.tempIdentity);
       const removableAnchored = finalInfo.isFile()
         && !finalInfo.isSymbolicLink()
         && Number.isSafeInteger(finalInfo.nlink)
         && finalInfo.nlink > 1;
-      if (!removablePublished && !removableAnchored) return false;
+      if (!removablePublished && !removableAnchored) return { status: "blocked" };
       try {
         fileOps.unlink(finalPath);
       } catch {
-        return false;
+        return { status: "blocked" };
       }
     }
     try {
       fileOps.link(backupMember.path, finalPath);
       finalInfo = lstatOrNull(finalPath, fileOps);
     } catch {
-      return false;
+      return { status: "blocked" };
     }
-    if (!isOwnedRegularFile(finalInfo, state.backupIdentity)) return false;
+    if (!isOwnedRegularFile(finalInfo, state.backupIdentity)) {
+      return { status: "blocked" };
+    }
   }
-  return removeCapturedGeneration(snapshot, fileOps);
+  return {
+    status: "protected",
+    filename: state.filename,
+    generationPath: snapshot.generationPath,
+    generationIdentity: snapshot.generationIdentity,
+    backupIdentity: state.backupIdentity,
+    priorRevision: state.priorRevision,
+    priorFrame: state.priorFrame,
+    snapshot,
+  };
 }
 
 export function recoverFrameStagesSync(
@@ -409,6 +434,7 @@ export function recoverFrameStagesSync(
   { preserveGeneration, manifest } = {},
 ) {
   const blocked = [];
+  const protectedStages = [];
   const entries = fileOps.readdir(imagesDir, { withFileTypes: true });
   for (const entry of entries) {
     const token = generationPattern.exec(entry.name)?.[1];
@@ -422,8 +448,56 @@ export function recoverFrameStagesSync(
       continue;
     }
     const priorRecovery = recoverPriorBackup(snapshot, imagesDir, manifest, fileOps);
-    if (priorRecovery === true) continue;
-    if (priorRecovery === false || !removeCapturedGeneration(snapshot, fileOps)) {
+    if (priorRecovery?.status === "removed") continue;
+    if (priorRecovery?.status === "protected") {
+      protectedStages.push(priorRecovery);
+      continue;
+    }
+    if (priorRecovery?.status === "blocked"
+      || !removeCapturedGeneration(snapshot, fileOps)) {
+      blocked.push(generationPath);
+    }
+  }
+  return { blocked, protectedStages };
+}
+
+export function retireProtectedFrameStagesSync(
+  imagesDir,
+  fileOps,
+  { manifest, protectedStages, committedFrame, priorRevision },
+) {
+  const blocked = [];
+  for (const protectedStage of protectedStages) {
+    const generationPath = protectedStage.generationPath;
+    const token = stageToken(generationPath);
+    if (!token
+      || path.dirname(path.resolve(generationPath)) !== path.resolve(imagesDir)
+      || protectedStage.snapshot?.generationPath !== generationPath
+      || !hasFileIdentity(
+        protectedStage.snapshot?.generationIdentity,
+        protectedStage.generationIdentity,
+      )) {
+      blocked.push(generationPath);
+      continue;
+    }
+    const snapshot = protectedStage.snapshot;
+    const recovery = readPriorBackupState(snapshot, imagesDir, fileOps);
+    const currentFrame = recovery && recovery !== false
+      ? currentManifestFrame(manifest, recovery.state.filename)
+      : null;
+    if (!recovery
+      || recovery === false
+      || !recovery.backupMember
+      || recovery.state.filename !== protectedStage.filename
+      || recovery.state.priorRevision !== protectedStage.priorRevision
+      || recovery.state.priorRevision !== priorRevision
+      || !isDeepStrictEqual(recovery.state.priorFrame, protectedStage.priorFrame)
+      || !hasFileIdentity(recovery.state.backupIdentity, protectedStage.backupIdentity)
+      || manifest.revision !== priorRevision + 1
+      || !committedFrame
+      || committedFrame.filename !== protectedStage.filename
+      || !isDeepStrictEqual(currentFrame, committedFrame)
+      || !removeCapturedGeneration(snapshot, fileOps)) {
       blocked.push(generationPath);
     }
   }
@@ -486,7 +560,6 @@ function restoreBackupAfterPublishFailure(prepared, finalPath, fileOps, failure)
     }
     const restored = lstatOrNull(finalPath, fileOps);
     if (isOwnedRegularFile(restored, prepared.backupIdentity)) {
-      prepared.preserveBackup = false;
       return;
     }
   } catch (restoreError) {
@@ -574,7 +647,5 @@ export function rollbackFramePublicationSync(prepared, finalPath, fileOps) {
     fileOps.link(prepared.backupPath, finalPath);
   }
   const restored = lstatOrNull(finalPath, fileOps);
-  if (isOwnedRegularFile(restored, prepared.backupIdentity)) {
-    prepared.preserveBackup = false;
-  }
+  return isOwnedRegularFile(restored, prepared.backupIdentity);
 }

@@ -24,6 +24,7 @@ import {
   publishFrameSync,
   recoverFrameStagesSync,
   resolveFrameFileOps,
+  retireProtectedFrameStagesSync,
   rollbackFramePublicationSync,
 } from "./frame-stage.mjs";
 
@@ -768,24 +769,49 @@ export async function openWorkspace({
       if (manifestToUpdate.revision !== current.revision) {
         throw conflict("Workspace manifest revision is stale");
       }
-      const blockedStages = recoverFrameStagesSync(imagesDir, resolvedFrameFileOps, {
+      const recovery = recoverFrameStagesSync(imagesDir, resolvedFrameFileOps, {
         preserveGeneration,
         manifest: current,
       });
-      if (blockedStages.length > 0) {
-        throw conflict(`Abandoned frame generation changed during recovery: ${blockedStages[0]}`);
+      if (recovery.blocked.length > 0) {
+        throw conflict(`Abandoned frame generation changed during recovery: ${recovery.blocked[0]}`);
       }
+      const protectedFilenames = new Set(
+        recovery.protectedStages.map((stage) => stage.filename),
+      );
       let committed = false;
       return operation({
         manifest: current,
-        canReuseFrame: (capture) => reuseFrameFromManifest(current, capture),
+        canReuseFrame: (capture) => protectedFilenames.has(capture.filename)
+          ? false
+          : reuseFrameFromManifest(current, capture),
         cleanupFrame(stage) {
           cleanupFrameStageSync(validateFrameStageCleanup(stage), resolvedFrameFileOps);
         },
         async commitFrame(preparedFrame) {
           if (committed) throw conflict("Frame lease already committed");
           committed = true;
-          return commitPreparedFrame(current, preparedFrame);
+          const writtenManifest = await commitPreparedFrame(current, preparedFrame);
+          const protectedForFrame = recovery.protectedStages.filter((stage) =>
+            stage.filename === preparedFrame.frame.filename);
+          const committedFrame = writtenManifest.images.find((frame) =>
+            frame.filename === preparedFrame.frame.filename);
+          const blockedRetirements = retireProtectedFrameStagesSync(
+            imagesDir,
+            resolvedFrameFileOps,
+            {
+              manifest: writtenManifest,
+              protectedStages: protectedForFrame,
+              committedFrame,
+              priorRevision: current.revision,
+            },
+          );
+          if (blockedRetirements.length > 0) {
+            throw conflict(
+              `Protected frame generation changed during retirement: ${blockedRetirements[0]}`,
+            );
+          }
+          return writtenManifest;
         },
       });
     });

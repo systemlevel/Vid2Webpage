@@ -878,7 +878,7 @@ test("prior final is restored after no-overwrite publication failure and resumed
 
   assert.equal((await failingWorkspace.loadManifest()).revision, 1);
   assert.equal(await readFile(finalPath, "utf8"), "prior-jpeg");
-  assert.deepEqual(await readdir(failingWorkspace.imagesDir), [planned.filename]);
+  await assertProtectedPriorBackup(failingWorkspace.imagesDir, "prior-jpeg");
 
   const resumed = await openWorkspace(options);
   const recovered = await extractFrames({
@@ -1074,6 +1074,203 @@ test("rollback relink failure retains prior backup and real resume restores then
   assert.equal(recovered.revision, initial.revision + 1);
   assert.equal(recovered.images[0].timestampMs, changed.timestampMs);
   assert.equal(await readFile(finalPath, "utf8"), "recovered-jpeg");
+  assert.equal((await resumed.markComplete(recovered)).status, "complete");
+  assert.deepEqual(await readdir(resumed.imagesDir), [planned.filename]);
+});
+
+test("live rollback retains the prior backup when the restored final is replaced before cleanup", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-live-rollback-final-replacement-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const videoPath = path.join(root, "source-video.mov");
+  const foreignPath = path.join(root, "foreign-final.jpg");
+  await writeFile(videoPath, "source-video-bytes");
+  await writeFile(foreignPath, "foreign-final");
+  const foreignIdentity = identity(await lstat(foreignPath));
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source: { ...source, input: videoPath },
+  };
+  const planned = capture();
+  delete planned.width;
+  delete planned.height;
+  const initialWorkspace = await openWorkspace(options);
+  const initial = await extractFrames({
+    videoPath,
+    captures: [planned],
+    workspace: initialWorkspace,
+    manifest: await initialWorkspace.loadManifest(),
+    run: frameRunner("prior-jpeg"),
+    log: { info() {} },
+  });
+  const finalPath = path.join(initialWorkspace.imagesDir, planned.filename);
+  const manifestFailure = new Error("injected frame manifest failure");
+  const failingWorkspace = await openWorkspace({
+    ...options,
+    hooks: {
+      beforeFrameManifestWrite() {
+        throw manifestFailure;
+      },
+    },
+  });
+  const changed = { ...planned, timestampMs: planned.timestampMs + 1 };
+  let replacedAfterRollback = false;
+
+  await assert.rejects(extractFrames({
+    videoPath,
+    captures: [changed],
+    workspace: failingWorkspace,
+    manifest: initial,
+    run: frameRunner("failed-new-jpeg"),
+    log: { info() {} },
+    fileOps: {
+      async open(filePath, flags, mode) {
+        const handle = await open(filePath, flags, mode);
+        if (path.basename(filePath) !== planned.filename) return handle;
+        return {
+          get fd() {
+            return handle.fd;
+          },
+          stat: (...args) => handle.stat(...args),
+          async close() {
+            if (!replacedAfterRollback) {
+              replacedAfterRollback = true;
+              unlinkSync(finalPath);
+              linkSync(foreignPath, finalPath);
+            }
+            await handle.close();
+          },
+        };
+      },
+    },
+  }), (error) => error instanceof SourceError && error.cause === manifestFailure);
+
+  assert.equal(replacedAfterRollback, true);
+  assert.equal((await failingWorkspace.loadManifest()).revision, initial.revision);
+  assert.deepEqual(identity(await lstat(finalPath)), foreignIdentity);
+  assert.equal(await readFile(finalPath, "utf8"), "foreign-final");
+  await assertProtectedPriorBackup(failingWorkspace.imagesDir, "prior-jpeg");
+});
+
+test("restart recovery retains the prior backup when its verified final is replaced before cleanup", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-recovery-final-replacement-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const videoPath = path.join(root, "source-video.mov");
+  const foreignPath = path.join(root, "foreign-final.jpg");
+  await writeFile(videoPath, "source-video-bytes");
+  await writeFile(foreignPath, "foreign-final");
+  const foreignIdentity = identity(await lstat(foreignPath));
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source: { ...source, input: videoPath },
+  };
+  const planned = capture();
+  delete planned.width;
+  delete planned.height;
+  const initialWorkspace = await openWorkspace(options);
+  const initial = await extractFrames({
+    videoPath,
+    captures: [planned],
+    workspace: initialWorkspace,
+    manifest: await initialWorkspace.loadManifest(),
+    run: frameRunner("prior-jpeg"),
+    log: { info() {} },
+  });
+  const finalPath = path.join(initialWorkspace.imagesDir, planned.filename);
+  const manifestFailure = new Error("injected frame manifest failure");
+  const relinkFailure = Object.assign(new Error("injected rollback relink failure"), {
+    code: "EIO",
+  });
+  let relinkFailed = false;
+  const interruptedWorkspace = await openWorkspace({
+    ...options,
+    hooks: {
+      beforeFrameManifestWrite() {
+        throw manifestFailure;
+      },
+    },
+    frameFileOps: {
+      link(from, to) {
+        if (!relinkFailed
+          && to === finalPath
+          && path.basename(from).startsWith("previous-")) {
+          relinkFailed = true;
+          throw relinkFailure;
+        }
+        linkSync(from, to);
+      },
+    },
+  });
+  const changed = { ...planned, timestampMs: planned.timestampMs + 1 };
+  await assert.rejects(extractFrames({
+    videoPath,
+    captures: [changed],
+    workspace: interruptedWorkspace,
+    manifest: initial,
+    run: frameRunner("failed-new-jpeg"),
+    log: { info() {} },
+  }), SourceError);
+  assert.equal(relinkFailed, true);
+  await assert.rejects(access(finalPath));
+  await assertProtectedPriorBackup(interruptedWorkspace.imagesDir, "prior-jpeg");
+
+  let restored = false;
+  let replacedAfterVerification = false;
+  const recoveryWorkspace = await openWorkspace({
+    ...options,
+    frameFileOps: {
+      link(from, to) {
+        linkSync(from, to);
+        if (to === finalPath && path.basename(from).startsWith("previous-")) {
+          restored = true;
+        }
+      },
+      lstat(filePath) {
+        const info = lstatSync(filePath);
+        if (filePath === finalPath && restored && !replacedAfterVerification) {
+          replacedAfterVerification = true;
+          unlinkSync(finalPath);
+          linkSync(foreignPath, finalPath);
+        }
+        return info;
+      },
+    },
+  });
+  const stopAfterRecovery = new Error("stop after recovery");
+  await assert.rejects(extractFrames({
+    videoPath,
+    captures: [changed],
+    workspace: recoveryWorkspace,
+    manifest: await recoveryWorkspace.loadManifest(),
+    run: async () => { throw stopAfterRecovery; },
+    log: { info() {} },
+  }), (error) => error instanceof SourceError && error.cause === stopAfterRecovery);
+
+  assert.equal(replacedAfterVerification, true);
+  assert.equal((await recoveryWorkspace.loadManifest()).revision, initial.revision);
+  assert.deepEqual(identity(await lstat(finalPath)), foreignIdentity);
+  assert.equal(await readFile(finalPath, "utf8"), "foreign-final");
+  await assertProtectedPriorBackup(recoveryWorkspace.imagesDir, "prior-jpeg");
+
+  let ffmpegCalls = 0;
+  const resumed = await openWorkspace(options);
+  const recovered = await extractFrames({
+    videoPath,
+    captures: [planned],
+    workspace: resumed,
+    manifest: await resumed.loadManifest(),
+    run: async (command, args) => {
+      if (command === "ffmpeg") ffmpegCalls += 1;
+      return frameRunner("republished-jpeg")(command, args);
+    },
+    log: { info() {} },
+  });
+  assert.equal(ffmpegCalls, 1);
+  assert.equal(recovered.revision, initial.revision + 1);
+  assert.equal(await readFile(finalPath, "utf8"), "republished-jpeg");
   assert.equal((await resumed.markComplete(recovered)).status, "complete");
   assert.deepEqual(await readdir(resumed.imagesDir), [planned.filename]);
 });
