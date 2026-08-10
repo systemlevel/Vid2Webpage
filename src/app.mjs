@@ -20,7 +20,13 @@ import {
   removeOwnedFile,
   reserveOwnedArtifact,
 } from "./fs.mjs";
-import { discoverLocalCaption, extractAudio, probeMedia } from "./media.mjs";
+import {
+  discoverLocalCaption,
+  extractAudio,
+  locateLocalCaption,
+  materializeLocalCaption,
+  probeMedia,
+} from "./media.mjs";
 import { defaultCacheRoot, preflight } from "./preflight.mjs";
 import { inspectTranscript } from "./quality.mjs";
 import { renderOutput } from "./render.mjs";
@@ -60,8 +66,10 @@ export const DEFAULT_SERVICES = Object.freeze({
   inspectTranscript,
   isNonEmptyFile,
   listFrameTimestamps,
+  locateLocalCaption,
   loadVocabPrompt,
   localFingerprint,
+  materializeLocalCaption,
   openWorkspace,
   parseVtt,
   pathMatchesFileIdentity,
@@ -136,11 +144,15 @@ async function transcribeAuthoritatively({
   cacheDir,
   tools,
   protectedFiles,
+  retentionDir,
   services,
 }) {
   const audioOutputPath = path.join(cacheDir, "audio.m4a");
   await rejectProtectedAlias(audioOutputPath, protectedFiles, services, "Audio output");
-  const audioReservation = await reserveOwnedArtifact(audioOutputPath, { protectedFiles });
+  const audioReservation = await reserveOwnedArtifact(audioOutputPath, {
+    protectedFiles,
+    retentionDir,
+  });
   let audioArtifact;
   try {
     try {
@@ -152,7 +164,7 @@ async function transcribeAuthoritatively({
       if (extractionResult !== undefined) {
         throw new SourceError("Audio extraction must use only the provided output capability");
       }
-      audioArtifact = await audioReservation.publish({ protectedFiles });
+      audioArtifact = await audioReservation.publish({ protectedFiles, retentionDir });
     } catch (error) {
       if (error instanceof SourceError) throw error;
       throw new SourceError(`Unable to publish extracted audio: ${audioOutputPath}`, {
@@ -378,6 +390,7 @@ export async function runPipeline(
   const cleanupFiles = [];
   let videoPath = classified.path;
   let captionPath = null;
+  let captionLocation = null;
 
   if (classified.kind === "youtube") {
     videoPath = await services.downloadYoutubeMedia({
@@ -393,54 +406,12 @@ export async function runPipeline(
 
   const mediaInfo = await services.probeMedia(videoPath);
   if (classified.kind === "local") {
-    const captionOutputPath = path.join(cacheDir, "captions.vtt");
-    await rejectProtectedAlias(
-      captionOutputPath,
-      protectedFiles,
-      services,
-      "Caption cache output",
-    );
-    const captionReservation = await reserveOwnedArtifact(captionOutputPath, { protectedFiles });
-    let captionArtifact;
-    try {
-      const captionResult = await services.discoverLocalCaption({
-        videoPath,
-        mediaInfo,
-        output: captionReservation.writer,
-        protectedFiles,
-      });
-      if (captionResult?.kind === "capability-output") {
-        const captionProtectedFiles = Array.isArray(captionResult.protectedFiles)
-          ? captionResult.protectedFiles
-          : protectedFiles;
-        captionArtifact = await captionReservation.publish({
-          protectedFiles: captionProtectedFiles,
-        });
-        addProtectedFiles(protectedFiles, captionProtectedFiles);
-        captionPath = captionArtifact.path;
-        cleanupFiles.push(captionArtifact);
-      } else {
-        captionPath = typeof captionResult === "string" ? captionResult : null;
-      }
-    } finally {
-      await captionReservation.discard();
-    }
-    if (captionPath) {
-      await rejectProtectedAlias(
-        captionPath,
-        protectedFiles,
-        services,
-        "Local caption",
+    captionLocation = await services.locateLocalCaption({ videoPath, mediaInfo });
+    if (captionLocation?.kind === "vtt" || captionLocation?.kind === "srt") {
+      protectedFiles.push(
+        await protectLocalFile(captionLocation.path, "caption", services),
       );
-      if (captionArtifact) {
-        protectedFiles.push({
-          ...captionArtifact,
-          canonicalPath: await services.canonicalPath(captionArtifact.path),
-          label: "caption",
-        });
-      } else {
-        protectedFiles.push(await protectLocalFile(captionPath, "caption", services));
-      }
+      if (captionLocation.kind === "vtt") captionPath = captionLocation.path;
     }
   }
 
@@ -457,6 +428,7 @@ export async function runPipeline(
     fingerprint,
     outputDir,
     source,
+    protectedFiles,
   });
   let manifest = await workspace.loadManifest();
 
@@ -469,6 +441,44 @@ export async function runPipeline(
       services,
     });
     return manifest;
+  }
+
+  if (classified.kind === "local"
+    && captionLocation
+    && captionLocation.kind !== "vtt") {
+    const captionOutputPath = path.join(cacheDir, "captions.vtt");
+    await rejectProtectedAlias(
+      captionOutputPath,
+      protectedFiles,
+      services,
+      "Caption cache output",
+    );
+    const captionReservation = await reserveOwnedArtifact(captionOutputPath, {
+      protectedFiles,
+      retentionDir: workspace.cacheRetentionDir,
+    });
+    try {
+      const captionResult = await services.materializeLocalCaption({
+        videoPath,
+        location: captionLocation,
+        output: captionReservation.writer,
+        protectedFiles,
+      });
+      if (captionResult?.kind === "capability-output") {
+        const captionProtectedFiles = Array.isArray(captionResult.protectedFiles)
+          ? captionResult.protectedFiles
+          : protectedFiles;
+        addProtectedFiles(protectedFiles, captionProtectedFiles);
+        const captionArtifact = await captionReservation.publish({
+          protectedFiles: captionProtectedFiles,
+          retentionDir: workspace.cacheRetentionDir,
+        });
+        captionPath = captionArtifact.path;
+        cleanupFiles.push(captionArtifact);
+      }
+    } finally {
+      await captionReservation.discard();
+    }
   }
 
   await rejectProtectedAlias(
@@ -484,6 +494,7 @@ export async function runPipeline(
       cacheDir,
       tools,
       protectedFiles,
+      retentionDir: workspace.cacheRetentionDir,
       services,
     });
     cleanupFiles.push(transcript.audioArtifact);

@@ -75,7 +75,11 @@ const manifest = {
   ],
 };
 
-async function createRenderableWorkspace(t, { engine = "mlx-whisper" } = {}) {
+async function createRenderableWorkspace(t, {
+  engine = "mlx-whisper",
+  hooks = {},
+  protectVideo = false,
+} = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "v2w-render-workspace-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const videoPath = path.join(root, "video.mov");
@@ -89,11 +93,20 @@ async function createRenderableWorkspace(t, { engine = "mlx-whisper" } = {}) {
     width: 1_920,
     height: 1_080,
   };
+  const videoInfo = await stat(videoPath);
+  const protectedFiles = protectVideo ? [{
+    label: "video",
+    path: videoPath,
+    canonicalPath: videoPath,
+    identity: { dev: videoInfo.dev, ino: videoInfo.ino },
+  }] : [];
   const workspace = await openWorkspace({
     cacheRoot: path.join(root, "cache"),
     fingerprint: source.fingerprint,
     outputDir: path.join(root, "output"),
     source,
+    hooks,
+    protectedFiles,
   });
   let building = await workspace.loadManifest();
   building = await workspace.saveManifest({
@@ -105,7 +118,7 @@ async function createRenderableWorkspace(t, { engine = "mlx-whisper" } = {}) {
     building = await workspace.recordFrame(building, structuredClone(image));
     await writeFile(path.join(workspace.imagesDir, image.filename), "jpeg-bytes");
   }
-  return { root, workspace, building };
+  return { root, workspace, building, protectedFiles };
 }
 
 test("renders escaped Whisper content and association-aware screenshot galleries", () => {
@@ -300,13 +313,16 @@ test("render publication retains a protected hard link introduced at the destina
   const transcriptVttPath = path.join(dir, "cached.vtt");
   const captionPath = path.join(dir, "lesson.vtt");
   const destinationPath = path.join(outputDir, "transcript.vtt");
+  const retentionDir = path.join(dir, "retention");
   await mkdir(outputDir);
+  await mkdir(retentionDir);
   await writeFile(transcriptVttPath, "WEBVTT\n\nrendered transcript\n");
   await writeFile(captionPath, "protected-caption-bytes");
   const captionBefore = await stat(captionPath);
   await link(captionPath, destinationPath);
   const workspace = {
     outputDir,
+    retentionDir,
     async withRenderLease(value, operation) {
       return operation({
         manifest: value,
@@ -351,7 +367,9 @@ test("render publication atomically captures a protected swap at the former rena
   const transcriptVttPath = path.join(dir, "cached.vtt");
   const captionPath = path.join(dir, "lesson.vtt");
   const destinationPath = path.join(outputDir, "transcript.vtt");
+  const retentionDir = path.join(dir, "retention");
   await mkdir(outputDir);
+  await mkdir(retentionDir);
   await writeFile(transcriptVttPath, "WEBVTT\n\nrendered transcript\n");
   await writeFile(captionPath, "protected-caption");
   await writeFile(destinationPath, "prior-render");
@@ -359,6 +377,7 @@ test("render publication atomically captures a protected swap at the former rena
   let injected = false;
   const workspace = {
     outputDir,
+    retentionDir,
     async withRenderLease(value, operation) {
       return operation({
         manifest: value,
@@ -420,6 +439,49 @@ test("completes a real association-aware workspace without duplicating physical 
   assert.equal((await workspace.loadManifest()).status, "complete");
   assert.equal((html.match(/images\/000003000-primary\.jpg/g) ?? []).length, 4);
   assert.match(html, /2 screenshots/);
+});
+
+test("an interrupted protected render replaces its own assets and completes on retry", async (t) => {
+  const interruption = new Error("injected protected render interruption");
+  let interrupt = true;
+  const { root, workspace, building, protectedFiles } = await createRenderableWorkspace(t, {
+    protectVideo: true,
+    hooks: {
+      beforeCompletionInventory() {
+        if (interrupt) {
+          interrupt = false;
+          throw interruption;
+        }
+      },
+    },
+  });
+  const transcriptVttPath = path.join(root, "cached.vtt");
+  await writeFile(
+    transcriptVttPath,
+    "WEBVTT\n\n00:00:01.000 --> 00:00:05.000\nWhisper retry text\n",
+  );
+
+  await assert.rejects(renderOutput({
+    workspace,
+    manifest: building,
+    segments,
+    transcriptVttPath,
+    protectedFiles,
+  }), (error) => error === interruption);
+  for (const name of ["transcript.vtt", "styles.css", "index.html"]) {
+    assert.ok((await stat(path.join(workspace.outputDir, name))).size > 0);
+  }
+
+  const completed = await renderOutput({
+    workspace,
+    manifest: await workspace.loadManifest(),
+    segments,
+    transcriptVttPath,
+    protectedFiles,
+  });
+
+  assert.equal(completed.status, "complete");
+  assert.equal((await workspace.loadManifest()).status, "complete");
 });
 
 test("rejects stale completed rendering before it can overwrite published assets", async (t) => {

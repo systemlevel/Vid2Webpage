@@ -172,6 +172,23 @@ async function assertPublishedOutput(outputDir, completed) {
   const html = await readFile(path.join(outputDir, "index.html"), "utf8");
   assert.match(html, /Composition Whisper words/);
   assert.doesNotMatch(html, /caption poison|returned cue poison/);
+  const inventory = [];
+  const visit = async (directory, prefix = "") => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const relative = path.join(prefix, entry.name);
+      inventory.push(relative);
+      if (entry.isDirectory()) await visit(path.join(directory, entry.name), relative);
+    }
+  };
+  await visit(outputDir);
+  assert.deepEqual(inventory.sort(), [
+    "images",
+    ...manifest.images.map((image) => path.join("images", image.filename)),
+    "index.html",
+    "manifest.json",
+    "styles.css",
+    "transcript.vtt",
+  ].sort());
   return { manifest, html };
 }
 

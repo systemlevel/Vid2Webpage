@@ -1,7 +1,9 @@
+import { randomUUID } from "node:crypto";
 import {
   fstatSync,
   linkSync,
   lstatSync,
+  mkdirSync,
   readFileSync,
   readdirSync,
   renameSync,
@@ -22,6 +24,7 @@ const nativeFrameFileOps = {
   fstat: fstatSync,
   link: linkSync,
   lstat: lstatSync,
+  mkdir: mkdirSync,
   readFile: readFileSync,
   readdir: readdirSync,
   rename: renameSync,
@@ -76,6 +79,30 @@ function isOwnedRegularFile(info, expectedIdentity) {
 
 function stageToken(generationPath) {
   return generationPattern.exec(path.basename(generationPath))?.[1] ?? null;
+}
+
+export function reserveProtectedFrameRetentionPathSync(
+  retentionDir,
+  token,
+  fileOps,
+) {
+  if (typeof retentionDir !== "string" || retentionDir.length === 0
+    || typeof token !== "string" || !/^[0-9a-f-]+$/u.test(token)) {
+    throw new FrameStageConflictError("Protected frame retention path is invalid");
+  }
+  const retentionInfo = lstatOrNull(retentionDir, fileOps);
+  if (!retentionInfo
+    || !retentionInfo.isDirectory()
+    || retentionInfo.isSymbolicLink()) {
+    throw new FrameStageConflictError("Protected frame retention root is unsafe");
+  }
+  const slotPath = path.join(retentionDir, `frame-${token}-${randomUUID()}`);
+  fileOps.mkdir(slotPath, { mode: 0o700 });
+  const slotInfo = lstatOrNull(slotPath, fileOps);
+  if (!slotInfo || !slotInfo.isDirectory() || slotInfo.isSymbolicLink()) {
+    throw new FrameStageConflictError("Protected frame retention slot is unsafe");
+  }
+  return path.join(slotPath, "stage");
 }
 
 function ownerTextMatches(ownerPath, token, fileOps) {
@@ -446,11 +473,40 @@ function recoverPriorBackup(snapshot, imagesDir, manifest, fileOps) {
 export function recoverFrameStagesSync(
   imagesDir,
   fileOps,
-  { preserveGeneration, manifest } = {},
+  {
+    preserveGeneration,
+    manifest,
+    protectedFiles = [],
+    retentionDir,
+  } = {},
 ) {
   const blocked = [];
   const protectedStages = [];
   const entries = fileOps.readdir(imagesDir, { withFileTypes: true });
+  if (protectedFiles.length > 0) {
+    for (const entry of entries) {
+      const token = generationPattern.exec(entry.name)?.[1];
+      if (!token) continue;
+      const generationPath = path.join(imagesDir, entry.name);
+      if (preserveGeneration
+        && path.resolve(preserveGeneration) === path.resolve(generationPath)) continue;
+      if (!entry.isDirectory() || entry.isSymbolicLink()) {
+        blocked.push(generationPath);
+        continue;
+      }
+      try {
+        const retainedPath = reserveProtectedFrameRetentionPathSync(
+          retentionDir,
+          token,
+          fileOps,
+        );
+        fileOps.rename(generationPath, retainedPath);
+      } catch {
+        blocked.push(generationPath);
+      }
+    }
+    return { blocked, protectedStages };
+  }
   for (const entry of entries) {
     const token = generationPattern.exec(entry.name)?.[1];
     if (!token || !entry.isDirectory() || entry.isSymbolicLink()) continue;
@@ -566,6 +622,16 @@ function writePriorBackupState(prepared, fileOps) {
   prepared.backupStateIdentity = fileIdentity(stateInfo);
 }
 
+function restoreCapturedNoOverwrite(capturedPath, finalPath, fileOps) {
+  try {
+    fileOps.link(capturedPath, finalPath);
+    return true;
+  } catch (error) {
+    if (error.code === "EEXIST") return false;
+    throw error;
+  }
+}
+
 function restoreBackupAfterPublishFailure(prepared, finalPath, fileOps, failure) {
   if (!prepared.backupIdentity) return;
   prepared.preserveBackup = true;
@@ -587,6 +653,7 @@ function restoreBackupAfterPublishFailure(prepared, finalPath, fileOps, failure)
 
 function publishProtectedFrameSync(prepared, finalPath, fileOps, protectedFiles) {
   const backupPath = path.join(prepared.generationPath, `previous-${prepared.token}`);
+  const observed = lstatOrNull(finalPath, fileOps);
   let captured = false;
   try {
     fileOps.rename(finalPath, backupPath);
@@ -596,23 +663,34 @@ function publishProtectedFrameSync(prepared, finalPath, fileOps, protectedFiles)
   }
 
   if (captured) {
-    const backupInfo = statOrNull(backupPath, fileOps);
-    if (!backupInfo || !backupInfo.isFile()) {
+    const backupInfo = lstatOrNull(backupPath, fileOps);
+    if (!observed
+      || !backupInfo
+      || !observed.isFile()
+      || observed.isSymbolicLink()
+      || !backupInfo.isFile()
+      || backupInfo.isSymbolicLink()
+      || !hasFileIdentity(backupInfo, fileIdentity(observed))) {
+      if (backupInfo?.isFile() && !backupInfo.isSymbolicLink()) {
+        restoreCapturedNoOverwrite(backupPath, finalPath, fileOps);
+      }
       throw frameConflict("Atomically captured frame output is not a regular file");
     }
     prepared.backupPath = backupPath;
     prepared.backupIdentity = fileIdentity(backupInfo);
     prepared.preserveBackup = true;
-    const message = infoIsProtected(backupInfo, protectedFiles)
-      ? "Atomically captured frame output aliases a protected local file"
-      : "Atomically captured frame output ownership is unproven in protected mode";
-    restoreBackupAfterPublishFailure(
-      prepared,
-      finalPath,
-      fileOps,
-      frameConflict(message),
-    );
-    throw frameConflict(message);
+    if (infoIsProtected(backupInfo, protectedFiles)) {
+      const message = "Atomically captured frame output aliases a protected local file";
+      restoreBackupAfterPublishFailure(
+        prepared,
+        finalPath,
+        fileOps,
+        frameConflict(message),
+      );
+      throw frameConflict(message);
+    }
+  } else if (observed) {
+    throw frameConflict("Frame output changed during atomic capture");
   }
 
   const currentTemp = lstatOrNull(prepared.tempPath, fileOps);
@@ -650,13 +728,15 @@ export function publishFrameSync(prepared, finalPath, fileOps) {
     throw frameConflict("Frame output must not alias the local video");
   }
   const protectedFiles = prepared.protectedFiles ?? [];
-  if (pathIsProtected(finalPath, protectedFiles)
-    || infoIsProtected(statOrNull(finalPath, fileOps), protectedFiles)) {
+  if (pathIsProtected(finalPath, protectedFiles)) {
     throw frameConflict("Frame output must not alias a protected local file");
   }
   if (protectedFiles.length > 0) {
     publishProtectedFrameSync(prepared, finalPath, fileOps, protectedFiles);
     return;
+  }
+  if (infoIsProtected(statOrNull(finalPath, fileOps), protectedFiles)) {
+    throw frameConflict("Frame output must not alias a protected local file");
   }
 
   const priorFinal = lstatOrNull(finalPath, fileOps);

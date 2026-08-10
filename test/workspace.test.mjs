@@ -2200,6 +2200,188 @@ test("recovery preserves a replacement member introduced between capture and unl
   assert.equal(await readFile(ownerPath, "utf8"), token);
 });
 
+test("protected restart recovery quarantines a whole generation across the former member-unlink gap", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-protected-recovery-quarantine-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const videoPath = path.join(root, "lesson.mov");
+  const captionPath = path.join(root, "lesson.vtt");
+  await writeFile(videoPath, "protected-video");
+  await writeFile(captionPath, "protected-caption");
+  const videoBefore = await lstat(videoPath);
+  const captionBefore = await lstat(captionPath);
+  const protectedFiles = [
+    {
+      label: "video",
+      path: videoPath,
+      canonicalPath: videoPath,
+      identity: identity(videoBefore),
+    },
+    {
+      label: "caption",
+      path: captionPath,
+      canonicalPath: captionPath,
+      identity: identity(captionBefore),
+    },
+  ];
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source: { ...source, input: videoPath },
+    protectedFiles,
+  };
+  const initialWorkspace = await openWorkspace(options);
+  const token = "00000000-0000-4000-8000-000000000203";
+  const generationPath = path.join(initialWorkspace.imagesDir, `.v2w-frame-stage-${token}`);
+  const ownerPath = path.join(generationPath, `owner-${token}`);
+  const memberPath = path.join(generationPath, "abandoned.jpg");
+  await mkdir(generationPath, { mode: 0o700 });
+  await writeFile(ownerPath, token);
+  await writeFile(memberPath, "owned-abandoned-member");
+  let injected = false;
+  let retainedGenerationPath;
+  let memberUnlinks = 0;
+  const workspace = await openWorkspace({
+    ...options,
+    frameFileOps: {
+      rename(from, to) {
+        if (!injected && from === generationPath) {
+          unlinkSync(memberPath);
+          linkSync(captionPath, memberPath);
+          injected = true;
+          retainedGenerationPath = to;
+        }
+        renameSync(from, to);
+      },
+      unlink(filePath) {
+        if (filePath === memberPath) memberUnlinks += 1;
+        unlinkSync(filePath);
+      },
+    },
+  });
+  let operations = 0;
+
+  await workspace.withFrameLease(await workspace.loadManifest(), () => {
+    operations += 1;
+    return null;
+  });
+
+  assert.equal(operations, 1);
+  assert.equal(injected, true);
+  assert.equal(memberUnlinks, 0);
+  assert.equal(path.resolve(retainedGenerationPath).startsWith(
+    `${path.resolve(workspace.outputDir)}${path.sep}`,
+  ), false);
+  const retainedMember = path.join(retainedGenerationPath, "abandoned.jpg");
+  assert.equal(await readFile(retainedMember, "utf8"), "protected-caption");
+  assert.deepEqual(identity(await lstat(retainedMember)), identity(captionBefore));
+  assert.deepEqual(identity(await lstat(captionPath)), identity(captionBefore));
+  assert.deepEqual(identity(await lstat(videoPath)), identity(videoBefore));
+  assert.equal(await readFile(captionPath, "utf8"), "protected-caption");
+  assert.equal(await readFile(videoPath, "utf8"), "protected-video");
+});
+
+test("protected manifest saves retain safe prior generations outside output and remain retryable", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-protected-manifest-retry-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const videoPath = path.join(root, "lesson.mov");
+  await writeFile(videoPath, "protected-video");
+  const videoInfo = await lstat(videoPath);
+  const workspace = await openWorkspace({
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source: { ...source, input: videoPath },
+    protectedFiles: [{
+      label: "video",
+      path: videoPath,
+      canonicalPath: videoPath,
+      identity: identity(videoInfo),
+    }],
+    seedSegments: false,
+  });
+  const initialBytes = await readFile(workspace.manifestPath, "utf8");
+  const first = await workspace.saveManifest({
+    ...(await workspace.loadManifest()),
+    segments: sourceSegments,
+  });
+  const firstBytes = await readFile(workspace.manifestPath, "utf8");
+  const second = await workspace.saveManifest({
+    ...first,
+    transcript: { engine: "mlx-whisper", filename: "transcript.vtt" },
+  });
+
+  assert.equal(second.revision, first.revision + 1);
+  assert.deepEqual(JSON.parse(await readFile(workspace.manifestPath, "utf8")), second);
+  assert.deepEqual((await readdir(workspace.outputDir)).sort(), ["images", "manifest.json"]);
+  const retainedContents = [];
+  const visit = async (directory) => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const entryPath = path.join(directory, entry.name);
+      if (path.resolve(entryPath) === path.resolve(workspace.outputDir)) continue;
+      if (entry.isDirectory()) await visit(entryPath);
+      else {
+        try {
+          retainedContents.push(await readFile(entryPath, "utf8"));
+        } catch {
+          // Binary or transient files are irrelevant to prior-manifest retention.
+        }
+      }
+    }
+  };
+  await visit(root);
+  assert.ok(retainedContents.includes(initialBytes));
+  assert.ok(retainedContents.includes(firstBytes));
+});
+
+test("protected manifest publication preserves a hard-link replacement captured at rename", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-protected-manifest-boundary-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const videoPath = path.join(root, "lesson.mov");
+  const outputDir = path.join(root, "output");
+  const manifestPath = path.join(outputDir, "manifest.json");
+  await writeFile(videoPath, "protected-video");
+  const videoBefore = await lstat(videoPath);
+  let armed = false;
+  let injected = false;
+  const workspace = await openWorkspace({
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir,
+    source: { ...source, input: videoPath },
+    protectedFiles: [{
+      label: "video",
+      path: videoPath,
+      canonicalPath: videoPath,
+      identity: identity(videoBefore),
+    }],
+    publicationFileOps: {
+      rename(from, to) {
+        if (armed && !injected && from === manifestPath) {
+          unlinkSync(manifestPath);
+          linkSync(videoPath, manifestPath);
+          injected = true;
+        }
+        renameSync(from, to);
+      },
+    },
+    seedSegments: false,
+  });
+  const manifest = await workspace.loadManifest();
+  armed = true;
+
+  await assert.rejects(workspace.saveManifest({
+    ...manifest,
+    segments: sourceSegments,
+  }), OutputConflictError);
+
+  assert.equal(injected, true);
+  assert.equal(await readFile(videoPath, "utf8"), "protected-video");
+  assert.equal(await readFile(manifestPath, "utf8"), "protected-video");
+  assert.deepEqual(identity(await lstat(videoPath)), identity(videoBefore));
+  assert.deepEqual(identity(await lstat(manifestPath)), identity(videoBefore));
+});
+
 test("EEXIST with a prior final leaves an owned recoverable stage and the next real extraction completes", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "v2w-prior-final-eexist-"));
   t.after(() => rm(root, { recursive: true, force: true }));

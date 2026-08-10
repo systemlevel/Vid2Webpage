@@ -227,13 +227,18 @@ export async function renderOutput({
       segments: renderManifest.segments,
     };
 
-    await copyFileAtomic(transcriptVttPath, transcriptPath, { protectedFiles, fileOps });
-    await copyFileAtomic(pageCssPath, stylesheetPath, { protectedFiles, fileOps });
+    const publicationOptions = {
+      protectedFiles,
+      retentionDir: workspace.retentionDir,
+      fileOps,
+    };
+    await copyFileAtomic(transcriptVttPath, transcriptPath, publicationOptions);
+    await copyFileAtomic(pageCssPath, stylesheetPath, publicationOptions);
     const savedManifest = await lease.saveManifest(buildingManifest);
     await writeFileAtomic(
       htmlPath,
       renderPage({ manifest: savedManifest, segments }),
-      { protectedFiles, fileOps },
+      publicationOptions,
     );
     return lease.markComplete(savedManifest);
   });

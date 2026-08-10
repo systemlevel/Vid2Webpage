@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import { fstatSync } from "node:fs";
+import { lstat, mkdir } from "node:fs/promises";
 import path from "node:path";
 
 import { SourceError } from "./errors.mjs";
@@ -64,6 +66,20 @@ async function withProtectedInput(protectedFiles, inputPath, label) {
     : [...protectedFiles, protectedInput];
 }
 
+async function directRetentionDir(outputPath) {
+  const key = createHash("sha256")
+    .update(path.resolve(outputPath))
+    .digest("hex")
+    .slice(0, 24);
+  const directory = path.join(path.dirname(outputPath), `.v2w-retention-${key}`);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const info = await lstat(directory);
+  if (!info.isDirectory() || info.isSymbolicLink()) {
+    throw new Error(`Media retention root is unsafe: ${directory}`);
+  }
+  return directory;
+}
+
 export async function probeMedia(videoPath, { run = runCommand } = {}) {
   let result;
   try {
@@ -124,6 +140,7 @@ export async function extractAudio({
   output,
   outputPath,
   protectedFiles = [],
+  retentionDir,
   run = runCommand,
 }) {
   if (!output) {
@@ -143,6 +160,7 @@ export async function extractAudio({
       : [...protectedFiles, inputIdentity];
     const reservation = await reserveOwnedArtifact(outputPath, {
       protectedFiles: effectiveProtectedFiles,
+      retentionDir: retentionDir ?? await directRetentionDir(outputPath),
     });
     try {
       await extractAudio({
@@ -153,6 +171,7 @@ export async function extractAudio({
       });
       return (await reservation.publish({
         protectedFiles: effectiveProtectedFiles,
+        retentionDir: retentionDir ?? await directRetentionDir(outputPath),
       })).path;
     } finally {
       await reservation.discard();
@@ -182,23 +201,31 @@ export async function extractAudio({
   return undefined;
 }
 
-export async function discoverLocalCaption({
+export async function locateLocalCaption({ videoPath, mediaInfo }) {
+  const parsedPath = path.parse(videoPath);
+  const vttPath = path.join(parsedPath.dir, `${parsedPath.name}.vtt`);
+  if (await isNonEmptyFile(vttPath)) return { kind: "vtt", path: vttPath };
+
+  const srtPath = path.join(parsedPath.dir, `${parsedPath.name}.srt`);
+  if (await isNonEmptyFile(srtPath)) return { kind: "srt", path: srtPath };
+
+  const streamIndex = mediaInfo.subtitleStreamIndexes?.[0];
+  return Number.isInteger(streamIndex)
+    ? { kind: "embedded", streamIndex }
+    : null;
+}
+
+export async function materializeLocalCaption({
   videoPath,
-  mediaInfo,
+  location,
   output,
-  outputPath,
   protectedFiles = [],
   run = runCommand,
   logger = console,
 }) {
-  const parsedPath = path.parse(videoPath);
-  const vttPath = path.join(parsedPath.dir, `${parsedPath.name}.vtt`);
-  if (await isNonEmptyFile(vttPath)) return vttPath;
-
-  const srtPath = path.join(parsedPath.dir, `${parsedPath.name}.srt`);
-  const inputPath = (await isNonEmptyFile(srtPath)) ? srtPath : null;
-  const subtitleStreamIndex = mediaInfo.subtitleStreamIndexes?.[0];
-  if (!inputPath && !Number.isInteger(subtitleStreamIndex)) return null;
+  if (!location || location.kind === "vtt") {
+    return location?.kind === "vtt" ? location.path : null;
+  }
 
   let effectiveProtectedFiles;
   try {
@@ -207,10 +234,60 @@ export async function discoverLocalCaption({
       videoPath,
       "video",
     );
-    if (inputPath) {
+    if (location.kind === "srt") {
       effectiveProtectedFiles = await withProtectedInput(
         effectiveProtectedFiles,
-        inputPath,
+        location.path,
+        "caption",
+      );
+    }
+    verifyAudioCapability(output, effectiveProtectedFiles);
+    const childFd = 3;
+    const args = location.kind === "srt"
+      ? ["-y", "-i", location.path, "-f", "webvtt", `pipe:${childFd}`]
+      : [
+        "-y", "-i", videoPath, "-map", `0:${location.streamIndex}`,
+        "-f", "webvtt", `pipe:${childFd}`,
+      ];
+    const result = await run(
+      "ffmpeg",
+      args,
+      { stdio: ["ignore", "pipe", "pipe", output.fd] },
+    );
+    verifyAudioCapability(output, effectiveProtectedFiles, { requireNonEmpty: true });
+    if (result.code !== 0) throw new Error("Caption output was empty");
+    return { kind: "capability-output", protectedFiles: effectiveProtectedFiles };
+  } catch (error) {
+    logger?.warn?.(`Unable to prepare caption timing hints for ${videoPath}`, error);
+    return null;
+  }
+}
+
+export async function discoverLocalCaption({
+  videoPath,
+  mediaInfo,
+  output,
+  outputPath,
+  protectedFiles = [],
+  retentionDir,
+  run = runCommand,
+  logger = console,
+}) {
+  const location = await locateLocalCaption({ videoPath, mediaInfo });
+  if (!location) return null;
+  if (location.kind === "vtt") return location.path;
+
+  let effectiveProtectedFiles;
+  try {
+    effectiveProtectedFiles = await withProtectedInput(
+      protectedFiles,
+      videoPath,
+      "video",
+    );
+    if (location.kind === "srt") {
+      effectiveProtectedFiles = await withProtectedInput(
+        effectiveProtectedFiles,
+        location.path,
         "caption",
       );
     }
@@ -221,7 +298,8 @@ export async function discoverLocalCaption({
 
   if (!output) {
     const overwritesVideo = await pathsReferToSameFile(videoPath, outputPath);
-    const overwritesCaptionInput = inputPath && await pathsReferToSameFile(inputPath, outputPath);
+    const overwritesCaptionInput = location.kind === "srt"
+      && await pathsReferToSameFile(location.path, outputPath);
     if (overwritesVideo || overwritesCaptionInput) {
       logger?.warn?.(
         `Unable to prepare caption timing hints for ${videoPath}`,
@@ -232,6 +310,7 @@ export async function discoverLocalCaption({
     try {
       const reservation = await reserveOwnedArtifact(outputPath, {
         protectedFiles: effectiveProtectedFiles,
+        retentionDir: retentionDir ?? await directRetentionDir(outputPath),
       });
       try {
         const result = await discoverLocalCaption({
@@ -239,12 +318,14 @@ export async function discoverLocalCaption({
           mediaInfo,
           output: reservation.writer,
           protectedFiles: effectiveProtectedFiles,
+          retentionDir,
           run,
           logger,
         });
         if (result?.kind !== "capability-output") return null;
         return (await reservation.publish({
           protectedFiles: result.protectedFiles,
+          retentionDir: retentionDir ?? await directRetentionDir(outputPath),
         })).path;
       } finally {
         await reservation.discard();
@@ -255,27 +336,12 @@ export async function discoverLocalCaption({
     }
   }
 
-  const childFd = 3;
-  const args = inputPath
-    ? ["-y", "-i", inputPath, "-f", "webvtt", `pipe:${childFd}`]
-    : [
-      "-y", "-i", videoPath, "-map", `0:${subtitleStreamIndex}`,
-      "-f", "webvtt", `pipe:${childFd}`,
-    ];
-  try {
-    verifyAudioCapability(output, effectiveProtectedFiles);
-    const result = await run(
-      "ffmpeg",
-      args,
-      { stdio: ["ignore", "pipe", "pipe", output.fd] },
-    );
-    verifyAudioCapability(output, effectiveProtectedFiles, { requireNonEmpty: true });
-    if (result.code !== 0) {
-      throw new Error("Caption output was empty");
-    }
-    return { kind: "capability-output", protectedFiles: effectiveProtectedFiles };
-  } catch (error) {
-    logger?.warn?.(`Unable to prepare caption timing hints for ${videoPath}`, error);
-    return null;
-  }
+  return materializeLocalCaption({
+    videoPath,
+    location,
+    output,
+    protectedFiles: effectiveProtectedFiles,
+    run,
+    logger,
+  });
 }

@@ -14,6 +14,7 @@ import {
 } from "./fs.mjs";
 import {
   cleanupFrameStageSync,
+  reserveProtectedFrameRetentionPathSync,
   resolveFrameFileOps,
   verifyOpenFrameStageSync,
 } from "./frame-stage.mjs";
@@ -327,6 +328,15 @@ export async function extractFrames({
           frameFileOps: resolvedFrameFileOps,
         });
         reservation.protectedFiles = protectedFiles;
+        if (protectedFiles.length > 0 && typeof workspace.retentionDir === "string") {
+          const token = path.basename(reservation.generationPath)
+            .slice(".v2w-frame-stage-".length);
+          reservation.retentionPath = reserveProtectedFrameRetentionPathSync(
+            workspace.retentionDir,
+            token,
+            resolvedFrameFileOps,
+          );
+        }
         let result;
         try {
           result = await run("ffmpeg", buildFrameArgs({
@@ -372,14 +382,6 @@ export async function extractFrames({
         };
         try {
           nextManifest = await lease.commitFrame(preparedFrame);
-          if (protectedFiles.length > 0 && typeof workspace.cacheDir === "string") {
-            const token = path.basename(reservation.generationPath)
-              .slice(".v2w-frame-stage-".length);
-            reservation.retentionPath = path.join(
-              workspace.cacheDir,
-              `.v2w-retained-frame-${token}`,
-            );
-          }
         } finally {
           reservation.backupPath = preparedFrame.backupPath;
           reservation.backupIdentity = preparedFrame.backupIdentity;

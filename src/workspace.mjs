@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   lstat,
   mkdir,
@@ -14,6 +14,8 @@ import { isDeepStrictEqual } from "node:util";
 
 import { OutputConflictError } from "./errors.mjs";
 import {
+  AtomicPublicationConflictError,
+  canonicalPath,
   isNonEmptyFile,
   pathsReferToSameFile,
   writeFileAtomic,
@@ -230,6 +232,39 @@ async function ensureDirectory(directoryPath, description) {
     throw conflict(`${description} is not a safe directory: ${directoryPath}`);
   }
   await mkdir(directoryPath, { recursive: true });
+}
+
+function pathContainsOrEquals(parent, child) {
+  const relative = path.relative(path.resolve(parent), path.resolve(child));
+  return relative === "" || (!path.isAbsolute(relative)
+    && relative !== ".."
+    && !relative.startsWith(`..${path.sep}`));
+}
+
+function retentionKey(outputDir, fingerprint) {
+  return createHash("sha256")
+    .update(path.resolve(outputDir))
+    .update("\0")
+    .update(fingerprint)
+    .digest("hex")
+    .slice(0, 32);
+}
+
+async function ensureSameFilesystemRetention(directoryPath, targetParent, description) {
+  await ensureDirectory(directoryPath, description);
+  const [retentionInfo, parentInfo] = await Promise.all([
+    statOrNull(directoryPath),
+    statOrNull(targetParent),
+  ]);
+  if (!retentionInfo
+    || !retentionInfo.isDirectory()
+    || retentionInfo.isSymbolicLink()
+    || !parentInfo
+    || !parentInfo.isDirectory()
+    || parentInfo.isSymbolicLink()
+    || retentionInfo.dev !== parentInfo.dev) {
+    throw conflict(`${description} is not a safe same-filesystem directory: ${directoryPath}`);
+  }
 }
 
 function lockMetadata(token) {
@@ -498,6 +533,8 @@ export async function openWorkspace({
   source,
   hooks = {},
   frameFileOps = {},
+  protectedFiles = [],
+  publicationFileOps,
 }) {
   if (typeof fingerprint !== "string" || fingerprint.length === 0
     || !isPlainObject(source)
@@ -510,28 +547,97 @@ export async function openWorkspace({
   const manifestLockPath = path.join(outputDir, manifestLockFilename);
   const imagesDir = path.join(outputDir, "images");
   const resolvedFrameFileOps = resolveFrameFileOps(frameFileOps);
+  if (!Array.isArray(protectedFiles)
+    || protectedFiles.some((protectedFile) =>
+      !isPlainObject(protectedFile) || !isValidIdentity(protectedFile.identity))) {
+    throw conflict("Workspace protected-file context must be an array");
+  }
+  const protectedContext = Object.freeze(protectedFiles.map((protectedFile) =>
+    Object.freeze({ ...protectedFile, identity: Object.freeze({ ...protectedFile.identity }) })));
   await ensureDirectory(cacheDir, "Cache workspace");
   await ensureDirectory(outputDir, "Output path");
 
-  await hooks.beforeInitializationLock?.();
-  const manifest = await withMutationLock(manifestLockPath, hooks, async () => {
-    const manifestInfo = await statOrNull(manifestPath);
-    if (manifestInfo && (!manifestInfo.isFile() || manifestInfo.isSymbolicLink())) {
-      throw conflict(`Output manifest is not a safe file: ${manifestPath}`);
+  const [canonicalOutputDir, canonicalCacheDir] = await Promise.all([
+    canonicalPath(outputDir),
+    canonicalPath(cacheDir),
+  ]);
+  const key = retentionKey(canonicalOutputDir, fingerprint);
+  const retentionDir = path.join(
+    path.dirname(canonicalOutputDir),
+    `.v2w-retention-${key}`,
+  );
+  const cacheRetentionDir = path.join(
+    canonicalCacheDir,
+    `.v2w-retention-${key}`,
+  );
+  if (pathContainsOrEquals(canonicalOutputDir, retentionDir)
+    || pathContainsOrEquals(retentionDir, canonicalOutputDir)) {
+    throw conflict(`Workspace retention must remain outside output: ${retentionDir}`);
+  }
+
+  const publicationOptions = protectedContext.length > 0
+    ? {
+      protectedFiles: protectedContext,
+      retentionDir,
+      fileOps: publicationFileOps,
     }
-    if (manifestInfo) {
-      return readManifest(manifestPath, fingerprint, imagesDir);
-    }
-    const outputEntries = (await readdir(outputDir))
-      .filter((entry) => entry !== manifestLockFilename
-        && !lockCandidateFilenamePattern.test(entry));
-    if (outputEntries.length > 0) {
-      throw conflict(`Refusing to overwrite nonempty output without a v2w manifest: ${outputDir}`);
-    }
-    const createdManifest = initialManifest(source);
-    await writeFileAtomic(manifestPath, `${JSON.stringify(createdManifest, null, 2)}\n`);
-    return createdManifest;
-  });
+    : undefined;
+
+  const existingManifestInfo = await statOrNull(manifestPath);
+  if (existingManifestInfo
+    && (!existingManifestInfo.isFile() || existingManifestInfo.isSymbolicLink())) {
+    throw conflict(`Output manifest is not a safe file: ${manifestPath}`);
+  }
+  let manifest = existingManifestInfo
+    ? await readManifest(manifestPath, fingerprint, imagesDir)
+    : null;
+  const completedReadOnly = manifest?.status === "complete";
+
+  if (!completedReadOnly && protectedContext.length > 0) {
+    await ensureSameFilesystemRetention(
+      retentionDir,
+      canonicalOutputDir,
+      "Output retention root",
+    );
+    await ensureSameFilesystemRetention(
+      cacheRetentionDir,
+      canonicalCacheDir,
+      "Cache retention root",
+    );
+  }
+
+  if (!completedReadOnly) {
+    await hooks.beforeInitializationLock?.();
+    manifest = await withMutationLock(manifestLockPath, hooks, async () => {
+      const manifestInfo = await statOrNull(manifestPath);
+      if (manifestInfo && (!manifestInfo.isFile() || manifestInfo.isSymbolicLink())) {
+        throw conflict(`Output manifest is not a safe file: ${manifestPath}`);
+      }
+      if (manifestInfo) {
+        return readManifest(manifestPath, fingerprint, imagesDir);
+      }
+      const outputEntries = (await readdir(outputDir))
+        .filter((entry) => entry !== manifestLockFilename
+          && !lockCandidateFilenamePattern.test(entry));
+      if (outputEntries.length > 0) {
+        throw conflict(`Refusing to overwrite nonempty output without a v2w manifest: ${outputDir}`);
+      }
+      const createdManifest = initialManifest(source);
+      try {
+        await writeFileAtomic(
+          manifestPath,
+          `${JSON.stringify(createdManifest, null, 2)}\n`,
+          publicationOptions,
+        );
+      } catch (error) {
+        if (error instanceof AtomicPublicationConflictError) {
+          throw conflict(error.message);
+        }
+        throw error;
+      }
+      return createdManifest;
+    });
+  }
 
   if (manifest.status === "complete") {
     const imagesInfo = await statOrNull(imagesDir);
@@ -548,7 +654,18 @@ export async function openWorkspace({
 
   async function writeManifest(nextManifest) {
     validateManifest(nextManifest, fingerprint, imagesDir);
-    await writeFileAtomic(manifestPath, `${JSON.stringify(nextManifest, null, 2)}\n`);
+    try {
+      await writeFileAtomic(
+        manifestPath,
+        `${JSON.stringify(nextManifest, null, 2)}\n`,
+        publicationOptions,
+      );
+    } catch (error) {
+      if (error instanceof AtomicPublicationConflictError) {
+        throw conflict(error.message);
+      }
+      throw error;
+    }
     return nextManifest;
   }
 
@@ -751,9 +868,12 @@ export async function openWorkspace({
       tempFd,
       sourcePath,
       sourceIdentity,
-      protectedFiles = [],
+      protectedFiles: preparedProtectedFiles = [],
       frame,
     } = preparedFrame;
+    const effectiveProtectedFiles = protectedContext.length > 0
+      ? protectedContext
+      : preparedProtectedFiles;
     const replacement = validateFrame(frame, imagesDir, { canonical: true });
     const resolvedImagesDir = path.resolve(imagesDir);
     const resolvedGenerationPath = typeof generationPath === "string"
@@ -777,8 +897,8 @@ export async function openWorkspace({
       || !Number.isSafeInteger(tempFd) || tempFd < 0
       || typeof sourcePath !== "string" || sourcePath.length === 0
       || !(sourceIdentity === null || isValidIdentity(sourceIdentity))
-      || !Array.isArray(protectedFiles)
-      || protectedFiles.some((protectedFile) =>
+      || !Array.isArray(effectiveProtectedFiles)
+      || effectiveProtectedFiles.some((protectedFile) =>
         !isPlainObject(protectedFile) || !isValidIdentity(protectedFile.identity))) {
       throw conflict("Prepared frame temp path or identity is invalid");
     }
@@ -792,7 +912,7 @@ export async function openWorkspace({
       tempFd,
       sourcePath,
       sourceIdentity,
-      protectedFiles,
+      protectedFiles: effectiveProtectedFiles,
       frame: replacement,
       token,
     };
@@ -834,8 +954,8 @@ export async function openWorkspace({
           || path.basename(backupStatePath) !== `prior-${token}.json`
           || !isValidIdentity(stage.backupStateIdentity)))
       || (retentionPath !== undefined
-        && (path.dirname(retentionPath) !== path.resolve(cacheDir)
-          || path.basename(retentionPath) !== `.v2w-retained-frame-${token}`))) {
+        && (!pathContainsOrEquals(retentionDir, retentionPath)
+          || path.resolve(retentionPath) === path.resolve(retentionDir)))) {
       throw conflict("Frame stage cleanup path or identity is invalid");
     }
     return {
@@ -960,6 +1080,8 @@ export async function openWorkspace({
       const recovery = recoverFrameStagesSync(imagesDir, resolvedFrameFileOps, {
         preserveGeneration,
         manifest: current,
+        protectedFiles: protectedContext,
+        retentionDir,
       });
       if (recovery.blocked.length > 0) {
         throw conflict(`Abandoned frame generation changed during recovery: ${recovery.blocked[0]}`);
@@ -1007,9 +1129,12 @@ export async function openWorkspace({
 
   return {
     cacheDir,
+    cacheRetentionDir,
     outputDir,
     imagesDir,
     manifestPath,
+    protectedFiles: protectedContext,
+    retentionDir,
     loadManifest,
     saveManifest,
     withRenderLease,

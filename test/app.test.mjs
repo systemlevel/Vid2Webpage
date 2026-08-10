@@ -174,6 +174,14 @@ async function makeHarness({
         frameRate: 10,
       };
     },
+    locateLocalCaption: async ({ videoPath: requestedVideoPath }) => {
+      calls.push("discover-caption");
+      assert.equal(requestedVideoPath, sourcePath);
+      return captionPath ? { kind: "vtt", path: captionPath } : null;
+    },
+    materializeLocalCaption: async () => {
+      throw new Error("direct VTT harness must not materialize captions");
+    },
     discoverLocalCaption: async ({
       videoPath: requestedVideoPath,
       output,
@@ -187,12 +195,26 @@ async function makeHarness({
       assert.deepEqual(protectedFiles.map((protectedFile) => protectedFile.label), ["video"]);
       return captionPath;
     },
-    openWorkspace: async ({ cacheRoot: base, fingerprint: value, outputDir, source }) => {
+    openWorkspace: async ({
+      cacheRoot: base,
+      fingerprint: value,
+      outputDir,
+      source,
+      protectedFiles,
+    }) => {
       calls.push("open-workspace");
       assert.equal(base, cacheRoot);
       assert.equal(value, fingerprint);
+      assert.deepEqual(
+        protectedFiles.map((protectedFile) => protectedFile.label),
+        kind === "local" ? ["video", ...(captionPath ? ["caption"] : [])] : [],
+      );
       workspace.outputDir = outputDir;
       workspace.imagesDir = path.join(outputDir, "images");
+      workspace.retentionDir = path.join(root, "output-retention");
+      workspace.cacheRetentionDir = path.join(cacheDir, ".retention");
+      await mkdir(workspace.retentionDir, { recursive: true });
+      await mkdir(workspace.cacheRetentionDir, { recursive: true });
       manifest = { ...manifest, source: manifest.source ?? source };
       return workspace;
     },
@@ -484,6 +506,60 @@ test("returns a matching completed workspace without retranscribing or rewriting
   assert.deepEqual(harness.removed, []);
   assert.equal(await readFile(sourcePath, "utf8"), "local-video");
 });
+
+for (const captionKind of ["srt", "embedded"]) {
+  test(`completed local rerun with ${captionKind} captions is read-only`, async (t) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "v2w-app-complete-caption-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const sourcePath = path.join(root, "lesson.mov");
+    const sidecarPath = path.join(root, "lesson.srt");
+    await writeFile(sourcePath, "local-video");
+    if (captionKind === "srt") {
+      await writeFile(sidecarPath, "1\n00:00:00,000 --> 00:00:01,000\ntiming hint\n");
+    }
+    const harness = await makeHarness({
+      kind: "local",
+      root,
+      sourcePath,
+      captionPath: captionKind === "srt" ? sidecarPath : null,
+      completed: true,
+    });
+    let protectedLabels;
+    const openWorkspace = harness.services.openWorkspace;
+    harness.services.openWorkspace = async (options) => {
+      protectedLabels = options.protectedFiles?.map((file) => file.label);
+      return openWorkspace(options);
+    };
+    harness.services.locateLocalCaption = async () => captionKind === "srt"
+      ? { kind: "srt", path: sidecarPath }
+      : { kind: "embedded", streamIndex: 2 };
+    harness.services.materializeLocalCaption = async () => {
+      throw new Error("completed rerun must not materialize caption timing hints");
+    };
+    harness.services.discoverLocalCaption = async () => {
+      throw new Error("completed rerun must not republish caption timing hints");
+    };
+
+    const result = await runPipeline({
+      input: sourcePath,
+      cwd: root,
+      env: { XDG_CACHE_HOME: path.join(root, "cache-parent") },
+    }, harness.services);
+
+    assert.equal(result.status, "complete");
+    assert.equal(result.segments[0].text, "Already complete");
+    assert.deepEqual(
+      protectedLabels,
+      captionKind === "srt" ? ["video", "caption"] : ["video"],
+    );
+    assert.equal(harness.calls.includes("save-manifest"), false);
+    assert.equal(harness.calls.includes("render-output"), false);
+    assert.equal(await readFile(sourcePath, "utf8"), "local-video");
+    if (captionKind === "srt") {
+      assert.match(await readFile(sidecarPath, "utf8"), /timing hint/);
+    }
+  });
+}
 
 test("reuses only a recorded nonempty clean Whisper transcript", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "v2w-app-reuse-"));
