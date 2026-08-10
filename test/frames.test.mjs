@@ -5,6 +5,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   readdir,
   rename,
@@ -269,6 +270,45 @@ test("a matching nonempty manifest frame is reused without extraction or mutatio
   assert.equal(await readFile(path.join(imagesDir, planned.filename), "utf8"), "existing-jpeg");
 });
 
+test("reuse rechecks a source alias introduced while canReuseFrame is awaiting", async (t) => {
+  const { root, imagesDir } = await frameFixture(t);
+  const planned = capture();
+  const existing = { ...planned, width: 640, height: 360 };
+  const sourcePath = path.join(root, "source-video.mov");
+  const finalPath = path.join(imagesDir, planned.filename);
+  await writeFile(sourcePath, "source-video-bytes");
+  await writeFile(finalPath, "existing-jpeg");
+  let allowReuse;
+  let reuseStarted;
+  const reuseStartedPromise = new Promise((resolve) => { reuseStarted = resolve; });
+  const allowReusePromise = new Promise((resolve) => { allowReuse = resolve; });
+  const extraction = extractFrames({
+    videoPath: sourcePath,
+    captures: [planned],
+    workspace: {
+      imagesDir,
+      async canReuseFrame() {
+        reuseStarted();
+        await allowReusePromise;
+        return true;
+      },
+      commitFrame: async () => { throw new Error("must not commit an aliased reuse"); },
+    },
+    manifest: buildingManifest([existing], 4),
+    run: async () => { throw new Error("must not extract an aliased reuse"); },
+    log: { info() {} },
+  });
+
+  await reuseStartedPromise;
+  await unlink(finalPath);
+  await link(sourcePath, finalPath);
+  allowReuse();
+  await assert.rejects(extraction, SourceError);
+
+  assert.equal(await readFile(sourcePath, "utf8"), "source-video-bytes");
+  assert.equal(await readFile(finalPath, "utf8"), "source-video-bytes");
+});
+
 test("a stale manifest image is replaced and recorded when reuse is not confirmed", async (t) => {
   const { imagesDir } = await frameFixture(t);
   const planned = capture();
@@ -442,8 +482,9 @@ test("concurrent invocations exclusively own unique JPEG temp siblings", async (
   assert.deepEqual(results.map(({ status }) => status).sort(), ["fulfilled", "rejected"]);
   assert.equal(new Set(tempPaths).size, 2);
   for (const tempPath of tempPaths) {
-    assert.equal(path.dirname(tempPath), imagesDir);
-    assert.match(path.basename(tempPath), /^000004250-primary\.part-\d+-[0-9a-f-]+\.jpg$/u);
+    assert.equal(path.dirname(path.dirname(tempPath)), imagesDir);
+    assert.match(path.basename(path.dirname(tempPath)), /^\.v2w-frame-stage-[0-9a-f-]+$/u);
+    assert.equal(path.basename(tempPath), planned.filename);
     await assert.rejects(access(tempPath));
   }
   assert.equal(await readFile(foreignPath, "utf8"), "foreign-temp");
@@ -457,11 +498,9 @@ test("temp reservation retries an exclusive-name collision without touching the 
     "00000000-0000-4000-8000-000000000021",
     "00000000-0000-4000-8000-000000000022",
   ];
-  const collisionPath = path.join(
-    imagesDir,
-    `000004250-primary.part-${process.pid}-${ids[0]}.jpg`,
-  );
-  await writeFile(collisionPath, "foreign-collision");
+  const collisionPath = path.join(imagesDir, `.v2w-frame-stage-${ids[0]}`);
+  await mkdir(collisionPath);
+  await writeFile(path.join(collisionPath, "foreign.txt"), "foreign-collision");
   let ffmpegOutputPath;
 
   const result = await extractFrames({
@@ -489,8 +528,11 @@ test("temp reservation retries an exclusive-name collision without touching the 
     log: { info() {} },
   });
 
-  assert.match(ffmpegOutputPath, /00000000-0000-4000-8000-000000000022\.jpg$/u);
-  assert.equal(await readFile(collisionPath, "utf8"), "foreign-collision");
+  assert.match(
+    path.basename(path.dirname(ffmpegOutputPath)),
+    /00000000-0000-4000-8000-000000000022$/u,
+  );
+  assert.equal(await readFile(path.join(collisionPath, "foreign.txt"), "utf8"), "foreign-collision");
   assert.equal(result.revision, 1);
 });
 
@@ -649,6 +691,37 @@ test("temp pathname replacement and symlink attacks preserve foreign paths and t
   }
 });
 
+test("replacement of a private staging generation is rejected without deleting the replacement", async (t) => {
+  const { imagesDir } = await frameFixture(t);
+  const planned = capture();
+  let generationPath;
+  let movedGenerationPath;
+
+  await assert.rejects(extractFrames({
+    videoPath: "/video.mov",
+    captures: [planned],
+    workspace: {
+      imagesDir,
+      canReuseFrame: async () => false,
+      commitFrame: async () => { throw new Error("must not commit a replaced generation"); },
+    },
+    manifest: buildingManifest(),
+    run: async (command, args) => {
+      assert.equal(command, "ffmpeg");
+      generationPath = path.dirname(args.at(-1));
+      movedGenerationPath = `${generationPath}-moved`;
+      await rename(generationPath, movedGenerationPath);
+      await mkdir(generationPath);
+      await writeFile(path.join(generationPath, "foreign.txt"), "foreign-generation");
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    log: { info() {} },
+  }), SourceError);
+
+  assert.equal(await readFile(path.join(generationPath, "foreign.txt"), "utf8"), "foreign-generation");
+  assert.equal((await lstat(movedGenerationPath)).isDirectory(), true);
+});
+
 test("thrown FFmpeg and commit rename failures clean only the still-owned temp", async (t) => {
   for (const failureKind of ["runner", "rename"]) {
     const { imagesDir } = await frameFixture(t);
@@ -723,6 +796,80 @@ test("cleanup failure is reported without deleting or losing ownership of the re
   assert.equal((await lstat(tempPath)).isFile(), true);
 });
 
+test("initial frame-handle stat failure closes the handle and cleans only its private generation", async (t) => {
+  const { imagesDir } = await frameFixture(t);
+  const planned = capture();
+  const statFailure = new Error("initial handle stat failed");
+  let closed = false;
+
+  await assert.rejects(extractFrames({
+    videoPath: "/video.mov",
+    captures: [planned],
+    workspace: {
+      imagesDir,
+      canReuseFrame: async () => false,
+      commitFrame: async () => { throw new Error("must not commit failed reservation"); },
+    },
+    manifest: buildingManifest(),
+    fileOps: {
+      async open(filePath, flags, mode) {
+        const handle = await open(filePath, flags, mode);
+        if (path.extname(filePath) !== ".jpg") return handle;
+        return {
+          stat: async () => { throw statFailure; },
+          async close() {
+            await handle.close();
+            closed = true;
+          },
+        };
+      },
+    },
+    run: async () => { throw new Error("must not run after stat failure"); },
+    log: { info() {} },
+  }), (error) => error === statFailure || error.cause === statFailure);
+
+  assert.equal(closed, true);
+  assert.deepEqual(await readdir(imagesDir), []);
+});
+
+test("frame-handle close failure preserves the runner error and cleans the private generation", async (t) => {
+  const { imagesDir } = await frameFixture(t);
+  const planned = capture();
+  const runnerFailure = new Error("runner failed before close");
+  const closeFailure = new Error("frame handle close failed");
+
+  await assert.rejects(extractFrames({
+    videoPath: "/video.mov",
+    captures: [planned],
+    workspace: {
+      imagesDir,
+      canReuseFrame: async () => false,
+      commitFrame: async () => { throw new Error("must not commit runner failure"); },
+    },
+    manifest: buildingManifest(),
+    fileOps: {
+      async open(filePath, flags, mode) {
+        const handle = await open(filePath, flags, mode);
+        if (path.extname(filePath) !== ".jpg") return handle;
+        return {
+          stat: (...args) => handle.stat(...args),
+          async close() {
+            await handle.close();
+            throw closeFailure;
+          },
+        };
+      },
+    },
+    run: async () => { throw runnerFailure; },
+    log: { info() {} },
+  }), (error) => error instanceof SourceError
+    && error.cause instanceof AggregateError
+    && error.cause.errors.some((cause) => cause === closeFailure)
+    && error.cause.errors.some((cause) => cause.cause === runnerFailure));
+
+  assert.deepEqual(await readdir(imagesDir), []);
+});
+
 test("capture failures stop the sequential plan and never publish the failing frame", async (t) => {
   const { imagesDir } = await frameFixture(t);
   const first = capture();
@@ -768,7 +915,7 @@ test("capture failures stop the sequential plan and never publish the failing fr
     log: { info() {} },
   }), SourceError);
 
-  assert.deepEqual(attempted, ["000004250-primary", "000008000-scene"]);
+  assert.deepEqual(attempted, ["000004250-primary.jpg", "000008000-scene.jpg"]);
   assert.equal(await readFile(path.join(imagesDir, first.filename), "utf8"), "jpeg-bytes");
   await assert.rejects(access(path.join(imagesDir, second.filename)));
   await assert.rejects(access(path.join(imagesDir, third.filename)));

@@ -7,6 +7,7 @@ import {
   readdir,
   rename,
   rmdir,
+  stat,
   unlink,
 } from "node:fs/promises";
 import path from "node:path";
@@ -14,8 +15,10 @@ import { isDeepStrictEqual } from "node:util";
 
 import { OutputConflictError } from "./errors.mjs";
 import {
+  hasFileIdentity,
   isNonEmptyFile,
   pathIsOwnedRegularFile,
+  pathsReferToSameFile,
   writeFileAtomic,
 } from "./fs.mjs";
 
@@ -537,23 +540,80 @@ export async function openWorkspace({ cacheRoot, fingerprint, outputDir, source,
     });
   }
 
-  function validatePreparedFrame({ tempPath, tempIdentity, frame }) {
+  function isValidIdentity(identity) {
+    return isPlainObject(identity)
+      && hasExactKeys(identity, ["dev", "ino"])
+      && isNonNegativeInteger(identity.dev)
+      && isNonNegativeInteger(identity.ino);
+  }
+
+  function validatePreparedFrame(preparedFrame) {
+    if (!isPlainObject(preparedFrame)) {
+      throw conflict("Prepared frame transaction is invalid");
+    }
+    const {
+      generationPath,
+      generationIdentity,
+      ownerPath,
+      ownerIdentity,
+      tempPath,
+      tempIdentity,
+      sourcePath,
+      sourceIdentity,
+      frame,
+    } = preparedFrame;
     const replacement = validateFrame(frame, imagesDir, { canonical: true });
     const resolvedImagesDir = path.resolve(imagesDir);
+    const resolvedGenerationPath = typeof generationPath === "string"
+      ? path.resolve(generationPath)
+      : "";
+    const resolvedOwnerPath = typeof ownerPath === "string" ? path.resolve(ownerPath) : "";
     const resolvedTempPath = typeof tempPath === "string" ? path.resolve(tempPath) : "";
-    const parsedFrame = path.parse(replacement.filename);
-    const tempBasename = path.basename(resolvedTempPath);
-    if (!resolvedTempPath
-      || path.dirname(resolvedTempPath) !== resolvedImagesDir
-      || !tempBasename.startsWith(`${parsedFrame.name}.part-`)
-      || path.extname(tempBasename).toLowerCase() !== ".jpg"
-      || !isPlainObject(tempIdentity)
-      || !hasExactKeys(tempIdentity, ["dev", "ino"])
-      || !isNonNegativeInteger(tempIdentity.dev)
-      || !isNonNegativeInteger(tempIdentity.ino)) {
+    const generationBasename = path.basename(resolvedGenerationPath);
+    const token = generationBasename.startsWith(".v2w-frame-stage-")
+      ? generationBasename.slice(".v2w-frame-stage-".length)
+      : "";
+    if (!token || !/^[0-9a-f-]+$/u.test(token)
+      || path.dirname(resolvedGenerationPath) !== resolvedImagesDir
+      || path.dirname(resolvedOwnerPath) !== resolvedGenerationPath
+      || path.basename(resolvedOwnerPath) !== `owner-${token}`
+      || path.dirname(resolvedTempPath) !== resolvedGenerationPath
+      || path.basename(resolvedTempPath) !== replacement.filename
+      || !isValidIdentity(generationIdentity)
+      || !isValidIdentity(ownerIdentity)
+      || !isValidIdentity(tempIdentity)
+      || typeof sourcePath !== "string" || sourcePath.length === 0
+      || !(sourceIdentity === null || isValidIdentity(sourceIdentity))) {
       throw conflict("Prepared frame temp path or identity is invalid");
     }
-    return { tempPath: resolvedTempPath, tempIdentity, frame: replacement };
+    return {
+      generationPath: resolvedGenerationPath,
+      generationIdentity,
+      ownerPath: resolvedOwnerPath,
+      ownerIdentity,
+      tempPath: resolvedTempPath,
+      tempIdentity,
+      sourcePath,
+      sourceIdentity,
+      frame: replacement,
+      token,
+    };
+  }
+
+  async function validateCompleteInventory(manifestToComplete) {
+    const entries = await readdir(imagesDir, { withFileTypes: true });
+    const expected = manifestToComplete.images.map((image) => image.filename).sort();
+    const actual = entries.map((entry) => entry.name).sort();
+    if (!isDeepStrictEqual(actual, expected)) {
+      throw conflict("Output images inventory does not exactly match the manifest");
+    }
+    for (const entry of entries) {
+      const info = await lstat(path.join(imagesDir, entry.name));
+      if (!entry.isFile() || entry.isSymbolicLink() || !info.isFile()
+        || info.isSymbolicLink() || info.size <= 0) {
+        throw conflict("Output images inventory contains an invalid or empty image");
+      }
+    }
   }
 
   return {
@@ -570,6 +630,7 @@ export async function openWorkspace({ cacheRoot, fingerprint, outputDir, source,
       }
       const prepared = validatePreparedFrame(preparedFrame);
       const finalPath = assertSafeFilename(prepared.frame.filename, imagesDir);
+      const renameFramePath = hooks.renameFramePath ?? rename;
       return withMutationLock(manifestLockPath, hooks, async () => {
         const current = await loadManifest();
         if (current.status !== "building") {
@@ -578,10 +639,32 @@ export async function openWorkspace({ cacheRoot, fingerprint, outputDir, source,
         if (manifestToUpdate.revision !== current.revision) {
           throw conflict("Workspace manifest revision is stale");
         }
-        if (!(await pathIsOwnedRegularFile(prepared.tempPath, prepared.tempIdentity))
+        if (!(await pathIsOwnedRegularFile(prepared.ownerPath, prepared.ownerIdentity))
+          || !(await pathIsOwnedRegularFile(prepared.tempPath, prepared.tempIdentity))
           || !(await isNonEmptyFile(prepared.tempPath))) {
           throw conflict("Prepared frame temp is no longer the owned nonempty file");
         }
+        const generationInfo = await lstat(prepared.generationPath);
+        if (!generationInfo.isDirectory() || generationInfo.isSymbolicLink()
+          || !hasFileIdentity(generationInfo, prepared.generationIdentity)) {
+          throw conflict("Prepared frame generation is no longer owned");
+        }
+        await hooks.beforeFrameSourceCheck?.({ prepared, finalPath });
+        if (prepared.sourceIdentity) {
+          let sourceInfo;
+          try {
+            sourceInfo = await stat(prepared.sourcePath);
+          } catch {
+            throw conflict("Local video identity changed before frame publication");
+          }
+          if (!hasFileIdentity(sourceInfo, prepared.sourceIdentity)) {
+            throw conflict("Local video identity changed before frame publication");
+          }
+        }
+        if (await pathsReferToSameFile(prepared.sourcePath, finalPath)) {
+          throw conflict("Frame output must not alias the local video");
+        }
+        await hooks.afterFrameSourceCheck?.({ prepared, finalPath });
         const images = [
           ...current.images.filter((image) => image.filename !== prepared.frame.filename),
           prepared.frame,
@@ -593,14 +676,55 @@ export async function openWorkspace({ cacheRoot, fingerprint, outputDir, source,
           revision: current.revision + 1,
         };
         validateManifest(nextManifest, fingerprint, imagesDir);
-        await rename(prepared.tempPath, finalPath);
-        await hooks.beforeFrameManifestWrite?.({
-          tempPath: prepared.tempPath,
-          finalPath,
-          frame: prepared.frame,
-          manifest: nextManifest,
-        });
-        return writeManifest(nextManifest);
+        const backupPath = path.join(prepared.generationPath, `previous-${prepared.token}`);
+        let backupIdentity;
+        const priorFinal = await statOrNull(finalPath);
+        if (priorFinal) {
+          await renameFramePath(finalPath, backupPath);
+          const backupInfo = await lstat(backupPath);
+          backupIdentity = { dev: backupInfo.dev, ino: backupInfo.ino };
+          if (await pathsReferToSameFile(prepared.sourcePath, backupPath)) {
+            const currentBackup = await statOrNull(backupPath);
+            if (currentBackup && hasFileIdentity(currentBackup, backupIdentity)) {
+              await renameFramePath(backupPath, finalPath);
+            }
+            throw conflict("Existing frame output aliases the local video");
+          }
+        }
+
+        await renameFramePath(prepared.tempPath, finalPath);
+        let writtenManifest;
+        try {
+          await hooks.beforeFrameManifestWrite?.({
+            tempPath: prepared.tempPath,
+            finalPath,
+            frame: prepared.frame,
+            manifest: nextManifest,
+          });
+          writtenManifest = await writeManifest(nextManifest);
+        } catch (error) {
+          if (backupIdentity) {
+            const published = await statOrNull(finalPath);
+            const backup = await statOrNull(backupPath);
+            if (published && hasFileIdentity(published, prepared.tempIdentity)
+              && backup && hasFileIdentity(backup, backupIdentity)) {
+              try {
+                await renameFramePath(finalPath, prepared.tempPath);
+                await renameFramePath(backupPath, finalPath);
+              } catch (rollbackError) {
+                error.cause = rollbackError;
+              }
+            }
+          }
+          throw error;
+        }
+        if (backupIdentity) {
+          const backup = await statOrNull(backupPath);
+          if (backup && hasFileIdentity(backup, backupIdentity)) {
+            await unlink(backupPath);
+          }
+        }
+        return writtenManifest;
       });
     },
     async recordFrame(manifestToUpdate, frame) {
@@ -621,11 +745,22 @@ export async function openWorkspace({ cacheRoot, fingerprint, outputDir, source,
       if (manifestToComplete.status !== "building") {
         throw conflict("Completed output manifests are immutable");
       }
-      return mutateManifest(manifestToComplete, () => ({
-        ...manifestToComplete,
-        status: "complete",
-        completedAt: new Date().toISOString(),
-      }), "complete");
+      return withMutationLock(manifestLockPath, hooks, async () => {
+        const current = await loadManifest();
+        if (current.status !== "building") {
+          throw conflict("Completed output manifests are immutable");
+        }
+        if (manifestToComplete.revision !== current.revision) {
+          throw conflict("Workspace manifest revision is stale");
+        }
+        await validateCompleteInventory(current);
+        return writeManifest({
+          ...current,
+          status: "complete",
+          revision: current.revision + 1,
+          completedAt: new Date().toISOString(),
+        });
+      });
     },
     async canReuseFrame(capture) {
       const requested = validateFrame(capture, imagesDir);

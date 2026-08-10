@@ -1,21 +1,26 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import {
   access,
+  link,
   lstat,
   mkdir,
   mkdtemp,
   readFile,
   readdir,
   rm,
+  rmdir,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { OutputConflictError } from "../src/errors.mjs";
+import { OutputConflictError, SourceError } from "../src/errors.mjs";
+import { extractFrames } from "../src/frames.mjs";
 import { openWorkspace, workspaceCacheDir } from "../src/workspace.mjs";
 
 const source = {
@@ -98,17 +103,35 @@ async function createWorkspace(t) {
 }
 
 async function preparedFrame(workspace, frame = capture()) {
-  const tempPath = path.join(
-    workspace.imagesDir,
-    `${path.parse(frame.filename).name}.part-${process.pid}-00000000-0000-4000-8000-000000000011.jpg`,
-  );
+  const token = randomUUID();
+  const generationPath = path.join(workspace.imagesDir, `.v2w-frame-stage-${token}`);
+  await mkdir(generationPath, { mode: 0o700 });
+  const generationInfo = await lstat(generationPath);
+  const ownerPath = path.join(generationPath, `owner-${token}`);
+  await writeFile(ownerPath, token);
+  const ownerInfo = await lstat(ownerPath);
+  const tempPath = path.join(generationPath, frame.filename);
   await writeFile(tempPath, "prepared-jpeg");
   const info = await lstat(tempPath);
+  const sourcePath = path.join(workspace.cacheDir, "source-video.mov");
+  await writeFile(sourcePath, "source-video-bytes");
+  const sourceInfo = await lstat(sourcePath);
   return {
+    generationPath,
+    generationIdentity: { dev: generationInfo.dev, ino: generationInfo.ino },
+    ownerPath,
+    ownerIdentity: { dev: ownerInfo.dev, ino: ownerInfo.ino },
     tempPath,
     tempIdentity: { dev: info.dev, ino: info.ino },
+    sourcePath,
+    sourceIdentity: { dev: sourceInfo.dev, ino: sourceInfo.ino },
     frame,
   };
+}
+
+async function cleanupPreparedGeneration(prepared) {
+  await unlink(prepared.ownerPath);
+  await rmdir(prepared.generationPath);
 }
 
 test("creates cache, output, images, and an atomic building manifest", async (t) => {
@@ -289,12 +312,34 @@ test("marks completion only when explicitly requested and persists it atomically
   let manifest = await workspace.loadManifest();
   manifest = await workspace.recordFrame(manifest, capture());
   assert.equal(JSON.parse(await readFile(workspace.manifestPath, "utf8")).status, "building");
+  await writeFile(path.join(workspace.imagesDir, capture().filename), "jpeg-bytes");
 
   manifest = await workspace.markComplete(manifest);
 
   assert.equal(manifest.status, "complete");
   assert.match(manifest.completedAt, /^\d{4}-\d{2}-\d{2}T/);
   assert.deepEqual(JSON.parse(await readFile(workspace.manifestPath, "utf8")), manifest);
+});
+
+test("completion requires an exact nonempty regular image inventory", async (t) => {
+  const workspace = await createWorkspace(t);
+  let manifest = await workspace.loadManifest();
+  const frame = capture();
+  manifest = await workspace.recordFrame(manifest, frame);
+  const imagePath = path.join(workspace.imagesDir, frame.filename);
+
+  await assert.rejects(workspace.markComplete(manifest), OutputConflictError);
+  await writeFile(imagePath, "");
+  await assert.rejects(workspace.markComplete(manifest), OutputConflictError);
+  await writeFile(imagePath, "jpeg-bytes");
+  const foreignPath = path.join(workspace.imagesDir, ".v2w-frame-backup-foreign.jpg");
+  await writeFile(foreignPath, "foreign-backup");
+  await assert.rejects(workspace.markComplete(manifest), OutputConflictError);
+  assert.equal(await readFile(foreignPath, "utf8"), "foreign-backup");
+
+  await unlink(foreignPath);
+  const complete = await workspace.markComplete(manifest);
+  assert.equal(complete.status, "complete");
 });
 
 test("keeps completed workspaces readable and terminal across every mutation API", async (t) => {
@@ -441,42 +486,23 @@ test("completion that acquires the lock first rejects a stale frame commit befor
     outputDir: path.join(root, "output"),
     source,
   };
-  const completionLocked = deferred();
-  const allowCompletion = deferred();
-  let armCompletion = false;
-  const completing = await openWorkspace({
-    ...options,
-    hooks: {
-      async afterLockPublished() {
-        if (!armCompletion) return;
-        completionLocked.resolve();
-        await allowCompletion.promise;
-      },
-    },
-  });
+  const completing = await openWorkspace(options);
   const extracting = await openWorkspace(options);
   const completionManifest = await completing.loadManifest();
   const staleFrameManifest = structuredClone(await extracting.loadManifest());
+  const complete = await completing.markComplete(completionManifest);
   const prepared = await preparedFrame(extracting);
   const finalPath = path.join(extracting.imagesDir, prepared.frame.filename);
 
-  armCompletion = true;
-  const completion = completing.markComplete(completionManifest);
-  await completionLocked.promise;
-  try {
-    await assert.rejects(
-      extracting.commitFrame(staleFrameManifest, prepared),
-      OutputConflictError,
-    );
-  } finally {
-    allowCompletion.resolve();
-  }
+  await assert.rejects(
+    extracting.commitFrame(staleFrameManifest, prepared),
+    OutputConflictError,
+  );
   await assert.rejects(access(finalPath));
   assert.equal(await readFile(prepared.tempPath, "utf8"), "prepared-jpeg");
-
-  const complete = await completion;
   assert.equal(complete.status, "complete");
   assert.deepEqual(complete.images, []);
+  assert.deepEqual(await completing.loadManifest(), complete);
   await assert.rejects(access(finalPath));
 });
 
@@ -489,46 +515,19 @@ test("frame commit that acquires the lock first makes concurrent stale completio
     outputDir: path.join(root, "output"),
     source,
   };
-  const frameLocked = deferred();
-  const allowFrameCommit = deferred();
-  let armFrame = false;
-  const extracting = await openWorkspace({
-    ...options,
-    hooks: {
-      async afterLockPublished() {
-        if (!armFrame) return;
-        frameLocked.resolve();
-        await allowFrameCommit.promise;
-      },
-    },
-  });
+  const extracting = await openWorkspace(options);
   const completing = await openWorkspace(options);
   const frameManifest = await extracting.loadManifest();
   const staleCompletionManifest = structuredClone(await completing.loadManifest());
   const prepared = await preparedFrame(extracting);
   const finalPath = path.join(extracting.imagesDir, prepared.frame.filename);
 
-  armFrame = true;
-  const frameCommit = extracting.commitFrame(frameManifest, prepared);
-  const frameCommitResult = frameCommit.then(
-    (value) => ({ status: "fulfilled", value }),
-    (reason) => ({ status: "rejected", reason }),
-  );
-  const phase = await Promise.race([
-    frameLocked.promise.then(() => "frame-locked"),
-    frameCommitResult.then(() => "frame-settled"),
-  ]);
-  assert.equal(phase, "frame-locked");
+  const building = await extracting.commitFrame(frameManifest, prepared);
+  await cleanupPreparedGeneration(prepared);
   await assert.rejects(
     completing.markComplete(staleCompletionManifest),
     OutputConflictError,
   );
-  await assert.rejects(access(finalPath));
-
-  allowFrameCommit.resolve();
-  const completedFrameCommit = await frameCommitResult;
-  assert.equal(completedFrameCommit.status, "fulfilled");
-  const building = completedFrameCommit.value;
   assert.equal(building.status, "building");
   assert.equal(building.revision, 1);
   assert.equal(await readFile(finalPath, "utf8"), "prepared-jpeg");
@@ -542,11 +541,17 @@ test("manifest publication failure after frame rename remains building and recov
   const root = await mkdtemp(path.join(os.tmpdir(), "v2w-frame-manifest-failure-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const failure = new Error("injected manifest write failure");
-  const workspace = await openWorkspace({
+  const videoPath = path.join(root, "source-video.mov");
+  await writeFile(videoPath, "source-video-bytes");
+  const localSource = { ...source, input: videoPath };
+  const options = {
     cacheRoot: path.join(root, "cache"),
     fingerprint: source.fingerprint,
     outputDir: path.join(root, "output"),
-    source,
+    source: localSource,
+  };
+  const workspace = await openWorkspace({
+    ...options,
     hooks: {
       beforeFrameManifestWrite() {
         throw failure;
@@ -554,26 +559,147 @@ test("manifest publication failure after frame rename remains building and recov
     },
   });
   const manifest = await workspace.loadManifest();
+  const planned = capture();
+  delete planned.width;
+  delete planned.height;
+  const finalPath = path.join(workspace.imagesDir, planned.filename);
+  const run = async (command, args) => {
+    if (command === "ffmpeg") {
+      await writeFile(args.at(-1), "prepared-jpeg");
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return {
+      code: 0,
+      stdout: JSON.stringify({ streams: [{ width: 640, height: 360 }] }),
+      stderr: "",
+    };
+  };
+
+  await assert.rejects(
+    extractFrames({
+      videoPath,
+      captures: [planned],
+      workspace,
+      manifest,
+      run,
+      log: { info() {} },
+    }),
+    (error) => error instanceof SourceError && error.cause === failure,
+  );
+
+  const persisted = await workspace.loadManifest();
+  const persistedBytes = await readFile(workspace.manifestPath, "utf8");
+  assert.equal(persisted.status, "building");
+  assert.equal(persisted.revision, 0);
+  assert.deepEqual(persisted.images, []);
+  assert.equal(await readFile(finalPath, "utf8"), "prepared-jpeg");
+  assert.deepEqual(await readdir(workspace.imagesDir), [planned.filename]);
+  for (const candidate of [manifest, persisted]) {
+    await assert.rejects(workspace.markComplete(candidate), OutputConflictError);
+    assert.equal(await readFile(workspace.manifestPath, "utf8"), persistedBytes);
+    assert.equal(await readFile(finalPath, "utf8"), "prepared-jpeg");
+  }
+
+  const resumed = await openWorkspace(options);
+  const recovered = await extractFrames({
+    videoPath,
+    captures: [planned],
+    workspace: resumed,
+    manifest: await resumed.loadManifest(),
+    run: async (command, args) => {
+      if (command === "ffmpeg") {
+        await writeFile(args.at(-1), "recovered-jpeg");
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      return {
+        code: 0,
+        stdout: JSON.stringify({ streams: [{ width: 640, height: 360 }] }),
+        stderr: "",
+      };
+    },
+    log: { info() {} },
+  });
+  assert.equal(recovered.revision, 1);
+  assert.equal(await readFile(finalPath, "utf8"), "recovered-jpeg");
+  const complete = await resumed.markComplete(recovered);
+  assert.equal(complete.status, "complete");
+  assert.deepEqual(await readdir(resumed.imagesDir), [planned.filename]);
+});
+
+test("commitFrame surfaces a real workspace rename failure without publishing manifest or final", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-frame-rename-failure-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const renameFailure = Object.assign(new Error("injected frame rename failure"), { code: "EIO" });
+  let renameCalls = 0;
+  const workspace = await openWorkspace({
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source,
+    hooks: {
+      renameFramePath() {
+        renameCalls += 1;
+        throw renameFailure;
+      },
+    },
+  });
+  const manifest = await workspace.loadManifest();
+  const manifestBytes = await readFile(workspace.manifestPath, "utf8");
   const prepared = await preparedFrame(workspace);
   const finalPath = path.join(workspace.imagesDir, prepared.frame.filename);
 
   await assert.rejects(
     workspace.commitFrame(manifest, prepared),
-    (error) => error === failure,
+    (error) => error === renameFailure,
   );
 
-  const persisted = await workspace.loadManifest();
-  assert.equal(persisted.status, "building");
-  assert.equal(persisted.revision, 0);
-  assert.deepEqual(persisted.images, []);
-  assert.equal(await readFile(finalPath, "utf8"), "prepared-jpeg");
-  await assert.rejects(access(prepared.tempPath));
-  assert.equal((await openWorkspace({
+  assert.equal(renameCalls, 1);
+  assert.equal(await readFile(workspace.manifestPath, "utf8"), manifestBytes);
+  assert.equal(await readFile(prepared.tempPath, "utf8"), "prepared-jpeg");
+  await assert.rejects(access(finalPath));
+});
+
+test("commitFrame rejects a source alias introduced after extraction checks but before locked publication", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-frame-late-alias-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const sourceCheckReached = deferred();
+  const allowSourceCheck = deferred();
+  const workspace = await openWorkspace({
     cacheRoot: path.join(root, "cache"),
     fingerprint: source.fingerprint,
     outputDir: path.join(root, "output"),
     source,
-  })).outputDir, workspace.outputDir);
+    hooks: {
+      async afterFrameSourceCheck() {
+        sourceCheckReached.resolve();
+        await allowSourceCheck.promise;
+      },
+    },
+  });
+  const manifest = await workspace.loadManifest();
+  const prepared = await preparedFrame(workspace);
+  const finalPath = path.join(workspace.imagesDir, prepared.frame.filename);
+
+  const commit = workspace.commitFrame(manifest, prepared);
+  const commitResult = commit.then(
+    (value) => ({ status: "fulfilled", value }),
+    (reason) => ({ status: "rejected", reason }),
+  );
+  const phase = await Promise.race([
+    sourceCheckReached.promise.then(() => "source-check"),
+    commitResult.then(() => "commit-settled"),
+  ]);
+  assert.equal(phase, "source-check");
+  await link(prepared.sourcePath, finalPath);
+  allowSourceCheck.resolve();
+  const rejected = await commitResult;
+  assert.equal(rejected.status, "rejected");
+  assert.ok(rejected.reason instanceof OutputConflictError);
+
+  assert.equal(await readFile(prepared.sourcePath, "utf8"), "source-video-bytes");
+  assert.equal(await readFile(finalPath, "utf8"), "source-video-bytes");
+  assert.equal(await readFile(prepared.tempPath, "utf8"), "prepared-jpeg");
+  assert.equal((await workspace.loadManifest()).revision, 0);
 });
 
 test("rejects empty fingerprints and noncanonical resumed timestamps", async (t) => {
