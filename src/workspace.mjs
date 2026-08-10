@@ -803,7 +803,7 @@ export async function openWorkspace({
               manifest: writtenManifest,
               protectedStages: protectedForFrame,
               committedFrame,
-              priorRevision: current.revision,
+              leaseRevision: current.revision,
             },
           );
           if (blockedRetirements.length > 0) {

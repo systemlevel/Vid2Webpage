@@ -193,6 +193,54 @@ async function assertProtectedPriorBackup(imagesDir, expectedBytes) {
   return { stagePath, token };
 }
 
+async function leaveProtectedPriorBackup({
+  options,
+  videoPath,
+  manifest,
+  planned,
+  expectedBytes,
+}) {
+  const finalPath = path.join(options.outputDir, "images", planned.filename);
+  const manifestFailure = new Error("injected frame manifest failure");
+  const relinkFailure = Object.assign(new Error("injected rollback relink failure"), {
+    code: "EIO",
+  });
+  let relinkFailed = false;
+  const workspace = await openWorkspace({
+    ...options,
+    hooks: {
+      beforeFrameManifestWrite() {
+        throw manifestFailure;
+      },
+    },
+    frameFileOps: {
+      link(from, to) {
+        if (!relinkFailed
+          && to === finalPath
+          && path.basename(from).startsWith("previous-")) {
+          relinkFailed = true;
+          throw relinkFailure;
+        }
+        linkSync(from, to);
+      },
+    },
+  });
+  const attempted = { ...planned, timestampMs: planned.timestampMs + 1 };
+  await assert.rejects(extractFrames({
+    videoPath,
+    captures: [attempted],
+    workspace,
+    manifest,
+    run: frameRunner("failed-new-jpeg"),
+    log: { info() {} },
+  }), SourceError);
+  assert.equal(relinkFailed, true);
+  assert.equal((await workspace.loadManifest()).revision, manifest.revision);
+  await assert.rejects(access(finalPath));
+  await assertProtectedPriorBackup(workspace.imagesDir, expectedBytes);
+  return { attempted, finalPath };
+}
+
 test("creates cache, output, images, and an atomic building manifest", async (t) => {
   const workspace = await createWorkspace(t);
   const manifest = await workspace.loadManifest();
@@ -1273,6 +1321,158 @@ test("restart recovery retains the prior backup when its verified final is repla
   assert.equal(await readFile(finalPath, "utf8"), "republished-jpeg");
   assert.equal((await resumed.markComplete(recovered)).status, "complete");
   assert.deepEqual(await readdir(resumed.imagesDir), [planned.filename]);
+});
+
+test("an unrelated frame commit carries a protected frame forward until its own republish", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-protected-unrelated-revision-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const videoPath = path.join(root, "source-video.mov");
+  await writeFile(videoPath, "source-video-bytes");
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source: { ...source, input: videoPath },
+  };
+  const frameA = capture({
+    filename: "000001000-primary.jpg",
+    requestedMs: 1000,
+    timestampMs: 1000,
+    associations: [{ segmentIndex: 0, requestedMs: 1000, reasons: ["primary"] }],
+  });
+  const frameB = capture({
+    filename: "000002000-primary.jpg",
+    requestedMs: 2000,
+    timestampMs: 2000,
+    associations: [{ segmentIndex: 1, requestedMs: 2000, reasons: ["primary"] }],
+  });
+  delete frameA.width;
+  delete frameA.height;
+  delete frameB.width;
+  delete frameB.height;
+  const initialWorkspace = await openWorkspace(options);
+  const initial = await extractFrames({
+    videoPath,
+    captures: [frameA, frameB],
+    workspace: initialWorkspace,
+    manifest: await initialWorkspace.loadManifest(),
+    run: frameRunner("prior-jpeg"),
+    log: { info() {} },
+  });
+  const { finalPath: finalAPath } = await leaveProtectedPriorBackup({
+    options,
+    videoPath,
+    manifest: initial,
+    planned: frameA,
+    expectedBytes: "prior-jpeg",
+  });
+
+  const finalBPath = path.join(initialWorkspace.imagesDir, frameB.filename);
+  const changedB = { ...frameB, timestampMs: frameB.timestampMs + 1 };
+  const bWorkspace = await openWorkspace(options);
+  const afterB = await extractFrames({
+    videoPath,
+    captures: [changedB],
+    workspace: bWorkspace,
+    manifest: await bWorkspace.loadManifest(),
+    run: frameRunner("updated-b"),
+    log: { info() {} },
+  });
+  assert.equal(afterB.revision, initial.revision + 1);
+  assert.equal(await readFile(finalAPath, "utf8"), "prior-jpeg");
+  assert.equal(await readFile(finalBPath, "utf8"), "updated-b");
+  await assertProtectedPriorBackup(bWorkspace.imagesDir, "prior-jpeg");
+
+  let aFfmpegCalls = 0;
+  const aWorkspace = await openWorkspace(options);
+  const afterA = await extractFrames({
+    videoPath,
+    captures: [frameA],
+    workspace: aWorkspace,
+    manifest: afterB,
+    run: async (command, args) => {
+      if (command === "ffmpeg") aFfmpegCalls += 1;
+      return frameRunner("republished-a")(command, args);
+    },
+    log: { info() {} },
+  });
+  assert.equal(aFfmpegCalls, 1);
+  assert.equal(afterA.revision, initial.revision + 2);
+  assert.equal(await readFile(finalAPath, "utf8"), "republished-a");
+  assert.equal(await readFile(finalBPath, "utf8"), "updated-b");
+  assert.equal((await aWorkspace.markComplete(afterA)).status, "complete");
+  assert.deepEqual(
+    (await readdir(aWorkspace.imagesDir)).sort(),
+    [frameA.filename, frameB.filename].sort(),
+  );
+});
+
+test("a changed protected frame manifest identity blocks stale recovery and preserves its backup", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-protected-frame-identity-change-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const videoPath = path.join(root, "source-video.mov");
+  await writeFile(videoPath, "source-video-bytes");
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source: { ...source, input: videoPath },
+  };
+  const planned = capture();
+  delete planned.width;
+  delete planned.height;
+  const initialWorkspace = await openWorkspace(options);
+  const initial = await extractFrames({
+    videoPath,
+    captures: [planned],
+    workspace: initialWorkspace,
+    manifest: await initialWorkspace.loadManifest(),
+    run: frameRunner("prior-jpeg"),
+    log: { info() {} },
+  });
+  const { finalPath } = await leaveProtectedPriorBackup({
+    options,
+    videoPath,
+    manifest: initial,
+    planned,
+    expectedBytes: "prior-jpeg",
+  });
+
+  const mutatingWorkspace = await openWorkspace(options);
+  const beforeMutation = await mutatingWorkspace.loadManifest();
+  const changedFrame = {
+    ...beforeMutation.images[0],
+    timestampMs: beforeMutation.images[0].timestampMs + 50,
+  };
+  const changedManifest = await mutatingWorkspace.saveManifest({
+    ...beforeMutation,
+    images: [changedFrame],
+  });
+  let runnerCalls = 0;
+  let rejection;
+  const recoveryWorkspace = await openWorkspace(options);
+  try {
+    await extractFrames({
+      videoPath,
+      captures: [planned],
+      workspace: recoveryWorkspace,
+      manifest: changedManifest,
+      run: async (command, args) => {
+        runnerCalls += 1;
+        return frameRunner("must-not-run")(command, args);
+      },
+      log: { info() {} },
+    });
+  } catch (error) {
+    rejection = error;
+  }
+
+  assert.ok(rejection instanceof OutputConflictError);
+  assert.equal(runnerCalls, 0);
+  assert.equal((await recoveryWorkspace.loadManifest()).revision, changedManifest.revision);
+  assert.deepEqual((await recoveryWorkspace.loadManifest()).images, [changedFrame]);
+  await assert.rejects(access(finalPath));
+  await assertProtectedPriorBackup(recoveryWorkspace.imagesDir, "prior-jpeg");
 });
 
 test("post-manifest backup cleanup failure leaves a committed stage that resume recovers", async (t) => {

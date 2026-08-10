@@ -362,7 +362,7 @@ function recoverPriorBackup(snapshot, imagesDir, manifest, fileOps) {
     return { status: "blocked" };
   }
 
-  const committed = manifest.revision === state.nextRevision
+  const committed = manifest.revision >= state.nextRevision
     && isDeepStrictEqual(currentFrame, state.nextFrame);
   if (committed && isOwnedRegularFile(finalInfo, state.tempIdentity)) {
     return removeCapturedGeneration(snapshot, fileOps)
@@ -370,16 +370,8 @@ function recoverPriorBackup(snapshot, imagesDir, manifest, fileOps) {
       : { status: "blocked" };
   }
 
-  const transitionedAway = manifest.revision > state.priorRevision
-    && !isDeepStrictEqual(currentFrame, state.priorFrame);
-  if (transitionedAway) {
-    return removeCapturedGeneration(snapshot, fileOps)
-      ? { status: "removed" }
-      : { status: "blocked" };
-  }
-
   const priorManifest = state.priorFrame !== null
-    && manifest.revision === state.priorRevision
+    && manifest.revision >= state.priorRevision
     && isDeepStrictEqual(currentFrame, state.priorFrame);
   if (!priorManifest) return { status: "blocked" };
   if (!backupMember) return { status: "blocked" };
@@ -422,6 +414,7 @@ function recoverPriorBackup(snapshot, imagesDir, manifest, fileOps) {
     generationPath: snapshot.generationPath,
     generationIdentity: snapshot.generationIdentity,
     backupIdentity: state.backupIdentity,
+    observedRevision: manifest.revision,
     priorRevision: state.priorRevision,
     priorFrame: state.priorFrame,
     snapshot,
@@ -464,7 +457,7 @@ export function recoverFrameStagesSync(
 export function retireProtectedFrameStagesSync(
   imagesDir,
   fileOps,
-  { manifest, protectedStages, committedFrame, priorRevision },
+  { manifest, protectedStages, committedFrame, leaseRevision },
 ) {
   const blocked = [];
   for (const protectedStage of protectedStages) {
@@ -490,10 +483,11 @@ export function retireProtectedFrameStagesSync(
       || !recovery.backupMember
       || recovery.state.filename !== protectedStage.filename
       || recovery.state.priorRevision !== protectedStage.priorRevision
-      || recovery.state.priorRevision !== priorRevision
+      || recovery.state.priorRevision > leaseRevision
+      || protectedStage.observedRevision !== leaseRevision
       || !isDeepStrictEqual(recovery.state.priorFrame, protectedStage.priorFrame)
       || !hasFileIdentity(recovery.state.backupIdentity, protectedStage.backupIdentity)
-      || manifest.revision !== priorRevision + 1
+      || manifest.revision !== leaseRevision + 1
       || !committedFrame
       || committedFrame.filename !== protectedStage.filename
       || !isDeepStrictEqual(currentFrame, committedFrame)
