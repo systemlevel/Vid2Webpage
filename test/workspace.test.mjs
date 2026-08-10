@@ -111,6 +111,16 @@ async function createWorkspace(t) {
   });
 }
 
+async function createRenderLeaseWorkspace(t) {
+  const workspace = await createWorkspace(t);
+  const manifest = await workspace.saveManifest({
+    ...(await workspace.loadManifest()),
+    transcript: { engine: "mlx-whisper", filename: "transcript.vtt" },
+    segments: [{ startMs: 0, endMs: 8_000, text: "Whisper segment" }],
+  });
+  return { workspace, manifest };
+}
+
 async function preparedFrame(workspace, t, frame = capture()) {
   const token = randomUUID();
   const generationPath = path.join(workspace.imagesDir, `.v2w-frame-stage-${token}`);
@@ -527,6 +537,66 @@ test("rejects duplicate and out-of-range frame associations without persisting t
     await assert.rejects(workspace.recordFrame(manifest, frame), OutputConflictError);
     assert.equal(await readFile(workspace.manifestPath, "utf8"), originalBytes);
   }
+});
+
+test("durable manifest saves reject out-of-range associations", async (t) => {
+  const { workspace, manifest } = await createRenderLeaseWorkspace(t);
+  const originalBytes = await readFile(workspace.manifestPath, "utf8");
+  await assert.rejects(
+    workspace.saveManifest({
+      ...manifest,
+      images: [capture({
+        associations: [{ segmentIndex: 1, requestedMs: 4_000, reasons: ["primary"] }],
+      })],
+    }),
+    OutputConflictError,
+  );
+  assert.equal(await readFile(workspace.manifestPath, "utf8"), originalBytes);
+});
+
+test("render lease rejects escaped operations after its callback without writes", async (t) => {
+  const { workspace, manifest } = await createRenderLeaseWorkspace(t);
+  let escapedSave;
+  await workspace.withRenderLease(manifest, (lease) => {
+    escapedSave = lease.saveManifest;
+  });
+  const originalBytes = await readFile(workspace.manifestPath, "utf8");
+
+  await assert.rejects(escapedSave(manifest), OutputConflictError);
+  assert.equal(await readFile(workspace.manifestPath, "utf8"), originalBytes);
+});
+
+test("render lease closes synchronously before a queued escaped operation can start", async (t) => {
+  const { workspace, manifest } = await createRenderLeaseWorkspace(t);
+  let escapedSave;
+  await workspace.withRenderLease(manifest, (lease) => {
+    queueMicrotask(() => {
+      escapedSave = lease.saveManifest(manifest);
+      escapedSave.catch(() => {});
+    });
+  });
+  const originalBytes = await readFile(workspace.manifestPath, "utf8");
+
+  await assert.rejects(escapedSave, OutputConflictError);
+  assert.equal(await readFile(workspace.manifestPath, "utf8"), originalBytes);
+});
+
+test("render lease serializes duplicate and out-of-order transitions", async (t) => {
+  const { workspace, manifest } = await createRenderLeaseWorkspace(t);
+  const complete = await workspace.withRenderLease(manifest, async (lease) => {
+    await assert.rejects(lease.markComplete(manifest), OutputConflictError);
+    const saved = await lease.saveManifest(manifest);
+    const outcomes = await Promise.allSettled([
+      lease.markComplete(saved),
+      lease.markComplete(saved),
+    ]);
+    assert.equal(outcomes.filter((outcome) => outcome.status === "fulfilled").length, 1);
+    assert.equal(outcomes.filter((outcome) => outcome.status === "rejected").length, 1);
+    return outcomes.find((outcome) => outcome.status === "fulfilled").value;
+  });
+
+  assert.equal(complete.status, "complete");
+  assert.equal(complete.revision, manifest.revision + 2);
 });
 
 test("rejects contradictory completed lifecycle state without replacing it", async (t) => {

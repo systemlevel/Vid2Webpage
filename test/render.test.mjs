@@ -171,11 +171,50 @@ test("encodes contained image filenames as single URL path segments", () => {
   assert.match(html, /src="images\/frame%23%3F%25\.jpg"/);
 });
 
+test("rejects malformed, duplicate, out-of-range, and dot image associations in standalone rendering", () => {
+  const invalidImages = [
+    {
+      ...sharedImage,
+      associations: [
+        { segmentIndex: 0, requestedMs: 3_000, reasons: ["primary"] },
+        { segmentIndex: 0, requestedMs: 3_001, reasons: ["caption"] },
+      ],
+    },
+    {
+      ...sharedImage,
+      associations: [{ segmentIndex: 2, requestedMs: 3_000, reasons: ["primary"] }],
+    },
+    {
+      ...sharedImage,
+      associations: [{ segmentIndex: "0", requestedMs: 3_000, reasons: ["primary"] }],
+    },
+    {
+      ...sharedImage,
+      associations: [{
+        segmentIndex: 0,
+        requestedMs: 3_000,
+        reasons: ["primary"],
+        unexpected: true,
+      }],
+    },
+    { ...sharedImage, filename: "." },
+    { ...sharedImage, filename: ".." },
+  ];
+
+  for (const image of invalidImages) {
+    assert.throws(() => renderPage({ manifest: { ...manifest, images: [image] }, segments }), TypeError);
+  }
+});
+
 test("renders a valid zero-based segment timestamp", () => {
   const html = renderPage({
     manifest: {
       ...manifest,
       source: { kind: "local", title: "Local", input: "/video.mov", fingerprint: "local" },
+      images: [{
+        ...sharedImage,
+        associations: [{ segmentIndex: 0, requestedMs: 3_000, reasons: ["primary"] }],
+      }],
     },
     segments: [{ ...segments[0], startMs: 0 }],
   });

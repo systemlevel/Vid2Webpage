@@ -145,7 +145,8 @@ function validateFrame(frame, imagesDir, { canonical = false, segmentCount } = {
   if (new Set(associations.map((association) => association.segmentIndex)).size !== associations.length) {
     throw conflict("Frame associations must contain each segment only once");
   }
-  if (segmentCount !== undefined && associations.some((association) => association.segmentIndex >= segmentCount)) {
+  if (segmentCount !== undefined && segmentCount > 0
+    && associations.some((association) => association.segmentIndex >= segmentCount)) {
     throw conflict("Frame association references a segment outside the transcript");
   }
   const associationReasons = [...new Set(associations.flatMap((association) => association.reasons))]
@@ -186,7 +187,10 @@ function validateManifest(manifest, fingerprint, imagesDir) {
     throw conflict("Output manifest is incompatible with this source");
   }
   for (const image of manifest.images) {
-    if (!isDeepStrictEqual(image, validateFrame(image, imagesDir, { canonical: true }))) {
+    if (!isDeepStrictEqual(image, validateFrame(image, imagesDir, {
+      canonical: true,
+      segmentCount: manifest.segments.length,
+    }))) {
       throw conflict("Output manifest contains a noncanonical frame record");
     }
   }
@@ -592,43 +596,101 @@ export async function openWorkspace({
         throw conflict("Workspace manifest revision is stale");
       }
       validateRenderableManifest(current, fingerprint, imagesDir);
-      let saved = false;
-      let completed = false;
-      return operation({
+      let phase = "ready";
+      let acceptingOperations = true;
+      let pendingOperations = 0;
+      let notifyDrain;
+      const beginOperation = (requiredPhase, nextPhase, message) => {
+        if (!acceptingOperations) throw conflict("Render lease has expired");
+        if (phase !== requiredPhase) throw conflict(message);
+        phase = nextPhase;
+        pendingOperations += 1;
+      };
+      const finishOperation = () => {
+        pendingOperations -= 1;
+        if (pendingOperations === 0) {
+          notifyDrain?.();
+          notifyDrain = undefined;
+        }
+      };
+      const waitForOperations = async () => {
+        while (pendingOperations > 0) {
+          await new Promise((resolve) => {
+            notifyDrain = resolve;
+          });
+        }
+      };
+      const lease = {
         manifest: current,
         async saveManifest(nextManifest) {
-          if (saved || completed) {
-            throw conflict("Render lease manifest metadata was already saved");
+          beginOperation(
+            "ready",
+            "saving",
+            "Render lease manifest metadata was already saved",
+          );
+          try {
+            validateRenderableManifest(nextManifest, fingerprint, imagesDir);
+            if (nextManifest.status !== "building" || nextManifest.revision !== current.revision) {
+              throw conflict("Render lease manifest revision is stale");
+            }
+            current = await writeManifest({ ...nextManifest, revision: current.revision + 1 });
+            phase = "saved";
+            return current;
+          } catch (error) {
+            phase = "failed";
+            throw error;
+          } finally {
+            finishOperation();
           }
-          validateRenderableManifest(nextManifest, fingerprint, imagesDir);
-          if (nextManifest.status !== "building" || nextManifest.revision !== current.revision) {
-            throw conflict("Render lease manifest revision is stale");
-          }
-          current = await writeManifest({ ...nextManifest, revision: current.revision + 1 });
-          saved = true;
-          return current;
         },
         async markComplete(manifestToComplete) {
-          if (!saved || completed) {
-            throw conflict("Render lease completion requires saved render metadata");
+          beginOperation(
+            "saved",
+            "completing",
+            "Render lease completion requires saved render metadata",
+          );
+          try {
+            validateRenderableManifest(manifestToComplete, fingerprint, imagesDir);
+            if (manifestToComplete.status !== "building"
+              || manifestToComplete.revision !== current.revision) {
+              throw conflict("Render lease manifest revision is stale");
+            }
+            await hooks.beforeCompletionInventory?.({ manifest: current, imagesDir });
+            await validateCompleteInventory(current);
+            current = await writeManifest({
+              ...current,
+              status: "complete",
+              revision: current.revision + 1,
+              completedAt: new Date().toISOString(),
+            });
+            phase = "complete";
+            return current;
+          } catch (error) {
+            phase = "failed";
+            throw error;
+          } finally {
+            finishOperation();
           }
-          validateRenderableManifest(manifestToComplete, fingerprint, imagesDir);
-          if (manifestToComplete.status !== "building"
-            || manifestToComplete.revision !== current.revision) {
-            throw conflict("Render lease manifest revision is stale");
-          }
-          await hooks.beforeCompletionInventory?.({ manifest: current, imagesDir });
-          await validateCompleteInventory(current);
-          current = await writeManifest({
-            ...current,
-            status: "complete",
-            revision: current.revision + 1,
-            completedAt: new Date().toISOString(),
-          });
-          completed = true;
-          return current;
         },
-      });
+      };
+      let operationResult;
+      let operationError;
+      try {
+        const callbackResult = operation(lease);
+        if (callbackResult && typeof callbackResult.then === "function") {
+          operationResult = await callbackResult;
+        } else {
+          acceptingOperations = false;
+          operationResult = callbackResult;
+        }
+      } catch (error) {
+        operationError = error;
+      } finally {
+        acceptingOperations = false;
+        await waitForOperations();
+      }
+      if (operationError) throw operationError;
+      return operationResult;
     });
   }
 

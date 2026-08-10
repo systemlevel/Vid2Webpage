@@ -33,11 +33,17 @@ function safeHttpUrl(url) {
   return parsed;
 }
 
-function safeImagePath(filename) {
+function assertSafeImageFilename(filename) {
   if (typeof filename !== "string" || filename.length === 0 || path.isAbsolute(filename)
-    || filename !== path.basename(filename) || filename.includes("/") || filename.includes("\\")) {
+    || filename === "." || filename === ".." || filename !== path.basename(filename)
+    || filename.includes("/") || filename.includes("\\")) {
     throw new TypeError(`Unsafe manifest image filename: ${filename}`);
   }
+  return filename;
+}
+
+function safeImagePath(filename) {
+  assertSafeImageFilename(filename);
   return `images/${encodeURIComponent(filename)}`;
 }
 
@@ -74,12 +80,53 @@ function timestampMarkup(source, timestampMs) {
   return `<time datetime="${isoDuration(timestampMs)}">${display}</time>`;
 }
 
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function validateRenderImages(images, segmentCount) {
+  if (!Array.isArray(images)) {
+    throw new TypeError("Manifest images must be an array");
+  }
+  for (const image of images) {
+    if (!isPlainObject(image)) throw new TypeError("Frame record must be an object");
+    assertSafeImageFilename(image.filename);
+    nonNegativeInteger(image.timestampMs, "Frame timestamp");
+    positiveInteger(image.width, "Frame width");
+    positiveInteger(image.height, "Frame height");
+    if (!Array.isArray(image.associations) || image.associations.length === 0) {
+      throw new TypeError("Frame record must include associations");
+    }
+    const associatedSegments = new Set();
+    for (const association of image.associations) {
+      if (!isPlainObject(association)
+        || Object.keys(association).length !== 3
+        || !Object.hasOwn(association, "segmentIndex")
+        || !Object.hasOwn(association, "requestedMs")
+        || !Object.hasOwn(association, "reasons")
+        || !Number.isSafeInteger(association.segmentIndex)
+        || association.segmentIndex < 0
+        || association.segmentIndex >= segmentCount
+        || !Number.isSafeInteger(association.requestedMs)
+        || association.requestedMs < 0
+        || !Array.isArray(association.reasons)
+        || association.reasons.length === 0
+        || association.reasons.some((reason) => typeof reason !== "string")) {
+        throw new TypeError("Frame association is invalid");
+      }
+      if (associatedSegments.has(association.segmentIndex)) {
+        throw new TypeError("Frame associations must contain each segment only once");
+      }
+      associatedSegments.add(association.segmentIndex);
+    }
+  }
+}
+
 function segmentGalleries(images, segmentCount) {
   const galleries = Array.from({ length: segmentCount }, () => new Map());
-  for (const image of images ?? []) {
-    for (const association of image.associations ?? []) {
-      const index = association?.segmentIndex;
-      if (!Number.isSafeInteger(index) || index < 0 || index >= galleries.length) continue;
+  for (const image of images) {
+    for (const association of image.associations) {
+      const index = association.segmentIndex;
       const existing = galleries[index].get(image.filename);
       const reasons = new Set([...(existing?.reasons ?? []), ...(association.reasons ?? [])]);
       galleries[index].set(image.filename, { image, reasons: [...reasons] });
@@ -119,8 +166,10 @@ function sourceTitle(source) {
 export function renderPage({ manifest, segments }) {
   const transcriptSegments = Array.isArray(segments) ? segments : [];
   const source = manifest?.source ?? {};
-  const galleries = segmentGalleries(manifest?.images, transcriptSegments.length);
-  const physicalCount = Array.isArray(manifest?.images) ? manifest.images.length : 0;
+  const images = manifest?.images ?? [];
+  validateRenderImages(images, transcriptSegments.length);
+  const galleries = segmentGalleries(images, transcriptSegments.length);
+  const physicalCount = images.length;
   const engine = escapeHtml(manifest?.transcript?.engine);
   const articles = transcriptSegments.map((segment, index) => {
     const startMs = nonNegativeInteger(segment?.startMs, "Segment start");
