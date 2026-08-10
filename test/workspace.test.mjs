@@ -130,6 +130,11 @@ async function preparedFrame(workspace, frame = capture()) {
 }
 
 async function cleanupPreparedGeneration(prepared) {
+  try {
+    await unlink(prepared.tempPath);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
   await unlink(prepared.ownerPath);
   await rmdir(prepared.generationPath);
 }
@@ -477,6 +482,134 @@ test("concurrent output mutations leave exactly one revision-one terminal or bui
   }
 });
 
+test("completion inventory lease prevents a stale extractor from creating a stage after the scan starts", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-completion-lease-first-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const videoPath = path.join(root, "source-video.mov");
+  await writeFile(videoPath, "source-video-bytes");
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source: { ...source, input: videoPath },
+  };
+  const inventoryReached = deferred();
+  const allowCompletion = deferred();
+  const completing = await openWorkspace({
+    ...options,
+    hooks: {
+      async beforeCompletionInventory() {
+        inventoryReached.resolve();
+        await allowCompletion.promise;
+      },
+    },
+  });
+  const extracting = await openWorkspace(options);
+  const building = await completing.loadManifest();
+  const stale = structuredClone(await extracting.loadManifest());
+  const planned = capture();
+  delete planned.width;
+  delete planned.height;
+  let runnerCalls = 0;
+
+  const completion = completing.markComplete(building);
+  await inventoryReached.promise;
+  const extractionResult = await extractFrames({
+    videoPath,
+    captures: [planned],
+    workspace: extracting,
+    manifest: stale,
+    run: async () => {
+      runnerCalls += 1;
+      throw new Error("runner must not start after completion owns the lease");
+    },
+    log: { info() {} },
+  }).then(
+    (value) => ({ status: "fulfilled", value }),
+    (reason) => ({ status: "rejected", reason }),
+  );
+  allowCompletion.resolve();
+  const complete = await completion;
+  assert.equal(extractionResult.status, "rejected");
+  assert.equal(runnerCalls, 0);
+  assert.deepEqual(await readdir(extracting.imagesDir), []);
+  assert.equal(complete.status, "complete");
+  await assert.rejects(extractFrames({
+    videoPath,
+    captures: [planned],
+    workspace: extracting,
+    manifest: stale,
+    run: async () => {
+      runnerCalls += 1;
+      throw new Error("runner must not start after completion releases the lease");
+    },
+    log: { info() {} },
+  }), OutputConflictError);
+  assert.equal(runnerCalls, 0);
+  assert.deepEqual(await readdir(extracting.imagesDir), []);
+});
+
+test("frame lease keeps completion inventory out until extraction and stage cleanup fully release", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-frame-lease-first-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const videoPath = path.join(root, "source-video.mov");
+  await writeFile(videoPath, "source-video-bytes");
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source: { ...source, input: videoPath },
+  };
+  const extracting = await openWorkspace(options);
+  let inventoryScans = 0;
+  const completing = await openWorkspace({
+    ...options,
+    hooks: {
+      beforeCompletionInventory() {
+        inventoryScans += 1;
+      },
+    },
+  });
+  const frameManifest = await extracting.loadManifest();
+  const staleCompletion = structuredClone(await completing.loadManifest());
+  const planned = capture();
+  delete planned.width;
+  delete planned.height;
+  const ffmpegReached = deferred();
+  const allowFfmpeg = deferred();
+  const extraction = extractFrames({
+    videoPath,
+    captures: [planned],
+    workspace: extracting,
+    manifest: frameManifest,
+    run: async (command, args) => {
+      if (command === "ffmpeg") {
+        await writeFile(args.at(-1), "jpeg-bytes");
+        ffmpegReached.resolve();
+        await allowFfmpeg.promise;
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      return {
+        code: 0,
+        stdout: JSON.stringify({ streams: [{ width: 640, height: 360 }] }),
+        stderr: "",
+      };
+    },
+    log: { info() {} },
+  });
+  await ffmpegReached.promise;
+  await assert.rejects(completing.markComplete(staleCompletion), OutputConflictError);
+  const scansDuringFrameLease = inventoryScans;
+  allowFfmpeg.resolve();
+  const building = await extraction;
+  assert.equal(scansDuringFrameLease, 0);
+  assert.equal(building.revision, 1);
+  assert.deepEqual(await readdir(extracting.imagesDir), [planned.filename]);
+  const complete = await completing.markComplete(building);
+  assert.equal(complete.status, "complete");
+  assert.equal(inventoryScans, 1);
+});
+
 test("completion that acquires the lock first rejects a stale frame commit before JPEG rename", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "v2w-frame-complete-first-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -626,20 +759,206 @@ test("manifest publication failure after frame rename remains building and recov
   assert.deepEqual(await readdir(resumed.imagesDir), [planned.filename]);
 });
 
-test("commitFrame surfaces a real workspace rename failure without publishing manifest or final", async (t) => {
+test("prior final is restored after no-overwrite publication failure and resumed extraction completes", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-prior-final-recovery-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const videoPath = path.join(root, "source-video.mov");
+  await writeFile(videoPath, "source-video-bytes");
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source: { ...source, input: videoPath },
+  };
+  const planned = capture();
+  delete planned.width;
+  delete planned.height;
+  const runner = (bytes) => async (command, args) => {
+    if (command === "ffmpeg") {
+      await writeFile(args.at(-1), bytes);
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return {
+      code: 0,
+      stdout: JSON.stringify({ streams: [{ width: 640, height: 360 }] }),
+      stderr: "",
+    };
+  };
+  const firstWorkspace = await openWorkspace(options);
+  const first = await extractFrames({
+    videoPath,
+    captures: [planned],
+    workspace: firstWorkspace,
+    manifest: await firstWorkspace.loadManifest(),
+    run: runner("prior-jpeg"),
+    log: { info() {} },
+  });
+  const finalPath = path.join(firstWorkspace.imagesDir, planned.filename);
+  assert.equal(await readFile(finalPath, "utf8"), "prior-jpeg");
+
+  const publicationFailure = Object.assign(new Error("injected prepared publish failure"), {
+    code: "EIO",
+  });
+  let failFinalPublication = true;
+  const failingWorkspace = await openWorkspace({
+    ...options,
+    hooks: {
+      async linkFramePath(from, to) {
+        if (to === finalPath && failFinalPublication) {
+          failFinalPublication = false;
+          throw publicationFailure;
+        }
+        await link(from, to);
+      },
+    },
+  });
+  const changed = { ...planned, timestampMs: planned.timestampMs + 1 };
+  await assert.rejects(extractFrames({
+    videoPath,
+    captures: [changed],
+    workspace: failingWorkspace,
+    manifest: first,
+    run: runner("failed-new-jpeg"),
+    log: { info() {} },
+  }), (error) => error instanceof SourceError && error.cause === publicationFailure);
+
+  assert.equal((await failingWorkspace.loadManifest()).revision, 1);
+  assert.equal(await readFile(finalPath, "utf8"), "prior-jpeg");
+  assert.deepEqual(await readdir(failingWorkspace.imagesDir), [planned.filename]);
+
+  const resumed = await openWorkspace(options);
+  const recovered = await extractFrames({
+    videoPath,
+    captures: [changed],
+    workspace: resumed,
+    manifest: await resumed.loadManifest(),
+    run: runner("recovered-jpeg"),
+    log: { info() {} },
+  });
+  assert.equal(recovered.revision, 2);
+  assert.equal(await readFile(finalPath, "utf8"), "recovered-jpeg");
+  assert.equal((await resumed.markComplete(recovered)).status, "complete");
+});
+
+test("post-manifest backup cleanup failure is finished by lease cleanup and does not block completion", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-backup-cleanup-recovery-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const videoPath = path.join(root, "source-video.mov");
+  await writeFile(videoPath, "source-video-bytes");
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source: { ...source, input: videoPath },
+  };
+  const planned = capture();
+  delete planned.width;
+  delete planned.height;
+  const run = async (command, args) => {
+    if (command === "ffmpeg") {
+      await writeFile(args.at(-1), "jpeg-bytes");
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return {
+      code: 0,
+      stdout: JSON.stringify({ streams: [{ width: 640, height: 360 }] }),
+      stderr: "",
+    };
+  };
+  const firstWorkspace = await openWorkspace(options);
+  const first = await extractFrames({
+    videoPath,
+    captures: [planned],
+    workspace: firstWorkspace,
+    manifest: await firstWorkspace.loadManifest(),
+    run,
+    log: { info() {} },
+  });
+  const cleanupFailure = new Error("injected backup unlink failure");
+  let cleanupAttempts = 0;
+  const replacingWorkspace = await openWorkspace({
+    ...options,
+    hooks: {
+      unlinkFrameBackup() {
+        cleanupAttempts += 1;
+        throw cleanupFailure;
+      },
+    },
+  });
+  const changed = { ...planned, timestampMs: planned.timestampMs + 1 };
+  const replaced = await extractFrames({
+    videoPath,
+    captures: [changed],
+    workspace: replacingWorkspace,
+    manifest: first,
+    run,
+    log: { info() {} },
+  });
+
+  assert.equal(cleanupAttempts, 1);
+  assert.equal(replaced.revision, 2);
+  assert.deepEqual(await readdir(replacingWorkspace.imagesDir), [planned.filename]);
+  assert.equal((await replacingWorkspace.markComplete(replaced)).status, "complete");
+});
+
+test("a recovered frame lease scavenges a token-proven abandoned private generation", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-abandoned-frame-stage-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const videoPath = path.join(root, "source-video.mov");
+  await writeFile(videoPath, "source-video-bytes");
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source: { ...source, input: videoPath },
+  };
+  const workspace = await openWorkspace(options);
+  const token = "00000000-0000-4000-8000-000000000099";
+  const abandoned = path.join(workspace.imagesDir, `.v2w-frame-stage-${token}`);
+  await mkdir(abandoned, { mode: 0o700 });
+  await writeFile(path.join(abandoned, `owner-${token}`), token);
+  await writeFile(path.join(abandoned, "abandoned.jpg"), "partial-jpeg");
+  const planned = capture();
+  delete planned.width;
+  delete planned.height;
+
+  const building = await extractFrames({
+    videoPath,
+    captures: [planned],
+    workspace,
+    manifest: await workspace.loadManifest(),
+    run: async (command, args) => {
+      if (command === "ffmpeg") {
+        await writeFile(args.at(-1), "recovered-jpeg");
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      return {
+        code: 0,
+        stdout: JSON.stringify({ streams: [{ width: 640, height: 360 }] }),
+        stderr: "",
+      };
+    },
+    log: { info() {} },
+  });
+
+  assert.deepEqual(await readdir(workspace.imagesDir), [planned.filename]);
+  assert.equal((await workspace.markComplete(building)).status, "complete");
+});
+
+test("commitFrame surfaces a real workspace no-overwrite publication failure without changing prior state", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "v2w-frame-rename-failure-"));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const renameFailure = Object.assign(new Error("injected frame rename failure"), { code: "EIO" });
-  let renameCalls = 0;
+  const publicationFailure = Object.assign(new Error("injected frame publication failure"), { code: "EIO" });
+  let publicationCalls = 0;
   const workspace = await openWorkspace({
     cacheRoot: path.join(root, "cache"),
     fingerprint: source.fingerprint,
     outputDir: path.join(root, "output"),
     source,
     hooks: {
-      renameFramePath() {
-        renameCalls += 1;
-        throw renameFailure;
+      linkFramePath() {
+        publicationCalls += 1;
+        throw publicationFailure;
       },
     },
   });
@@ -650,16 +969,16 @@ test("commitFrame surfaces a real workspace rename failure without publishing ma
 
   await assert.rejects(
     workspace.commitFrame(manifest, prepared),
-    (error) => error === renameFailure,
+    (error) => error === publicationFailure,
   );
 
-  assert.equal(renameCalls, 1);
+  assert.equal(publicationCalls, 1);
   assert.equal(await readFile(workspace.manifestPath, "utf8"), manifestBytes);
   assert.equal(await readFile(prepared.tempPath, "utf8"), "prepared-jpeg");
   await assert.rejects(access(finalPath));
 });
 
-test("commitFrame rejects a source alias introduced after extraction checks but before locked publication", async (t) => {
+test("atomic no-overwrite rejects a source alias introduced in the final publication window", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "v2w-frame-late-alias-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const sourceCheckReached = deferred();
@@ -670,7 +989,7 @@ test("commitFrame rejects a source alias introduced after extraction checks but 
     outputDir: path.join(root, "output"),
     source,
     hooks: {
-      async afterFrameSourceCheck() {
+      async beforeFrameNoOverwritePublish() {
         sourceCheckReached.resolve();
         await allowSourceCheck.promise;
       },

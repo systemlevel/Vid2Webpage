@@ -151,6 +151,19 @@ async function cleanupReservation(reservation, fileOps) {
       errors.push(error);
     }
   }
+  if (generationOwned && reservation.obsoleteBackupPath
+    && reservation.obsoleteBackupIdentity
+    && await pathIsOwnedRegularFile(
+      reservation.obsoleteBackupPath,
+      reservation.obsoleteBackupIdentity,
+      { inspect: fileOps.lstat },
+    )) {
+    try {
+      await fileOps.unlink(reservation.obsoleteBackupPath);
+    } catch (error) {
+      errors.push(error);
+    }
+  }
 
   let ownerRemoved = !reservation.ownerIdentity;
   if (generationOwned && reservation.ownerIdentity
@@ -214,11 +227,15 @@ async function reserveOwnedTemp(finalPath, { nextTempId, fileOps }) {
       reservation.ownerHandle = undefined;
 
       reservation.handle = await fileOps.open(tempPath, "wx", 0o600);
+      const pathInfo = await fileOps.lstat(tempPath);
+      if (!pathInfo.isFile() || pathInfo.isSymbolicLink()) {
+        throw frameError(tempPath, "Reserved frame temp path is not a regular file");
+      }
+      reservation.tempIdentity = fileIdentity(pathInfo);
       const info = await reservation.handle.stat();
-      if (!info.isFile()) {
+      if (!info.isFile() || !hasFileIdentity(info, reservation.tempIdentity)) {
         throw frameError(tempPath, "Reserved frame temp is not a regular file");
       }
-      reservation.tempIdentity = fileIdentity(info);
       return reservation;
     } catch (error) {
       try {
@@ -314,98 +331,113 @@ export async function extractFrames({
 
   const resolvedFileOps = { ...defaultFileOps, ...fileOps };
   const sourceIdentity = await sourceIdentityOrNull(videoPath, resolvedFileOps);
+  const withFrameLease = workspace.withFrameLease
+    ? workspace.withFrameLease.bind(workspace)
+    : async (manifestToLease, operation) => operation({
+      manifest: manifestToLease,
+      canReuseFrame: (frame) => workspace.canReuseFrame(frame),
+      commitFrame: (prepared) => workspace.commitFrame(manifestToLease, prepared),
+    });
   let currentManifest = manifest;
   const orderedCaptures = [...captures].sort((left, right) =>
     left.timestampMs - right.timestampMs || left.filename.localeCompare(right.filename));
 
   for (const capture of orderedCaptures) {
-    const finalPath = safeFramePath(workspace.imagesDir, capture.filename);
-    if (await pathsReferToSameFile(videoPath, finalPath)) {
-      throw frameError(videoPath, "Frame output must not overwrite the local video");
-    }
-
-    const existing = currentManifest.images.find((image) => image.filename === capture.filename);
-    if (existing) {
-      const reuseCandidate = completedFrame(capture, existing);
-      if (await workspace.canReuseFrame(reuseCandidate)) {
-        if (!(await sourceIdentityIsCurrent(videoPath, sourceIdentity, resolvedFileOps))
-          || await pathsReferToSameFile(videoPath, finalPath)) {
-          throw frameError(videoPath, "Reusable frame must not alias the local video");
-        }
-        log?.info?.(`Reusing frame ${capture.filename}`);
-        continue;
-      }
-    }
-
-    let reservation;
-    let failure;
-    try {
-      reservation = await reserveOwnedTemp(finalPath, {
-        nextTempId,
-        fileOps: resolvedFileOps,
-      });
-      let result;
-      try {
-        result = await run("ffmpeg", buildFrameArgs({
-          videoPath,
-          timestampMs: capture.timestampMs,
-          outputPath: reservation.tempPath,
-        }));
-      } catch (error) {
-        throw frameError(capture.filename, "Unable to extract frame", error);
-      }
-      if (!(await reservationStillOwned(reservation, resolvedFileOps))) {
-        throw frameError(capture.filename, "Extracted frame temp ownership changed");
-      }
-      if (result?.code !== 0 || !(await isNonEmptyFile(reservation.tempPath))) {
-        throw frameError(capture.filename, "Unable to extract a nonempty frame");
-      }
-
-      const dimensions = await probeImageDimensions(reservation.tempPath, { run });
-      if (!(await reservationStillOwned(reservation, resolvedFileOps))) {
-        throw frameError(capture.filename, "Extracted frame temp ownership changed");
-      }
+    currentManifest = await withFrameLease(currentManifest, async (lease) => {
+      const leasedManifest = lease.manifest;
+      const finalPath = safeFramePath(workspace.imagesDir, capture.filename);
       if (await pathsReferToSameFile(videoPath, finalPath)) {
         throw frameError(videoPath, "Frame output must not overwrite the local video");
       }
-      const frame = completedFrame(capture, dimensions);
-      currentManifest = await workspace.commitFrame(currentManifest, {
-        generationPath: reservation.generationPath,
-        generationIdentity: reservation.generationIdentity,
-        ownerPath: reservation.ownerPath,
-        ownerIdentity: reservation.ownerIdentity,
-        tempPath: reservation.tempPath,
-        tempIdentity: reservation.tempIdentity,
-        sourcePath: videoPath,
-        sourceIdentity,
-        frame,
-      });
-      log?.info?.(`Extracted frame ${capture.filename}`);
-    } catch (error) {
-      failure = error instanceof SourceError
-        ? error
-        : frameError(capture.filename, "Unable to publish extracted frame", error);
-    }
 
-    let cleanupError;
-    if (reservation) {
-      try {
-        await cleanupReservation(reservation, resolvedFileOps);
-      } catch (error) {
-        cleanupError = error;
+      const existing = leasedManifest.images.find((image) => image.filename === capture.filename);
+      if (existing) {
+        const reuseCandidate = completedFrame(capture, existing);
+        if (await lease.canReuseFrame(reuseCandidate)) {
+          if (!(await sourceIdentityIsCurrent(videoPath, sourceIdentity, resolvedFileOps))
+            || await pathsReferToSameFile(videoPath, finalPath)) {
+            throw frameError(videoPath, "Reusable frame must not alias the local video");
+          }
+          log?.info?.(`Reusing frame ${capture.filename}`);
+          return leasedManifest;
+        }
       }
-    }
-    if (cleanupError) {
-      const cleanupCauses = cleanupError instanceof AggregateError
-        ? cleanupError.errors
-        : [cleanupError];
-      throw frameError(
-        capture.filename,
-        "Frame temp cleanup failed",
-        new AggregateError(failure ? [failure, ...cleanupCauses] : cleanupCauses),
-      );
-    }
-    if (failure) throw failure;
+
+      let reservation;
+      let nextManifest;
+      let failure;
+      try {
+        reservation = await reserveOwnedTemp(finalPath, {
+          nextTempId,
+          fileOps: resolvedFileOps,
+        });
+        let result;
+        try {
+          result = await run("ffmpeg", buildFrameArgs({
+            videoPath,
+            timestampMs: capture.timestampMs,
+            outputPath: reservation.tempPath,
+          }));
+        } catch (error) {
+          throw frameError(capture.filename, "Unable to extract frame", error);
+        }
+        if (!(await reservationStillOwned(reservation, resolvedFileOps))) {
+          throw frameError(capture.filename, "Extracted frame temp ownership changed");
+        }
+        if (result?.code !== 0 || !(await isNonEmptyFile(reservation.tempPath))) {
+          throw frameError(capture.filename, "Unable to extract a nonempty frame");
+        }
+
+        const dimensions = await probeImageDimensions(reservation.tempPath, { run });
+        if (!(await reservationStillOwned(reservation, resolvedFileOps))) {
+          throw frameError(capture.filename, "Extracted frame temp ownership changed");
+        }
+        if (await pathsReferToSameFile(videoPath, finalPath)) {
+          throw frameError(videoPath, "Frame output must not overwrite the local video");
+        }
+        const frame = completedFrame(capture, dimensions);
+        const preparedFrame = {
+          generationPath: reservation.generationPath,
+          generationIdentity: reservation.generationIdentity,
+          ownerPath: reservation.ownerPath,
+          ownerIdentity: reservation.ownerIdentity,
+          tempPath: reservation.tempPath,
+          tempIdentity: reservation.tempIdentity,
+          sourcePath: videoPath,
+          sourceIdentity,
+          frame,
+        };
+        nextManifest = await lease.commitFrame(preparedFrame);
+        reservation.obsoleteBackupPath = preparedFrame.obsoleteBackupPath;
+        reservation.obsoleteBackupIdentity = preparedFrame.obsoleteBackupIdentity;
+        log?.info?.(`Extracted frame ${capture.filename}`);
+      } catch (error) {
+        failure = error instanceof SourceError
+          ? error
+          : frameError(capture.filename, "Unable to publish extracted frame", error);
+      }
+
+      let cleanupError;
+      if (reservation) {
+        try {
+          await cleanupReservation(reservation, resolvedFileOps);
+        } catch (error) {
+          cleanupError = error;
+        }
+      }
+      if (cleanupError) {
+        const cleanupCauses = cleanupError instanceof AggregateError
+          ? cleanupError.errors
+          : [cleanupError];
+        throw frameError(
+          capture.filename,
+          "Frame temp cleanup failed",
+          new AggregateError(failure ? [failure, ...cleanupCauses] : cleanupCauses),
+        );
+      }
+      if (failure) throw failure;
+      return nextManifest;
+    });
   }
 
   return currentManifest;

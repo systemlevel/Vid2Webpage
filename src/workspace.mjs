@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
+  link,
   lstat,
   mkdir,
   open,
@@ -26,6 +27,7 @@ const manifestFilename = "manifest.json";
 const manifestLockFilename = ".v2w-manifest.lock";
 const lockCandidateFilenamePattern = /^\.v2w-manifest\.lock\.candidate-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const lockOwnerFilenamePattern = /^owner-([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/u;
+const frameGenerationPattern = /^\.v2w-frame-stage-([0-9a-f-]+)$/u;
 const reasonPriority = new Map([
   ["primary", 0],
   ["scene", 1],
@@ -613,7 +615,195 @@ export async function openWorkspace({ cacheRoot, fingerprint, outputDir, source,
         || info.isSymbolicLink() || info.size <= 0) {
         throw conflict("Output images inventory contains an invalid or empty image");
       }
+      if (manifestToComplete.source.kind === "local"
+        && await pathsReferToSameFile(
+          manifestToComplete.source.input,
+          path.join(imagesDir, entry.name),
+        )) {
+        throw conflict("Output image inventory aliases the local video");
+      }
     }
+  }
+
+  async function reuseFrameFromManifest(manifestToCheck, capture) {
+    const requested = validateFrame(capture, imagesDir);
+    const image = manifestToCheck.images.find((entry) => entry.filename === requested.filename);
+    return Boolean(image)
+      && image.timestampMs === requested.timestampMs
+      && isDeepStrictEqual(image.reasons, requested.reasons)
+      && isDeepStrictEqual(image.associations, requested.associations)
+      && isNonEmptyFile(assertSafeFilename(requested.filename, imagesDir));
+  }
+
+  async function unlinkMatching(filePath, identity) {
+    const current = await statOrNull(filePath);
+    if (current && hasFileIdentity(current, identity)) {
+      await unlink(filePath);
+      return true;
+    }
+    return false;
+  }
+
+  async function commitPreparedFrame(current, preparedFrame) {
+    const prepared = validatePreparedFrame(preparedFrame);
+    const finalPath = assertSafeFilename(prepared.frame.filename, imagesDir);
+    const linkFramePath = hooks.linkFramePath ?? link;
+    if (!(await pathIsOwnedRegularFile(prepared.ownerPath, prepared.ownerIdentity))
+      || !(await pathIsOwnedRegularFile(prepared.tempPath, prepared.tempIdentity))
+      || !(await isNonEmptyFile(prepared.tempPath))) {
+      throw conflict("Prepared frame temp is no longer the owned nonempty file");
+    }
+    const generationInfo = await lstat(prepared.generationPath);
+    if (!generationInfo.isDirectory() || generationInfo.isSymbolicLink()
+      || !hasFileIdentity(generationInfo, prepared.generationIdentity)) {
+      throw conflict("Prepared frame generation is no longer owned");
+    }
+    await hooks.beforeFrameSourceCheck?.({ prepared, finalPath });
+    if (prepared.sourceIdentity) {
+      let sourceInfo;
+      try {
+        sourceInfo = await stat(prepared.sourcePath);
+      } catch {
+        throw conflict("Local video identity changed before frame publication");
+      }
+      if (!hasFileIdentity(sourceInfo, prepared.sourceIdentity)) {
+        throw conflict("Local video identity changed before frame publication");
+      }
+    }
+    if (await pathsReferToSameFile(prepared.sourcePath, finalPath)) {
+      throw conflict("Frame output must not alias the local video");
+    }
+    const images = [
+      ...current.images.filter((image) => image.filename !== prepared.frame.filename),
+      prepared.frame,
+    ].sort((left, right) => left.timestampMs - right.timestampMs
+      || left.filename.localeCompare(right.filename));
+    const nextManifest = {
+      ...current,
+      images,
+      revision: current.revision + 1,
+    };
+    validateManifest(nextManifest, fingerprint, imagesDir);
+
+    const backupPath = path.join(prepared.generationPath, `previous-${prepared.token}`);
+    let backupIdentity;
+    const priorFinal = await statOrNull(finalPath);
+    if (priorFinal) {
+      await linkFramePath(finalPath, backupPath);
+      const backupInfo = await lstat(backupPath);
+      backupIdentity = { dev: backupInfo.dev, ino: backupInfo.ino };
+      const currentFinal = await statOrNull(finalPath);
+      if (!currentFinal || !hasFileIdentity(currentFinal, priorFinal)
+        || await pathsReferToSameFile(prepared.sourcePath, backupPath)) {
+        await unlinkMatching(backupPath, backupIdentity);
+        throw conflict("Existing frame output changed or aliases the local video");
+      }
+      await unlink(finalPath);
+    }
+
+    await hooks.beforeFrameNoOverwritePublish?.({ prepared, finalPath, backupPath });
+    try {
+      await linkFramePath(prepared.tempPath, finalPath);
+    } catch (error) {
+      if (backupIdentity && !(await statOrNull(finalPath))) {
+        try {
+          await linkFramePath(backupPath, finalPath);
+          await unlinkMatching(backupPath, backupIdentity);
+        } catch (restoreError) {
+          error.cause = restoreError;
+        }
+      }
+      if (error.code === "EEXIST") {
+        throw conflict("Frame final appeared during no-overwrite publication");
+      }
+      throw error;
+    }
+
+    let writtenManifest;
+    try {
+      await hooks.beforeFrameManifestWrite?.({
+        tempPath: prepared.tempPath,
+        finalPath,
+        frame: prepared.frame,
+        manifest: nextManifest,
+      });
+      writtenManifest = await writeManifest(nextManifest);
+    } catch (error) {
+      if (backupIdentity) {
+        try {
+          await unlinkMatching(finalPath, prepared.tempIdentity);
+          if (!(await statOrNull(finalPath))) await linkFramePath(backupPath, finalPath);
+          await unlinkMatching(backupPath, backupIdentity);
+        } catch (rollbackError) {
+          error.cause = rollbackError;
+        }
+      }
+      throw error;
+    }
+
+    if (backupIdentity) {
+      try {
+        if (hooks.unlinkFrameBackup) {
+          await hooks.unlinkFrameBackup(backupPath, backupIdentity);
+        } else {
+          await unlinkMatching(backupPath, backupIdentity);
+        }
+      } catch {
+        preparedFrame.obsoleteBackupPath = backupPath;
+        preparedFrame.obsoleteBackupIdentity = backupIdentity;
+      }
+    }
+    return writtenManifest;
+  }
+
+  async function withFrameLease(manifestToUpdate, operation, { preserveGeneration } = {}) {
+    validateManifest(manifestToUpdate, fingerprint, imagesDir);
+    if (manifestToUpdate.status !== "building") {
+      throw conflict("Cannot lease frames in a completed manifest");
+    }
+    return withMutationLock(manifestLockPath, hooks, async () => {
+      const current = await loadManifest();
+      if (current.status !== "building") {
+        throw conflict("Completed output manifests are immutable");
+      }
+      if (manifestToUpdate.revision !== current.revision) {
+        throw conflict("Workspace manifest revision is stale");
+      }
+      const entries = await readdir(imagesDir, { withFileTypes: true });
+      for (const entry of entries) {
+        const token = frameGenerationPattern.exec(entry.name)?.[1];
+        if (!token || !entry.isDirectory() || entry.isSymbolicLink()) continue;
+        const generationPath = path.join(imagesDir, entry.name);
+        if (preserveGeneration
+          && path.resolve(preserveGeneration) === path.resolve(generationPath)) continue;
+        const ownerFilename = `owner-${token}`;
+        const generationEntries = await readdir(generationPath, { withFileTypes: true });
+        const owner = generationEntries.find((candidate) => candidate.name === ownerFilename);
+        if (!owner || !owner.isFile() || owner.isSymbolicLink()
+          || generationEntries.some((candidate) =>
+            candidate.name !== ownerFilename
+            && (!candidate.isFile() || candidate.isSymbolicLink()))) continue;
+        const ownerPath = path.join(generationPath, ownerFilename);
+        if ((await readFile(ownerPath, "utf8")) !== token) continue;
+        for (const candidate of generationEntries) {
+          if (candidate.name !== ownerFilename) {
+            await unlink(path.join(generationPath, candidate.name));
+          }
+        }
+        await unlink(ownerPath);
+        await rmdir(generationPath);
+      }
+      let committed = false;
+      return operation({
+        manifest: current,
+        canReuseFrame: (capture) => reuseFrameFromManifest(current, capture),
+        async commitFrame(preparedFrame) {
+          if (committed) throw conflict("Frame lease already committed");
+          committed = true;
+          return commitPreparedFrame(current, preparedFrame);
+        },
+      });
+    });
   }
 
   return {
@@ -623,109 +813,13 @@ export async function openWorkspace({ cacheRoot, fingerprint, outputDir, source,
     manifestPath,
     loadManifest,
     saveManifest,
+    withFrameLease,
     async commitFrame(manifestToUpdate, preparedFrame) {
-      validateManifest(manifestToUpdate, fingerprint, imagesDir);
-      if (manifestToUpdate.status !== "building") {
-        throw conflict("Cannot commit frames in a completed manifest");
-      }
-      const prepared = validatePreparedFrame(preparedFrame);
-      const finalPath = assertSafeFilename(prepared.frame.filename, imagesDir);
-      const renameFramePath = hooks.renameFramePath ?? rename;
-      return withMutationLock(manifestLockPath, hooks, async () => {
-        const current = await loadManifest();
-        if (current.status !== "building") {
-          throw conflict("Completed output manifests are immutable");
-        }
-        if (manifestToUpdate.revision !== current.revision) {
-          throw conflict("Workspace manifest revision is stale");
-        }
-        if (!(await pathIsOwnedRegularFile(prepared.ownerPath, prepared.ownerIdentity))
-          || !(await pathIsOwnedRegularFile(prepared.tempPath, prepared.tempIdentity))
-          || !(await isNonEmptyFile(prepared.tempPath))) {
-          throw conflict("Prepared frame temp is no longer the owned nonempty file");
-        }
-        const generationInfo = await lstat(prepared.generationPath);
-        if (!generationInfo.isDirectory() || generationInfo.isSymbolicLink()
-          || !hasFileIdentity(generationInfo, prepared.generationIdentity)) {
-          throw conflict("Prepared frame generation is no longer owned");
-        }
-        await hooks.beforeFrameSourceCheck?.({ prepared, finalPath });
-        if (prepared.sourceIdentity) {
-          let sourceInfo;
-          try {
-            sourceInfo = await stat(prepared.sourcePath);
-          } catch {
-            throw conflict("Local video identity changed before frame publication");
-          }
-          if (!hasFileIdentity(sourceInfo, prepared.sourceIdentity)) {
-            throw conflict("Local video identity changed before frame publication");
-          }
-        }
-        if (await pathsReferToSameFile(prepared.sourcePath, finalPath)) {
-          throw conflict("Frame output must not alias the local video");
-        }
-        await hooks.afterFrameSourceCheck?.({ prepared, finalPath });
-        const images = [
-          ...current.images.filter((image) => image.filename !== prepared.frame.filename),
-          prepared.frame,
-        ].sort((left, right) => left.timestampMs - right.timestampMs
-          || left.filename.localeCompare(right.filename));
-        const nextManifest = {
-          ...current,
-          images,
-          revision: current.revision + 1,
-        };
-        validateManifest(nextManifest, fingerprint, imagesDir);
-        const backupPath = path.join(prepared.generationPath, `previous-${prepared.token}`);
-        let backupIdentity;
-        const priorFinal = await statOrNull(finalPath);
-        if (priorFinal) {
-          await renameFramePath(finalPath, backupPath);
-          const backupInfo = await lstat(backupPath);
-          backupIdentity = { dev: backupInfo.dev, ino: backupInfo.ino };
-          if (await pathsReferToSameFile(prepared.sourcePath, backupPath)) {
-            const currentBackup = await statOrNull(backupPath);
-            if (currentBackup && hasFileIdentity(currentBackup, backupIdentity)) {
-              await renameFramePath(backupPath, finalPath);
-            }
-            throw conflict("Existing frame output aliases the local video");
-          }
-        }
-
-        await renameFramePath(prepared.tempPath, finalPath);
-        let writtenManifest;
-        try {
-          await hooks.beforeFrameManifestWrite?.({
-            tempPath: prepared.tempPath,
-            finalPath,
-            frame: prepared.frame,
-            manifest: nextManifest,
-          });
-          writtenManifest = await writeManifest(nextManifest);
-        } catch (error) {
-          if (backupIdentity) {
-            const published = await statOrNull(finalPath);
-            const backup = await statOrNull(backupPath);
-            if (published && hasFileIdentity(published, prepared.tempIdentity)
-              && backup && hasFileIdentity(backup, backupIdentity)) {
-              try {
-                await renameFramePath(finalPath, prepared.tempPath);
-                await renameFramePath(backupPath, finalPath);
-              } catch (rollbackError) {
-                error.cause = rollbackError;
-              }
-            }
-          }
-          throw error;
-        }
-        if (backupIdentity) {
-          const backup = await statOrNull(backupPath);
-          if (backup && hasFileIdentity(backup, backupIdentity)) {
-            await unlink(backupPath);
-          }
-        }
-        return writtenManifest;
-      });
+      return withFrameLease(
+        manifestToUpdate,
+        (lease) => lease.commitFrame(preparedFrame),
+        { preserveGeneration: preparedFrame?.generationPath },
+      );
     },
     async recordFrame(manifestToUpdate, frame) {
       validateManifest(manifestToUpdate, fingerprint, imagesDir);
@@ -753,6 +847,7 @@ export async function openWorkspace({ cacheRoot, fingerprint, outputDir, source,
         if (manifestToComplete.revision !== current.revision) {
           throw conflict("Workspace manifest revision is stale");
         }
+        await hooks.beforeCompletionInventory?.({ manifest: current, imagesDir });
         await validateCompleteInventory(current);
         return writeManifest({
           ...current,

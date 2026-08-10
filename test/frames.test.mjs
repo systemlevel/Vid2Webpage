@@ -832,6 +832,49 @@ test("initial frame-handle stat failure closes the handle and cleans only its pr
   assert.deepEqual(await readdir(imagesDir), []);
 });
 
+test("replacement before initial handle stat failure preserves the foreign member and closes the handle", async (t) => {
+  const { imagesDir } = await frameFixture(t);
+  const planned = capture();
+  const statFailure = new Error("initial handle stat failed after replacement");
+  let closed = false;
+  let replacedPath;
+
+  await assert.rejects(extractFrames({
+    videoPath: "/video.mov",
+    captures: [planned],
+    workspace: {
+      imagesDir,
+      canReuseFrame: async () => false,
+      commitFrame: async () => { throw new Error("must not commit failed reservation"); },
+    },
+    manifest: buildingManifest(),
+    fileOps: {
+      async open(filePath, flags, mode) {
+        const handle = await open(filePath, flags, mode);
+        if (path.extname(filePath) !== ".jpg") return handle;
+        replacedPath = filePath;
+        return {
+          async stat() {
+            await unlink(filePath);
+            await writeFile(filePath, "foreign-replacement");
+            throw statFailure;
+          },
+          async close() {
+            await handle.close();
+            closed = true;
+          },
+        };
+      },
+    },
+    run: async () => { throw new Error("must not run after stat failure"); },
+    log: { info() {} },
+  }), (error) => error === statFailure || error.cause === statFailure);
+
+  assert.equal(closed, true);
+  assert.equal(await readFile(replacedPath, "utf8"), "foreign-replacement");
+  assert.equal(path.dirname(path.dirname(replacedPath)), imagesDir);
+});
+
 test("frame-handle close failure preserves the runner error and cleans the private generation", async (t) => {
   const { imagesDir } = await frameFixture(t);
   const planned = capture();
