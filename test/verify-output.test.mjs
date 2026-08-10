@@ -436,6 +436,26 @@ for (const malformedTag of [
     name: "an absolute source URL",
     tag: '<img src="https://example.com/escaped.jpg">',
   },
+  {
+    name: "a bare src before an assigned src",
+    tag: '<img src src="images/000000500-primary.jpg">',
+  },
+  {
+    name: "a bare src after an assigned src",
+    tag: '<img src="images/000000500-primary.jpg" src>',
+  },
+  {
+    name: "case-variant bare and assigned src attributes",
+    tag: '<img SrC SRC="images/000000500-primary.jpg">',
+  },
+  {
+    name: "malformed equals syntax",
+    tag: '<img src="images/000000500-primary.jpg" =broken>',
+  },
+  {
+    name: "an unterminated quoted attribute",
+    tag: '<img src="images/000000500-primary.jpg" alt="unterminated>',
+  },
 ]) {
   test(`rejects an img tag with ${malformedTag.name}`, async (t) => {
     const html = pageHtml() + malformedTag.tag;
@@ -444,6 +464,20 @@ for (const malformedTag of [
     assertAuditFails(audit(outputDir), /img|src|source|quoted/i);
   });
 }
+
+test("tokenizes exact case-insensitive src without confusing related attribute names", async (t) => {
+  const reference = "images/000000500-primary.jpg";
+  const html = `<!doctype html><html><body>
+<img data-src="ignored.jpg" srcset="ignored-1.jpg 1x" source="ignored" asrc="ignored" SRC="${reference}">
+<img src="${reference}" data-srcset="ignored" some-src-name="ignored">
+</body></html>\n`;
+  const outputDir = await createOutput(t, { html });
+
+  const result = audit(outputDir);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /2 logical references, 1 physical JPEG/);
+});
 
 test("allows logical duplicate references while comparing unique physical paths", async (t) => {
   const outputDir = await createOutput(t, {

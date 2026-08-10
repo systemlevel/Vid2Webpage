@@ -169,22 +169,88 @@ function validateManifestImages(images, segmentCount) {
   return filenames;
 }
 
+function tokenizeImageAttributes(tag, imageIndex) {
+  const attributes = [];
+  const end = tag.length - 1;
+  let cursor = 4;
+
+  while (cursor < end) {
+    const separatorStart = cursor;
+    while (cursor < end && /\s/u.test(tag[cursor])) cursor += 1;
+    if (cursor >= end) break;
+    if (tag[cursor] === "/" && cursor === end - 1) {
+      cursor += 1;
+      break;
+    }
+    assert.ok(
+      cursor > separatorStart,
+      `HTML img ${imageIndex} has malformed attribute separation`,
+    );
+
+    const nameMatch = /^[A-Za-z_:][A-Za-z0-9_.:-]*/u.exec(tag.slice(cursor, end));
+    assert.ok(nameMatch, `HTML img ${imageIndex} has malformed attribute syntax`);
+    const name = nameMatch[0].toLowerCase();
+    cursor += nameMatch[0].length;
+
+    const afterName = cursor;
+    while (cursor < end && /\s/u.test(tag[cursor])) cursor += 1;
+    if (tag[cursor] !== "=") {
+      attributes.push({ name, hasValue: false, quoted: false, value: null });
+      cursor = afterName;
+      continue;
+    }
+
+    cursor += 1;
+    while (cursor < end && /\s/u.test(tag[cursor])) cursor += 1;
+    assert.ok(cursor < end, `HTML img ${imageIndex} attribute ${name} has no value`);
+    const quote = tag[cursor];
+    if (quote === "\"" || quote === "'") {
+      cursor += 1;
+      const valueStart = cursor;
+      while (cursor < end && tag[cursor] !== quote) cursor += 1;
+      assert.ok(
+        cursor < end,
+        `HTML img ${imageIndex} attribute ${name} has an unterminated quoted value`,
+      );
+      attributes.push({
+        name,
+        hasValue: true,
+        quoted: true,
+        value: tag.slice(valueStart, cursor),
+      });
+      cursor += 1;
+      continue;
+    }
+
+    const valueStart = cursor;
+    while (cursor < end && !/\s/u.test(tag[cursor])) cursor += 1;
+    const value = tag.slice(valueStart, cursor);
+    assert.ok(
+      value.length > 0 && !/["'`=<>]/u.test(value),
+      `HTML img ${imageIndex} attribute ${name} has a malformed unquoted value`,
+    );
+    attributes.push({ name, hasValue: true, quoted: false, value });
+  }
+
+  assert.equal(cursor, end, `HTML img ${imageIndex} has malformed trailing syntax`);
+  return attributes;
+}
+
 function parseImageReferences(html) {
   const tags = [...html.matchAll(/<img\b[^>]*>/giu)].map((match) => match[0]);
   return tags.map((tag, index) => {
-    const assignments = [...tag.matchAll(/\ssrc\s*=/giu)];
+    const attributes = tokenizeImageAttributes(tag, index);
+    const sources = attributes.filter((attribute) => attribute.name === "src");
     assert.equal(
-      assignments.length,
+      sources.length,
       1,
       `HTML img ${index} must contain exactly one src attribute`,
     );
-    const quotedSources = [...tag.matchAll(/\ssrc\s*=\s*(["'])(.*?)\1/giu)];
-    assert.equal(
-      quotedSources.length,
-      1,
-      `HTML img ${index} must contain exactly one quoted src attribute`,
+    assert.ok(
+      sources[0].hasValue && sources[0].quoted,
+      `HTML img ${index} src attribute must have exactly one quoted value`,
     );
-    const rawReference = quotedSources[0][2];
+    const rawReference = sources[0].value;
     assert.ok(!rawReference.includes("&"), `HTML img ${index} src must not contain an HTML entity`);
     assert.ok(
       !rawReference.includes("?") && !rawReference.includes("#"),
