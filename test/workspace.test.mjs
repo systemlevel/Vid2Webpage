@@ -40,6 +40,10 @@ const source = {
   durationMs: 10000,
   width: 640,
   height: 360,
+  initialSegments: [
+    { startMs: 0, endMs: 5_000, text: "first" },
+    { startMs: 5_000, endMs: 10_000, text: "second" },
+  ],
 };
 
 const manifestLockFilename = ".v2w-manifest.lock";
@@ -100,19 +104,20 @@ function capture({
   return { filename, requestedMs, timestampMs, reasons, associations, width: 640, height: 360 };
 }
 
-async function createWorkspace(t) {
+async function createWorkspace(t, { hooks = {}, workspaceSource = source } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "v2w-workspace-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   return openWorkspace({
     cacheRoot: path.join(root, "cache"),
-    fingerprint: source.fingerprint,
+    fingerprint: workspaceSource.fingerprint,
     outputDir: path.join(root, "output"),
-    source,
+    source: workspaceSource,
+    hooks,
   });
 }
 
-async function createRenderLeaseWorkspace(t) {
-  const workspace = await createWorkspace(t);
+async function createRenderLeaseWorkspace(t, options) {
+  const workspace = await createWorkspace(t, options);
   const manifest = await workspace.saveManifest({
     ...(await workspace.loadManifest()),
     transcript: { engine: "mlx-whisper", filename: "transcript.vtt" },
@@ -259,9 +264,9 @@ test("creates cache, output, images, and an atomic building manifest", async (t)
   assert.deepEqual(manifest, {
     schemaVersion: 1,
     status: "building",
-    source,
+    source: Object.fromEntries(Object.entries(source).filter(([key]) => key !== "initialSegments")),
     transcript: null,
-    segments: [],
+    segments: source.initialSegments,
     images: [],
     revision: 0,
     createdAt: manifest.createdAt,
@@ -554,6 +559,18 @@ test("durable manifest saves reject out-of-range associations", async (t) => {
   assert.equal(await readFile(workspace.manifestPath, "utf8"), originalBytes);
 });
 
+test("durable manifests reject images when no transcript segments exist", async (t) => {
+  const { initialSegments, ...sourceWithoutSegments } = source;
+  const workspace = await createWorkspace(t, { workspaceSource: sourceWithoutSegments });
+  const manifest = await workspace.loadManifest();
+  const originalBytes = await readFile(workspace.manifestPath, "utf8");
+  await assert.rejects(
+    workspace.saveManifest({ ...manifest, images: [capture()] }),
+    OutputConflictError,
+  );
+  assert.equal(await readFile(workspace.manifestPath, "utf8"), originalBytes);
+});
+
 test("render lease rejects escaped operations after its callback without writes", async (t) => {
   const { workspace, manifest } = await createRenderLeaseWorkspace(t);
   let escapedSave;
@@ -597,6 +614,40 @@ test("render lease serializes duplicate and out-of-order transitions", async (t)
 
   assert.equal(complete.status, "complete");
   assert.equal(complete.revision, manifest.revision + 2);
+});
+
+test("unawaited active lease failures reject the transaction without unhandled rejections", async (t) => {
+  const enteredInventory = deferred();
+  const releaseInventory = deferred();
+  const failure = new Error("completion inventory failed");
+  const { workspace, manifest } = await createRenderLeaseWorkspace(t, {
+    hooks: {
+      async beforeCompletionInventory() {
+        enteredInventory.resolve();
+        await releaseInventory.promise;
+        throw failure;
+      },
+    },
+  });
+  const unhandled = [];
+  const observeUnhandled = (reason) => unhandled.push(reason);
+  process.on("unhandledRejection", observeUnhandled);
+  try {
+    const transaction = workspace.withRenderLease(manifest, async (lease) => {
+      const saved = await lease.saveManifest(manifest);
+      lease.markComplete(saved);
+    });
+    await enteredInventory.promise;
+    releaseInventory.resolve();
+
+    await assert.rejects(transaction, (error) => error === failure);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(unhandled, []);
+    const resumed = await workspace.loadManifest();
+    await workspace.withRenderLease(resumed, () => undefined);
+  } finally {
+    process.off("unhandledRejection", observeUnhandled);
+  }
 });
 
 test("rejects contradictory completed lifecycle state without replacing it", async (t) => {

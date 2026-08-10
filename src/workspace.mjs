@@ -145,7 +145,7 @@ function validateFrame(frame, imagesDir, { canonical = false, segmentCount } = {
   if (new Set(associations.map((association) => association.segmentIndex)).size !== associations.length) {
     throw conflict("Frame associations must contain each segment only once");
   }
-  if (segmentCount !== undefined && segmentCount > 0
+  if (segmentCount !== undefined
     && associations.some((association) => association.segmentIndex >= segmentCount)) {
     throw conflict("Frame association references a segment outside the transcript");
   }
@@ -474,12 +474,13 @@ async function readManifest(manifestPath, fingerprint, imagesDir) {
 }
 
 function initialManifest(source) {
+  const { initialSegments = [], ...manifestSource } = source;
   return {
     schemaVersion: 1,
     status: "building",
-    source,
+    source: manifestSource,
     transcript: null,
-    segments: [],
+    segments: initialSegments,
     images: [],
     revision: 0,
     createdAt: new Date().toISOString(),
@@ -600,6 +601,8 @@ export async function openWorkspace({
       let acceptingOperations = true;
       let pendingOperations = 0;
       let notifyDrain;
+      const startedOperations = new Set();
+      const operationFailures = [];
       const beginOperation = (requiredPhase, nextPhase, message) => {
         if (!acceptingOperations) throw conflict("Render lease has expired");
         if (phase !== requiredPhase) throw conflict(message);
@@ -620,57 +623,81 @@ export async function openWorkspace({
           });
         }
       };
+      const trackOperation = (requiredPhase, nextPhase, message, operationToRun) => {
+        try {
+          beginOperation(requiredPhase, nextPhase, message);
+        } catch (error) {
+          const rejected = Promise.reject(error);
+          rejected.catch(() => {});
+          return rejected;
+        }
+        let started;
+        try {
+          started = Promise.resolve(operationToRun());
+        } catch (error) {
+          started = Promise.reject(error);
+        }
+        startedOperations.add(started);
+        started.then(
+          () => undefined,
+          (error) => operationFailures.push(error),
+        ).then(() => {
+          startedOperations.delete(started);
+          finishOperation();
+        });
+        return started;
+      };
       const lease = {
         manifest: current,
-        async saveManifest(nextManifest) {
-          beginOperation(
+        saveManifest(nextManifest) {
+          return trackOperation(
             "ready",
             "saving",
             "Render lease manifest metadata was already saved",
+            async () => {
+              try {
+                validateRenderableManifest(nextManifest, fingerprint, imagesDir);
+                if (nextManifest.status !== "building" || nextManifest.revision !== current.revision) {
+                  throw conflict("Render lease manifest revision is stale");
+                }
+                current = await writeManifest({ ...nextManifest, revision: current.revision + 1 });
+                phase = "saved";
+                return current;
+              } catch (error) {
+                phase = "failed";
+                throw error;
+              }
+            },
           );
-          try {
-            validateRenderableManifest(nextManifest, fingerprint, imagesDir);
-            if (nextManifest.status !== "building" || nextManifest.revision !== current.revision) {
-              throw conflict("Render lease manifest revision is stale");
-            }
-            current = await writeManifest({ ...nextManifest, revision: current.revision + 1 });
-            phase = "saved";
-            return current;
-          } catch (error) {
-            phase = "failed";
-            throw error;
-          } finally {
-            finishOperation();
-          }
         },
-        async markComplete(manifestToComplete) {
-          beginOperation(
+        markComplete(manifestToComplete) {
+          return trackOperation(
             "saved",
             "completing",
             "Render lease completion requires saved render metadata",
+            async () => {
+              try {
+                validateRenderableManifest(manifestToComplete, fingerprint, imagesDir);
+                if (manifestToComplete.status !== "building"
+                  || manifestToComplete.revision !== current.revision) {
+                  throw conflict("Render lease manifest revision is stale");
+                }
+                await hooks.beforeCompletionInventory?.({ manifest: current, imagesDir });
+                await validateCompleteInventory(current);
+                current = await writeManifest({
+                  ...current,
+                  status: "complete",
+                  revision: current.revision + 1,
+                  completedAt: new Date().toISOString(),
+                });
+                phase = "complete";
+                return current;
+              } catch (error) {
+                phase = "failed";
+                throw error;
+              }
+            },
           );
-          try {
-            validateRenderableManifest(manifestToComplete, fingerprint, imagesDir);
-            if (manifestToComplete.status !== "building"
-              || manifestToComplete.revision !== current.revision) {
-              throw conflict("Render lease manifest revision is stale");
-            }
-            await hooks.beforeCompletionInventory?.({ manifest: current, imagesDir });
-            await validateCompleteInventory(current);
-            current = await writeManifest({
-              ...current,
-              status: "complete",
-              revision: current.revision + 1,
-              completedAt: new Date().toISOString(),
-            });
-            phase = "complete";
-            return current;
-          } catch (error) {
-            phase = "failed";
-            throw error;
-          } finally {
-            finishOperation();
-          }
         },
       };
       let operationResult;
@@ -689,7 +716,17 @@ export async function openWorkspace({
         acceptingOperations = false;
         await waitForOperations();
       }
+      if (operationError && operationFailures.some((error) => error !== operationError)) {
+        throw new AggregateError(
+          [operationError, ...operationFailures.filter((error) => error !== operationError)],
+          "Render lease callback and operation failed",
+        );
+      }
       if (operationError) throw operationError;
+      if (operationFailures.length === 1) throw operationFailures[0];
+      if (operationFailures.length > 1) {
+        throw new AggregateError(operationFailures, "Render lease operations failed");
+      }
       return operationResult;
     });
   }
