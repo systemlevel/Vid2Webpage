@@ -48,6 +48,22 @@ function verifyAudioCapability(output, protectedFiles, { requireNonEmpty = false
   }
 }
 
+function includesIdentity(protectedFiles, identity) {
+  return protectedFiles.some((protectedFile) =>
+    hasFileIdentity(protectedFile?.identity, identity));
+}
+
+async function withProtectedInput(protectedFiles, inputPath, label) {
+  const protectedInput = {
+    ...(await captureFileIdentity(inputPath)),
+    path: inputPath,
+    label,
+  };
+  return includesIdentity(protectedFiles, protectedInput.identity)
+    ? protectedFiles
+    : [...protectedFiles, protectedInput];
+}
+
 export async function probeMedia(videoPath, { run = runCommand } = {}) {
   let result;
   try {
@@ -122,11 +138,12 @@ export async function extractAudio({
       path: inputPath,
       label: "video",
     };
-    const effectiveProtectedFiles = protectedFiles.some((protectedFile) =>
-      hasFileIdentity(protectedFile?.identity, inputIdentity.identity))
+    const effectiveProtectedFiles = includesIdentity(protectedFiles, inputIdentity.identity)
       ? protectedFiles
       : [...protectedFiles, inputIdentity];
-    const reservation = await reserveOwnedArtifact(outputPath);
+    const reservation = await reserveOwnedArtifact(outputPath, {
+      protectedFiles: effectiveProtectedFiles,
+    });
     try {
       await extractAudio({
         inputPath,
@@ -168,7 +185,9 @@ export async function extractAudio({
 export async function discoverLocalCaption({
   videoPath,
   mediaInfo,
+  output,
   outputPath,
+  protectedFiles = [],
   run = runCommand,
   logger = console,
 }) {
@@ -179,28 +198,82 @@ export async function discoverLocalCaption({
   const srtPath = path.join(parsedPath.dir, `${parsedPath.name}.srt`);
   const inputPath = (await isNonEmptyFile(srtPath)) ? srtPath : null;
   const subtitleStreamIndex = mediaInfo.subtitleStreamIndexes?.[0];
-  const args = inputPath
-    ? ["-y", "-i", inputPath, "-f", "webvtt", outputPath]
-    : Number.isInteger(subtitleStreamIndex)
-      ? ["-y", "-i", videoPath, "-map", `0:${subtitleStreamIndex}`, "-f", "webvtt", outputPath]
-      : null;
+  if (!inputPath && !Number.isInteger(subtitleStreamIndex)) return null;
 
-  if (!args) return null;
-  const overwritesVideo = await pathsReferToSameFile(videoPath, outputPath);
-  const overwritesCaptionInput = inputPath && await pathsReferToSameFile(inputPath, outputPath);
-  if (overwritesVideo || overwritesCaptionInput) {
-    logger?.warn?.(
-      `Unable to prepare caption timing hints for ${videoPath}`,
-      new Error("Caption output must not overwrite local input"),
+  let effectiveProtectedFiles;
+  try {
+    effectiveProtectedFiles = await withProtectedInput(
+      protectedFiles,
+      videoPath,
+      "video",
     );
+    if (inputPath) {
+      effectiveProtectedFiles = await withProtectedInput(
+        effectiveProtectedFiles,
+        inputPath,
+        "caption",
+      );
+    }
+  } catch (error) {
+    logger?.warn?.(`Unable to prepare caption timing hints for ${videoPath}`, error);
     return null;
   }
+
+  if (!output) {
+    const overwritesVideo = await pathsReferToSameFile(videoPath, outputPath);
+    const overwritesCaptionInput = inputPath && await pathsReferToSameFile(inputPath, outputPath);
+    if (overwritesVideo || overwritesCaptionInput) {
+      logger?.warn?.(
+        `Unable to prepare caption timing hints for ${videoPath}`,
+        new Error("Caption output must not overwrite local input"),
+      );
+      return null;
+    }
+    try {
+      const reservation = await reserveOwnedArtifact(outputPath, {
+        protectedFiles: effectiveProtectedFiles,
+      });
+      try {
+        const result = await discoverLocalCaption({
+          videoPath,
+          mediaInfo,
+          output: reservation.writer,
+          protectedFiles: effectiveProtectedFiles,
+          run,
+          logger,
+        });
+        if (result?.kind !== "capability-output") return null;
+        return (await reservation.publish({
+          protectedFiles: result.protectedFiles,
+        })).path;
+      } finally {
+        await reservation.discard();
+      }
+    } catch (error) {
+      logger?.warn?.(`Unable to prepare caption timing hints for ${videoPath}`, error);
+      return null;
+    }
+  }
+
+  const childFd = 3;
+  const args = inputPath
+    ? ["-y", "-i", inputPath, "-f", "webvtt", `pipe:${childFd}`]
+    : [
+      "-y", "-i", videoPath, "-map", `0:${subtitleStreamIndex}`,
+      "-f", "webvtt", `pipe:${childFd}`,
+    ];
   try {
-    const result = await run("ffmpeg", args);
-    if (result.code !== 0 || !(await isNonEmptyFile(outputPath))) {
+    verifyAudioCapability(output, effectiveProtectedFiles);
+    const result = await run(
+      "ffmpeg",
+      args,
+      { stdio: ["ignore", "pipe", "pipe", output.fd] },
+    );
+    verifyAudioCapability(output, effectiveProtectedFiles, { requireNonEmpty: true });
+    if (result.code !== 0) {
       throw new Error("Caption output was empty");
     }
-    return outputPath;
+    return { kind: "capability-output", protectedFiles: effectiveProtectedFiles };
   } catch (error) {
     logger?.warn?.(`Unable to prepare caption timing hints for ${videoPath}`, error);
     return null;

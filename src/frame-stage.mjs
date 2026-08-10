@@ -4,6 +4,7 @@ import {
   lstatSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmdirSync,
   statSync,
   unlinkSync,
@@ -23,6 +24,7 @@ const nativeFrameFileOps = {
   lstat: lstatSync,
   readFile: readFileSync,
   readdir: readdirSync,
+  rename: renameSync,
   rmdir: rmdirSync,
   stat: statSync,
   unlink: unlinkSync,
@@ -186,6 +188,13 @@ export function cleanupFrameStageSync(stage, fileOps) {
   }
   if (!shellOwned) {
     if (errors.length === 1) throw errors[0];
+    return;
+  }
+
+  if ((stage.protectedFiles?.length ?? 0) > 0) {
+    if (stage.retentionPath) {
+      fileOps.rename(stage.generationPath, stage.retentionPath);
+    }
     return;
   }
 
@@ -576,6 +585,57 @@ function restoreBackupAfterPublishFailure(prepared, finalPath, fileOps, failure)
   }
 }
 
+function publishProtectedFrameSync(prepared, finalPath, fileOps, protectedFiles) {
+  const backupPath = path.join(prepared.generationPath, `previous-${prepared.token}`);
+  let captured = false;
+  try {
+    fileOps.rename(finalPath, backupPath);
+    captured = true;
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+
+  if (captured) {
+    const backupInfo = statOrNull(backupPath, fileOps);
+    if (!backupInfo || !backupInfo.isFile()) {
+      throw frameConflict("Atomically captured frame output is not a regular file");
+    }
+    prepared.backupPath = backupPath;
+    prepared.backupIdentity = fileIdentity(backupInfo);
+    prepared.preserveBackup = true;
+    const message = infoIsProtected(backupInfo, protectedFiles)
+      ? "Atomically captured frame output aliases a protected local file"
+      : "Atomically captured frame output ownership is unproven in protected mode";
+    restoreBackupAfterPublishFailure(
+      prepared,
+      finalPath,
+      fileOps,
+      frameConflict(message),
+    );
+    throw frameConflict(message);
+  }
+
+  const currentTemp = lstatOrNull(prepared.tempPath, fileOps);
+  if (!isOwnedRegularFile(currentTemp, prepared.tempIdentity)) {
+    const failure = frameConflict("Prepared frame temp changed immediately before publication");
+    restoreBackupAfterPublishFailure(prepared, finalPath, fileOps, failure);
+    throw failure;
+  }
+  try {
+    fileOps.link(prepared.tempPath, finalPath);
+  } catch (error) {
+    restoreBackupAfterPublishFailure(prepared, finalPath, fileOps, error);
+    if (error.code === "EEXIST") {
+      throw frameConflict("Frame final appeared during no-overwrite publication", error);
+    }
+    throw error;
+  }
+  const published = lstatOrNull(finalPath, fileOps);
+  if (!isOwnedRegularFile(published, prepared.tempIdentity)) {
+    throw frameConflict("Published frame identity changed");
+  }
+}
+
 export function publishFrameSync(prepared, finalPath, fileOps) {
   if (!verifyOpenFrameStageSync(prepared, fileOps, { requireNonEmpty: true })) {
     throw frameConflict("Prepared frame temp is no longer the owned nonempty file");
@@ -593,6 +653,10 @@ export function publishFrameSync(prepared, finalPath, fileOps) {
   if (pathIsProtected(finalPath, protectedFiles)
     || infoIsProtected(statOrNull(finalPath, fileOps), protectedFiles)) {
     throw frameConflict("Frame output must not alias a protected local file");
+  }
+  if (protectedFiles.length > 0) {
+    publishProtectedFrameSync(prepared, finalPath, fileOps, protectedFiles);
+    return;
   }
 
   const priorFinal = lstatOrNull(finalPath, fileOps);
@@ -651,6 +715,27 @@ export function publishFrameSync(prepared, finalPath, fileOps) {
 }
 
 export function rollbackFramePublicationSync(prepared, finalPath, fileOps) {
+  if ((prepared.protectedFiles?.length ?? 0) > 0) {
+    const capturedPath = path.join(
+      prepared.generationPath,
+      `uncommitted-${prepared.token}`,
+    );
+    try {
+      fileOps.rename(finalPath, capturedPath);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    if (prepared.backupIdentity) {
+      try {
+        fileOps.link(prepared.backupPath, finalPath);
+      } catch (error) {
+        if (error.code !== "EEXIST") throw error;
+      }
+      const restored = lstatOrNull(finalPath, fileOps);
+      return isOwnedRegularFile(restored, prepared.backupIdentity);
+    }
+    return lstatOrNull(finalPath, fileOps) === null;
+  }
   if (!prepared.backupIdentity) return;
   prepared.preserveBackup = true;
   const backupInfo = lstatOrNull(prepared.backupPath, fileOps);

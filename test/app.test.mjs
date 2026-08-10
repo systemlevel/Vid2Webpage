@@ -174,10 +174,17 @@ async function makeHarness({
         frameRate: 10,
       };
     },
-    discoverLocalCaption: async ({ videoPath: requestedVideoPath, outputPath }) => {
+    discoverLocalCaption: async ({
+      videoPath: requestedVideoPath,
+      output,
+      outputPath,
+      protectedFiles,
+    }) => {
       calls.push("discover-caption");
       assert.equal(requestedVideoPath, sourcePath);
-      assert.equal(outputPath, path.join(cacheDir, "captions.vtt"));
+      assert.equal(outputPath, undefined);
+      assert.equal(Number.isSafeInteger(output.fd), true);
+      assert.deepEqual(protectedFiles.map((protectedFile) => protectedFile.label), ["video"]);
       return captionPath;
     },
     openWorkspace: async ({ cacheRoot: base, fingerprint: value, outputDir, source }) => {
@@ -424,7 +431,7 @@ for (const kind of ["local", "youtube"]) {
     assert.ok(harness.calls.indexOf("preflight") < harness.calls.indexOf(`${kind}-fingerprint`));
     assert.deepEqual(
       harness.removed.map((file) => path.basename(file)).sort(),
-      kind === "youtube" ? ["audio.m4a", "source.webm"] : ["audio.m4a"],
+      kind === "youtube" ? ["audio.m4a", "source.webm"] : [],
     );
     if (kind === "local") {
       assert.equal(await readFile(sourcePath, "utf8"), "local-video");
@@ -745,7 +752,7 @@ for (const aliasKind of ["symlink", "hard-link"]) {
   });
 }
 
-test("cleanup retains and warns when its owned audio target swaps to a protected hard link at removal", async (t) => {
+test("protected cleanup bypasses the former identity-validation and removal gap", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "v2w-app-cleanup-removal-race-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const sourcePath = path.join(root, "lesson.mov");
@@ -797,16 +804,55 @@ test("cleanup retains and warns when its owned audio target swaps to a protected
   }, harness.services);
 
   assert.equal(completed.status, "complete");
-  assert.equal(swapped, true);
+  assert.equal(swapped, false);
   assert.equal(await readFile(sidecarPath, "utf8"), captionVtt);
-  assert.equal(await readFile(audioPath, "utf8"), captionVtt);
+  assert.equal(await readFile(audioPath, "utf8"), "audio");
   const sidecarAfter = await stat(sidecarPath);
   assert.deepEqual(
     { dev: sidecarAfter.dev, ino: sidecarAfter.ino },
     { dev: sidecarBefore.dev, ino: sidecarBefore.ino },
   );
   assert.deepEqual(warnings, [
-    `Unable to remove temporary file ${audioPath}: temporary file ownership changed before removal`,
+    `Retained temporary file ${audioPath}: protected local cleanup cannot prove atomic removal`,
+  ]);
+});
+
+test("protected local cleanup retains owned audio without entering the mutable remove boundary", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-app-cleanup-conservative-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const sourcePath = path.join(root, "lesson.mov");
+  const sidecarPath = path.join(root, "lesson.vtt");
+  await writeFile(sourcePath, "local-video");
+  await writeFile(sidecarPath, captionVtt);
+  const warnings = [];
+  let removeCalls = 0;
+  const harness = await makeHarness({
+    kind: "local",
+    root,
+    sourcePath,
+    captionPath: sidecarPath,
+  });
+  const audioPath = path.join(harness.cacheDir, "audio.m4a");
+  harness.services.removeTemporary = async (file) => {
+    removeCalls += 1;
+    await rm(file, { force: true });
+    await link(sidecarPath, file);
+    await rm(file, { force: true });
+  };
+
+  const completed = await runPipeline({
+    input: sourcePath,
+    cwd: root,
+    env: { XDG_CACHE_HOME: path.join(root, "cache-parent") },
+    onWarning: (message) => warnings.push(message),
+  }, harness.services);
+
+  assert.equal(completed.status, "complete");
+  assert.equal(removeCalls, 0);
+  assert.equal(await readFile(audioPath, "utf8"), "audio");
+  assert.equal(await readFile(sidecarPath, "utf8"), captionVtt);
+  assert.deepEqual(warnings, [
+    `Retained temporary file ${audioPath}: protected local cleanup cannot prove atomic removal`,
   ]);
 });
 
@@ -888,7 +934,7 @@ test("keeps a completed result and warns while continuing best-effort cleanup", 
   assert.equal(Object.hasOwn(result, "warnings"), false);
 });
 
-test("keeps a completed result when a cleanup identity check fails", async (t) => {
+test("protected cleanup never invokes a fallible identity probe after completion", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "v2w-app-cleanup-identity-warning-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const sourcePath = path.join(root, "lesson.mov");
@@ -920,7 +966,7 @@ test("keeps a completed result when a cleanup identity check fails", async (t) =
   assert.equal(result.status, "complete");
   assert.deepEqual(harness.removed, []);
   assert.deepEqual(warnings, [
-    `Unable to remove temporary file ${path.join(harness.cacheDir, "audio.m4a")}: identity probe failed`,
+    `Retained temporary file ${path.join(harness.cacheDir, "audio.m4a")}: protected local cleanup cannot prove atomic removal`,
   ]);
   assert.equal(await readFile(sourcePath, "utf8"), "local-video");
   assert.equal(await readFile(sidecarPath, "utf8"), captionVtt);

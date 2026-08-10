@@ -140,7 +140,7 @@ async function transcribeAuthoritatively({
 }) {
   const audioOutputPath = path.join(cacheDir, "audio.m4a");
   await rejectProtectedAlias(audioOutputPath, protectedFiles, services, "Audio output");
-  const audioReservation = await reserveOwnedArtifact(audioOutputPath);
+  const audioReservation = await reserveOwnedArtifact(audioOutputPath, { protectedFiles });
   let audioArtifact;
   try {
     try {
@@ -261,6 +261,16 @@ async function protectLocalFile(file, label, services) {
   };
 }
 
+function addProtectedFiles(protectedFiles, additions) {
+  for (const addition of additions) {
+    if (!protectedFiles.some((current) =>
+      current.identity?.dev === addition.identity?.dev
+      && current.identity?.ino === addition.identity?.ino)) {
+      protectedFiles.push(addition);
+    }
+  }
+}
+
 async function cleanupAfterSuccess({
   files,
   cacheDir,
@@ -269,6 +279,19 @@ async function cleanupAfterSuccess({
   services,
 }) {
   const uniqueFiles = new Map(files.map((file) => [file.path, file]));
+  if (protectedFiles.length > 0) {
+    for (const fileRecord of uniqueFiles.values()) {
+      if (!isContainedCacheFile(fileRecord.path, cacheDir)) continue;
+      try {
+        onWarning(
+          `Retained temporary file ${fileRecord.path}: protected local cleanup cannot prove atomic removal`,
+        );
+      } catch {
+        // Cleanup warnings must never turn a durable completion into failure.
+      }
+    }
+    return;
+  }
   for (const fileRecord of uniqueFiles.values()) {
     const file = fileRecord.path;
     if (!isContainedCacheFile(file, cacheDir)) continue;
@@ -377,11 +400,31 @@ export async function runPipeline(
       services,
       "Caption cache output",
     );
-    captionPath = await services.discoverLocalCaption({
-      videoPath,
-      mediaInfo,
-      outputPath: captionOutputPath,
-    });
+    const captionReservation = await reserveOwnedArtifact(captionOutputPath, { protectedFiles });
+    let captionArtifact;
+    try {
+      const captionResult = await services.discoverLocalCaption({
+        videoPath,
+        mediaInfo,
+        output: captionReservation.writer,
+        protectedFiles,
+      });
+      if (captionResult?.kind === "capability-output") {
+        const captionProtectedFiles = Array.isArray(captionResult.protectedFiles)
+          ? captionResult.protectedFiles
+          : protectedFiles;
+        captionArtifact = await captionReservation.publish({
+          protectedFiles: captionProtectedFiles,
+        });
+        addProtectedFiles(protectedFiles, captionProtectedFiles);
+        captionPath = captionArtifact.path;
+        cleanupFiles.push(captionArtifact);
+      } else {
+        captionPath = typeof captionResult === "string" ? captionResult : null;
+      }
+    } finally {
+      await captionReservation.discard();
+    }
     if (captionPath) {
       await rejectProtectedAlias(
         captionPath,
@@ -389,7 +432,15 @@ export async function runPipeline(
         services,
         "Local caption",
       );
-      protectedFiles.push(await protectLocalFile(captionPath, "caption", services));
+      if (captionArtifact) {
+        protectedFiles.push({
+          ...captionArtifact,
+          canonicalPath: await services.canonicalPath(captionArtifact.path),
+          label: "caption",
+        });
+      } else {
+        protectedFiles.push(await protectLocalFile(captionPath, "caption", services));
+      }
     }
   }
 

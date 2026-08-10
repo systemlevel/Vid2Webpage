@@ -1866,6 +1866,62 @@ test("frame publication retains a caption hard link introduced after orchestrati
   assert.equal(await readFile(workspace.manifestPath, "utf8"), manifestBytes);
 });
 
+test("protected frame publication atomically captures a final swapped at the former unlink boundary", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-frame-atomic-capture-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const planned = capture();
+  const outputDir = path.join(root, "output");
+  const finalPath = path.join(outputDir, "images", planned.filename);
+  const captionPath = path.join(root, "lesson.vtt");
+  let injected = false;
+  const swapFinal = () => {
+    if (injected) return;
+    unlinkSync(finalPath);
+    linkSync(captionPath, finalPath);
+    injected = true;
+  };
+  const workspace = await openWorkspace({
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir,
+    source,
+    frameFileOps: {
+      rename(from, to) {
+        if (from === finalPath) swapFinal();
+        renameSync(from, to);
+      },
+      unlink(filePath) {
+        if (filePath === finalPath) swapFinal();
+        unlinkSync(filePath);
+      },
+    },
+  });
+  const manifest = await workspace.loadManifest();
+  const manifestBytes = await readFile(workspace.manifestPath, "utf8");
+  const prepared = await preparedFrame(workspace, t, planned);
+  await writeFile(finalPath, "prior-frame");
+  await writeFile(captionPath, "protected-caption");
+  const captionBefore = await lstat(captionPath);
+  prepared.protectedFiles = [{
+    label: "caption",
+    path: captionPath,
+    canonicalPath: captionPath,
+    identity: identity(captionBefore),
+  }];
+
+  await assert.rejects(
+    workspace.commitFrame(manifest, prepared),
+    OutputConflictError,
+  );
+
+  assert.equal(injected, true);
+  assert.equal(await readFile(captionPath, "utf8"), "protected-caption");
+  assert.equal(await readFile(finalPath, "utf8"), "protected-caption");
+  assert.deepEqual(identity(await lstat(captionPath)), identity(captionBefore));
+  assert.deepEqual(identity(await lstat(finalPath)), identity(captionBefore));
+  assert.equal(await readFile(workspace.manifestPath, "utf8"), manifestBytes);
+});
+
 test("publication rechecks the retained staged inode synchronously and a real resume cleans the owned residue", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "v2w-stage-publication-recheck-"));
   t.after(() => rm(root, { recursive: true, force: true }));

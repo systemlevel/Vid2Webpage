@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
-import { link, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -109,14 +109,51 @@ test("sidecar SRT is converted to WebVTT", async (t) => {
     videoPath,
     mediaInfo: { subtitleStreamIndexes: [2] },
     outputPath,
-    run: async (command, args) => {
+    run: async (command, args, options) => {
       assert.equal(command, "ffmpeg");
-      assert.deepEqual(args, ["-y", "-i", srtPath, "-f", "webvtt", outputPath]);
-      await writeFile(outputPath, "WEBVTT");
+      assert.deepEqual(args, ["-y", "-i", srtPath, "-f", "webvtt", "pipe:3"]);
+      writeFileSync(options.stdio[3], "WEBVTT");
       return { code: 0, stdout: "", stderr: "" };
     },
   });
   assert.equal(result, outputPath);
+});
+
+test("SRT conversion writer cannot follow a rebound output path into the protected sidecar", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "v2w-caption-capability-srt-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const videoPath = path.join(dir, "lesson.mov");
+  const srtPath = path.join(dir, "lesson.srt");
+  const outputPath = path.join(dir, "captions.vtt");
+  const originalSrt = "1\n00:00:00,000 --> 00:00:01,000\nProtected caption\n";
+  await writeFile(videoPath, "video");
+  await writeFile(srtPath, originalSrt);
+  const before = await stat(srtPath);
+  const warnings = [];
+
+  const result = await discoverLocalCaption({
+    videoPath,
+    mediaInfo: { subtitleStreamIndexes: [2] },
+    outputPath,
+    run: async (_command, args, options) => {
+      await rm(outputPath, { force: true });
+      await link(srtPath, outputPath);
+      if (options?.stdio?.[3] !== undefined) {
+        writeFileSync(options.stdio[3], "WEBVTT\n\nconverted\n");
+      } else {
+        await writeFile(args.at(-1), "WEBVTT\n\nunsafe conversion\n");
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    logger: { warn: (...args) => warnings.push(args) },
+  });
+
+  assert.equal(result, null);
+  assert.equal(warnings.length, 1);
+  assert.equal(await readFile(srtPath, "utf8"), originalSrt);
+  assert.equal(await readFile(outputPath, "utf8"), originalSrt);
+  const after = await stat(srtPath);
+  assert.deepEqual({ dev: after.dev, ino: after.ino }, { dev: before.dev, ino: before.ino });
 });
 
 async function assertSrtInputIsNotOverwritten({ videoPath, srtPath, outputPath }) {
@@ -183,14 +220,51 @@ test("embedded subtitle stream is extracted as WebVTT", async (t) => {
     videoPath,
     mediaInfo: { subtitleStreamIndexes: [7] },
     outputPath,
-    run: async (command, args) => {
+    run: async (command, args, options) => {
       assert.equal(command, "ffmpeg");
-      assert.deepEqual(args, ["-y", "-i", videoPath, "-map", "0:7", "-f", "webvtt", outputPath]);
-      await writeFile(outputPath, "WEBVTT");
+      assert.deepEqual(
+        args,
+        ["-y", "-i", videoPath, "-map", "0:7", "-f", "webvtt", "pipe:3"],
+      );
+      writeFileSync(options.stdio[3], "WEBVTT");
       return { code: 0, stdout: "", stderr: "" };
     },
   });
   assert.equal(result, outputPath);
+});
+
+test("embedded-caption writer cannot follow a rebound output path into the protected video", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "v2w-caption-capability-embedded-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const videoPath = path.join(dir, "lesson.mov");
+  const outputPath = path.join(dir, "embedded.vtt");
+  await writeFile(videoPath, "protected-video");
+  const before = await stat(videoPath);
+  const warnings = [];
+
+  const result = await discoverLocalCaption({
+    videoPath,
+    mediaInfo: { subtitleStreamIndexes: [7] },
+    outputPath,
+    run: async (_command, args, options) => {
+      await rm(outputPath, { force: true });
+      await link(videoPath, outputPath);
+      if (options?.stdio?.[3] !== undefined) {
+        writeFileSync(options.stdio[3], "WEBVTT\n\nembedded\n");
+      } else {
+        await writeFile(args.at(-1), "unsafe embedded captions");
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    logger: { warn: (...args) => warnings.push(args) },
+  });
+
+  assert.equal(result, null);
+  assert.equal(warnings.length, 1);
+  assert.equal(await readFile(videoPath, "utf8"), "protected-video");
+  assert.equal(await readFile(outputPath, "utf8"), "protected-video");
+  const after = await stat(videoPath);
+  assert.deepEqual({ dev: after.dev, ino: after.ino }, { dev: before.dev, ino: before.ino });
 });
 
 test("caption extraction failure warns and does not block transcription", async (t) => {

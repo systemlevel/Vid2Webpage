@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { linkSync, renameSync, unlinkSync } from "node:fs";
 import {
   access,
   link,
@@ -331,6 +332,70 @@ test("render publication retains a protected hard link introduced at the destina
 
   assert.equal(await readFile(captionPath, "utf8"), "protected-caption-bytes");
   assert.equal(await readFile(destinationPath, "utf8"), "protected-caption-bytes");
+  const captionAfter = await stat(captionPath);
+  const destinationAfter = await stat(destinationPath);
+  assert.deepEqual(
+    { dev: captionAfter.dev, ino: captionAfter.ino },
+    { dev: captionBefore.dev, ino: captionBefore.ino },
+  );
+  assert.deepEqual(
+    { dev: destinationAfter.dev, ino: destinationAfter.ino },
+    { dev: captionBefore.dev, ino: captionBefore.ino },
+  );
+});
+
+test("render publication atomically captures a protected swap at the former rename boundary", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "v2w-render-atomic-capture-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const outputDir = path.join(dir, "output");
+  const transcriptVttPath = path.join(dir, "cached.vtt");
+  const captionPath = path.join(dir, "lesson.vtt");
+  const destinationPath = path.join(outputDir, "transcript.vtt");
+  await mkdir(outputDir);
+  await writeFile(transcriptVttPath, "WEBVTT\n\nrendered transcript\n");
+  await writeFile(captionPath, "protected-caption");
+  await writeFile(destinationPath, "prior-render");
+  const captionBefore = await stat(captionPath);
+  let injected = false;
+  const workspace = {
+    outputDir,
+    async withRenderLease(value, operation) {
+      return operation({
+        manifest: value,
+        async saveManifest(saved) { return saved; },
+        async markComplete(saved) { return { ...saved, status: "complete" }; },
+      });
+    },
+  };
+  const protectedFiles = [{
+    label: "caption",
+    path: captionPath,
+    canonicalPath: captionPath,
+    identity: { dev: captionBefore.dev, ino: captionBefore.ino },
+  }];
+  const fileOps = {
+    rename(from, to) {
+      if (!injected && from === destinationPath) {
+        unlinkSync(destinationPath);
+        linkSync(captionPath, destinationPath);
+        injected = true;
+      }
+      renameSync(from, to);
+    },
+  };
+
+  await assert.rejects(renderOutput({
+    workspace,
+    manifest,
+    segments,
+    transcriptVttPath,
+    protectedFiles,
+    fileOps,
+  }));
+
+  assert.equal(injected, true);
+  assert.equal(await readFile(captionPath, "utf8"), "protected-caption");
+  assert.equal(await readFile(destinationPath, "utf8"), "protected-caption");
   const captionAfter = await stat(captionPath);
   const destinationAfter = await stat(destinationPath);
   assert.deepEqual(

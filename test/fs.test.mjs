@@ -121,7 +121,7 @@ test("owned removal retains a protected hard link that replaced the recorded art
   assert.throws(() => removeOwnedFile(audioPath, {
     expectedIdentity: { dev: audioIdentity.dev, ino: audioIdentity.ino },
     protectedFiles: [protectedCaption],
-  }), /ownership changed/);
+  }), /protected mode/);
   assert.equal(await readFile(captionPath, "utf8"), "protected-caption");
   assert.equal(await readFile(audioPath, "utf8"), "protected-caption");
   const captionAfter = await stat(captionPath);
@@ -130,4 +130,26 @@ test("owned removal retains a protected hard link that replaced the recorded art
     { dev: aliasAfter.dev, ino: aliasAfter.ino },
     { dev: captionAfter.dev, ino: captionAfter.ino },
   );
+});
+
+test("owned removal refuses protected mode before any pathname unlink", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "v2w-owned-removal-protected-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const audioPath = path.join(dir, "audio.m4a");
+  const protectedPath = path.join(dir, "video.mov");
+  await writeFile(audioPath, "owned-audio");
+  await writeFile(protectedPath, "protected-video");
+  const audioInfo = await stat(audioPath);
+  const protectedFile = {
+    ...(await captureFileIdentity(protectedPath)),
+    path: protectedPath,
+    label: "video",
+  };
+
+  assert.throws(() => removeOwnedFile(audioPath, {
+    expectedIdentity: { dev: audioInfo.dev, ino: audioInfo.ino },
+    protectedFiles: [protectedFile],
+  }), /protected mode/);
+  assert.equal(await readFile(audioPath, "utf8"), "owned-audio");
+  assert.equal(await readFile(protectedPath, "utf8"), "protected-video");
 });

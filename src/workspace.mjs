@@ -814,6 +814,9 @@ export async function openWorkspace({
     const backupStatePath = typeof stage.backupStatePath === "string"
       ? path.resolve(stage.backupStatePath)
       : undefined;
+    const retentionPath = typeof stage.retentionPath === "string"
+      ? path.resolve(stage.retentionPath)
+      : undefined;
     if (!token || !/^[0-9a-f-]+$/u.test(token)
       || path.dirname(generationPath) !== path.resolve(imagesDir)
       || path.dirname(ownerPath) !== generationPath
@@ -829,7 +832,10 @@ export async function openWorkspace({
       || (backupStatePath !== undefined
         && (path.dirname(backupStatePath) !== generationPath
           || path.basename(backupStatePath) !== `prior-${token}.json`
-          || !isValidIdentity(stage.backupStateIdentity)))) {
+          || !isValidIdentity(stage.backupStateIdentity)))
+      || (retentionPath !== undefined
+        && (path.dirname(retentionPath) !== path.resolve(cacheDir)
+          || path.basename(retentionPath) !== `.v2w-retained-frame-${token}`))) {
       throw conflict("Frame stage cleanup path or identity is invalid");
     }
     return {
@@ -839,6 +845,7 @@ export async function openWorkspace({
       tempPath,
       backupPath,
       backupStatePath,
+      retentionPath,
     };
   }
 

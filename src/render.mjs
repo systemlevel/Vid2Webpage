@@ -210,6 +210,7 @@ export async function renderOutput({
   segments,
   transcriptVttPath,
   protectedFiles = [],
+  fileOps,
 }) {
   const renderManifest = {
     ...manifest,
@@ -226,13 +227,13 @@ export async function renderOutput({
       segments: renderManifest.segments,
     };
 
-    await copyFileAtomic(transcriptVttPath, transcriptPath, { protectedFiles });
-    await copyFileAtomic(pageCssPath, stylesheetPath, { protectedFiles });
+    await copyFileAtomic(transcriptVttPath, transcriptPath, { protectedFiles, fileOps });
+    await copyFileAtomic(pageCssPath, stylesheetPath, { protectedFiles, fileOps });
     const savedManifest = await lease.saveManifest(buildingManifest);
     await writeFileAtomic(
       htmlPath,
       renderPage({ manifest: savedManifest, segments }),
-      { protectedFiles },
+      { protectedFiles, fileOps },
     );
     return lease.markComplete(savedManifest);
   });
