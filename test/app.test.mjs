@@ -310,19 +310,16 @@ async function makeHarness({
         }],
       };
     },
-    renderOutput: async ({
-      workspace: requestedWorkspace,
-      manifest: value,
-      segments,
-      transcriptVttPath,
-      protectedFiles,
-    }) => {
+    renderOutput: async (renderOptions) => {
+      const {
+        workspace: requestedWorkspace,
+        manifest: value,
+        segments,
+        transcriptVttPath,
+      } = renderOptions;
       calls.push("render-output");
       assert.equal(requestedWorkspace, workspace);
-      assert.deepEqual(
-        protectedFiles.map((protectedFile) => protectedFile.label),
-        kind === "local" ? ["video", ...(captionPath ? ["caption"] : [])] : [],
-      );
+      assert.equal(Object.hasOwn(renderOptions, "protectedFiles"), false);
       assert.equal(segments[0].text, "Whisper words");
       assert.doesNotMatch(JSON.stringify(segments), /caption poison|returned cue poison/);
       assert.equal(transcriptVttPath, path.join(cacheDir, "transcript.vtt"));

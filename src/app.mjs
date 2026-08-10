@@ -559,7 +559,6 @@ export async function runPipeline(
     manifest,
     segments: transcript.segments,
     transcriptVttPath: transcript.vttPath,
-    protectedFiles,
   });
 
   await cleanupAfterSuccess({

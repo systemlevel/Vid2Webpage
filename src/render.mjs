@@ -2,8 +2,8 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 import {
-  capturePublicationExpectation,
   copyFileAtomic,
+  isPublicationExpectation,
   writeFileAtomic,
 } from "./fs.mjs";
 import { formatVttTimestamp } from "./vtt.mjs";
@@ -86,6 +86,41 @@ function timestampMarkup(source, timestampMs) {
 
 function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function renderPublicationFromLease(lease) {
+  const publication = lease?.publication;
+  const protectedFiles = publication?.protectedFiles;
+  const protectedMode = Array.isArray(protectedFiles) && protectedFiles.length > 0;
+  const targets = publication?.targets;
+  const targetValues = [targets?.transcript, targets?.stylesheet, targets?.html];
+  const validTarget = (target) => isPlainObject(target)
+    && Object.isFrozen(target)
+    && typeof target.path === "string"
+    && target.path.length > 0
+    && (protectedMode
+      ? isPublicationExpectation(target.expectedDestination)
+      : target.expectedDestination === undefined);
+  if (!isPlainObject(lease)
+    || !Object.isFrozen(lease)
+    || !isPlainObject(publication)
+    || !Object.isFrozen(publication)
+    || !Array.isArray(protectedFiles)
+    || !Object.isFrozen(protectedFiles)
+    || protectedFiles.some((protectedFile) =>
+      !isPlainObject(protectedFile)
+      || !Object.isFrozen(protectedFile)
+      || !isPlainObject(protectedFile.identity)
+      || !Object.isFrozen(protectedFile.identity))
+    || !isPlainObject(targets)
+    || !Object.isFrozen(targets)
+    || targetValues.some((target) => !validTarget(target))
+    || (protectedMode
+      ? typeof publication.retentionDir !== "string" || publication.retentionDir.length === 0
+      : publication.retentionDir !== undefined)) {
+    throw new TypeError("Render lease publication context is invalid");
+  }
+  return publication;
 }
 
 function validateRenderImages(images, segmentCount) {
@@ -213,7 +248,6 @@ export async function renderOutput({
   manifest,
   segments,
   transcriptVttPath,
-  protectedFiles = [],
   fileOps,
 }) {
   const renderManifest = {
@@ -222,9 +256,8 @@ export async function renderOutput({
     segments: [...segments],
   };
   return workspace.withRenderLease(renderManifest, async (lease) => {
-    const transcriptPath = path.join(workspace.outputDir, "transcript.vtt");
-    const stylesheetPath = path.join(workspace.outputDir, "styles.css");
-    const htmlPath = path.join(workspace.outputDir, "index.html");
+    const publication = renderPublicationFromLease(lease);
+    const { protectedFiles, retentionDir, targets } = publication;
     const buildingManifest = {
       ...lease.manifest,
       transcript: renderManifest.transcript,
@@ -233,30 +266,22 @@ export async function renderOutput({
 
     const publicationOptions = {
       protectedFiles,
-      retentionDir: workspace.retentionDir,
+      retentionDir,
       fileOps,
     };
-    const [transcriptExpectation, stylesheetExpectation, htmlExpectation]
-      = protectedFiles.length > 0
-        ? await Promise.all([
-          capturePublicationExpectation(transcriptPath),
-          capturePublicationExpectation(stylesheetPath),
-          capturePublicationExpectation(htmlPath),
-        ])
-        : [undefined, undefined, undefined];
-    await copyFileAtomic(transcriptVttPath, transcriptPath, {
+    await copyFileAtomic(transcriptVttPath, targets.transcript.path, {
       ...publicationOptions,
-      expectedDestination: transcriptExpectation,
+      expectedDestination: targets.transcript.expectedDestination,
     });
-    await copyFileAtomic(pageCssPath, stylesheetPath, {
+    await copyFileAtomic(pageCssPath, targets.stylesheet.path, {
       ...publicationOptions,
-      expectedDestination: stylesheetExpectation,
+      expectedDestination: targets.stylesheet.expectedDestination,
     });
     const savedManifest = await lease.saveManifest(buildingManifest);
     await writeFileAtomic(
-      htmlPath,
+      targets.html.path,
       renderPage({ manifest: savedManifest, segments }),
-      { ...publicationOptions, expectedDestination: htmlExpectation },
+      { ...publicationOptions, expectedDestination: targets.html.expectedDestination },
     );
     return lease.markComplete(savedManifest);
   }, { expectedManifest: manifest });

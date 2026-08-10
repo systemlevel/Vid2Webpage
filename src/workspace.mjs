@@ -35,6 +35,11 @@ import {
 
 const manifestFilename = "manifest.json";
 const manifestLockFilename = ".v2w-manifest.lock";
+const renderAssetFilenames = Object.freeze({
+  transcript: "transcript.vtt",
+  stylesheet: "styles.css",
+  html: "index.html",
+});
 const lockCandidateFilenamePattern = /^\.v2w-manifest\.lock\.candidate-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const lockOwnerFilenamePattern = /^owner-([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/u;
 const reasonPriority = new Map([
@@ -626,6 +631,27 @@ export async function openWorkspace({
       throw error;
     }
   };
+  const captureRenderPublication = async () => {
+    const targetEntries = Object.entries(renderAssetFilenames).map(([name, filename]) => [
+      name,
+      path.join(outputDir, filename),
+    ]);
+    const expectations = protectedContext.length > 0
+      ? await Promise.all(targetEntries.map(([, filePath]) =>
+        captureDestinationExpectation(filePath)))
+      : targetEntries.map(() => undefined);
+    const targets = Object.freeze(Object.fromEntries(targetEntries.map(
+      ([name, filePath], index) => [name, Object.freeze({
+        path: filePath,
+        expectedDestination: expectations[index],
+      })],
+    )));
+    return Object.freeze({
+      protectedFiles: protectedContext,
+      retentionDir: protectedContext.length > 0 ? retentionDir : undefined,
+      targets,
+    });
+  };
   let manifest = existingManifestInfo
     ? rememberManifestState(await readManifestState(manifestPath, fingerprint, imagesDir))
     : null;
@@ -789,6 +815,7 @@ export async function openWorkspace({
       }
       assertManifestExpectation(expectedManifest, currentState);
       validateRenderableManifest(current, fingerprint, imagesDir);
+      const publication = await captureRenderPublication();
       let phase = "ready";
       let acceptingOperations = true;
       let pendingOperations = 0;
@@ -839,8 +866,9 @@ export async function openWorkspace({
         });
         return started;
       };
-      const lease = {
+      const lease = Object.freeze({
         manifest: current,
+        publication,
         saveManifest(nextManifest) {
           return trackOperation(
             "ready",
@@ -897,7 +925,7 @@ export async function openWorkspace({
             },
           );
         },
-      };
+      });
       let operationResult;
       let operationError;
       try {
