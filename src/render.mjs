@@ -38,7 +38,7 @@ function safeImagePath(filename) {
     || filename !== path.basename(filename) || filename.includes("/") || filename.includes("\\")) {
     throw new TypeError(`Unsafe manifest image filename: ${filename}`);
   }
-  return `images/${filename}`;
+  return `images/${encodeURIComponent(filename)}`;
 }
 
 function positiveInteger(value, description) {
@@ -121,13 +121,13 @@ export function renderPage({ manifest, segments }) {
   const source = manifest?.source ?? {};
   const galleries = segmentGalleries(manifest?.images, transcriptSegments.length);
   const physicalCount = Array.isArray(manifest?.images) ? manifest.images.length : 0;
-  const engine = escapeHtml(manifest?.transcript?.engine || "Whisper");
+  const engine = escapeHtml(manifest?.transcript?.engine);
   const articles = transcriptSegments.map((segment, index) => {
     const startMs = nonNegativeInteger(segment?.startMs, "Segment start");
     const endMs = nonNegativeInteger(segment?.endMs, "Segment end");
     const gallery = galleries[index].map((frame) => frameMarkup(frame, source)).join("\n");
     return `<article class="segment">
-  <header class="segment-header">${timestampMarkup(source, startMs)}<span class="segment-end">– ${formatVttTimestamp(endMs)}</span></header>
+  <header class="segment-header">${timestampMarkup(source, startMs)}<span class="segment-end">– ${timestampMarkup(source, endMs)}</span></header>
   <p>${escapeHtml(segment?.text)}</p>${gallery ? `
   <div class="gallery">${gallery}</div>` : ""}
 </article>`;
@@ -156,18 +156,25 @@ export function renderPage({ manifest, segments }) {
 }
 
 export async function renderOutput({ workspace, manifest, segments, transcriptVttPath }) {
-  const transcriptPath = path.join(workspace.outputDir, "transcript.vtt");
-  const stylesheetPath = path.join(workspace.outputDir, "styles.css");
-  const htmlPath = path.join(workspace.outputDir, "index.html");
-  const buildingManifest = {
+  const renderManifest = {
     ...manifest,
     transcript: { ...manifest.transcript, filename: "transcript.vtt" },
     segments: [...segments],
   };
+  return workspace.withRenderLease(renderManifest, async (lease) => {
+    const transcriptPath = path.join(workspace.outputDir, "transcript.vtt");
+    const stylesheetPath = path.join(workspace.outputDir, "styles.css");
+    const htmlPath = path.join(workspace.outputDir, "index.html");
+    const buildingManifest = {
+      ...lease.manifest,
+      transcript: renderManifest.transcript,
+      segments: renderManifest.segments,
+    };
 
-  await copyFileAtomic(transcriptVttPath, transcriptPath);
-  await copyFileAtomic(pageCssPath, stylesheetPath);
-  const savedManifest = await workspace.saveManifest(buildingManifest);
-  await writeFileAtomic(htmlPath, renderPage({ manifest: savedManifest, segments }));
-  return workspace.markComplete(savedManifest);
+    await copyFileAtomic(transcriptVttPath, transcriptPath);
+    await copyFileAtomic(pageCssPath, stylesheetPath);
+    const savedManifest = await lease.saveManifest(buildingManifest);
+    await writeFileAtomic(htmlPath, renderPage({ manifest: savedManifest, segments }));
+    return lease.markComplete(savedManifest);
+  });
 }

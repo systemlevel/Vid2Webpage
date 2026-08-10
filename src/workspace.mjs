@@ -116,7 +116,7 @@ function assertSafeFilename(filename, imagesDir) {
   return resolvedImagePath;
 }
 
-function validateFrame(frame, imagesDir, { canonical = false } = {}) {
+function validateFrame(frame, imagesDir, { canonical = false, segmentCount } = {}) {
   if (!isPlainObject(frame) || !hasExactKeys(frame, frameKeys)) {
     throw conflict("Frame record has an invalid shape");
   }
@@ -142,6 +142,12 @@ function validateFrame(frame, imagesDir, { canonical = false } = {}) {
       reasons: validateReasons(association.reasons, "Frame association reasons"),
     };
   });
+  if (new Set(associations.map((association) => association.segmentIndex)).size !== associations.length) {
+    throw conflict("Frame associations must contain each segment only once");
+  }
+  if (segmentCount !== undefined && associations.some((association) => association.segmentIndex >= segmentCount)) {
+    throw conflict("Frame association references a segment outside the transcript");
+  }
   const associationReasons = [...new Set(associations.flatMap((association) => association.reasons))]
     .sort(compareReasons);
   if (!isDeepStrictEqual(sortedReasons, associationReasons)) {
@@ -182,6 +188,24 @@ function validateManifest(manifest, fingerprint, imagesDir) {
   for (const image of manifest.images) {
     if (!isDeepStrictEqual(image, validateFrame(image, imagesDir, { canonical: true }))) {
       throw conflict("Output manifest contains a noncanonical frame record");
+    }
+  }
+  return manifest;
+}
+
+function validateRenderableManifest(manifest, fingerprint, imagesDir) {
+  validateManifest(manifest, fingerprint, imagesDir);
+  if (!isPlainObject(manifest.transcript)
+    || typeof manifest.transcript.engine !== "string"
+    || manifest.transcript.engine.trim().length === 0) {
+    throw conflict("Rendered output requires a nonblank transcript engine");
+  }
+  for (const image of manifest.images) {
+    if (!isDeepStrictEqual(image, validateFrame(image, imagesDir, {
+      canonical: true,
+      segmentCount: manifest.segments.length,
+    }))) {
+      throw conflict("Rendered output contains an invalid frame association");
     }
   }
   return manifest;
@@ -554,6 +578,60 @@ export async function openWorkspace({
     });
   }
 
+  async function withRenderLease(manifestToRender, operation) {
+    validateRenderableManifest(manifestToRender, fingerprint, imagesDir);
+    if (manifestToRender.status !== "building") {
+      throw conflict("Cannot render a completed manifest");
+    }
+    return withMutationLock(manifestLockPath, hooks, async () => {
+      let current = await loadManifest();
+      if (current.status !== "building") {
+        throw conflict("Completed output manifests are immutable");
+      }
+      if (manifestToRender.revision !== current.revision) {
+        throw conflict("Workspace manifest revision is stale");
+      }
+      validateRenderableManifest(current, fingerprint, imagesDir);
+      let saved = false;
+      let completed = false;
+      return operation({
+        manifest: current,
+        async saveManifest(nextManifest) {
+          if (saved || completed) {
+            throw conflict("Render lease manifest metadata was already saved");
+          }
+          validateRenderableManifest(nextManifest, fingerprint, imagesDir);
+          if (nextManifest.status !== "building" || nextManifest.revision !== current.revision) {
+            throw conflict("Render lease manifest revision is stale");
+          }
+          current = await writeManifest({ ...nextManifest, revision: current.revision + 1 });
+          saved = true;
+          return current;
+        },
+        async markComplete(manifestToComplete) {
+          if (!saved || completed) {
+            throw conflict("Render lease completion requires saved render metadata");
+          }
+          validateRenderableManifest(manifestToComplete, fingerprint, imagesDir);
+          if (manifestToComplete.status !== "building"
+            || manifestToComplete.revision !== current.revision) {
+            throw conflict("Render lease manifest revision is stale");
+          }
+          await hooks.beforeCompletionInventory?.({ manifest: current, imagesDir });
+          await validateCompleteInventory(current);
+          current = await writeManifest({
+            ...current,
+            status: "complete",
+            revision: current.revision + 1,
+            completedAt: new Date().toISOString(),
+          });
+          completed = true;
+          return current;
+        },
+      });
+    });
+  }
+
   function isValidIdentity(identity) {
     return isPlainObject(identity)
       && hasExactKeys(identity, ["dev", "ino"])
@@ -824,6 +902,7 @@ export async function openWorkspace({
     manifestPath,
     loadManifest,
     saveManifest,
+    withRenderLease,
     withFrameLease,
     async commitFrame(manifestToUpdate, preparedFrame) {
       return withFrameLease(
@@ -837,7 +916,10 @@ export async function openWorkspace({
       if (manifestToUpdate.status !== "building") {
         throw conflict("Cannot record frames in a completed manifest");
       }
-      const replacement = validateFrame(frame, imagesDir, { canonical: true });
+      const replacement = validateFrame(frame, imagesDir, {
+        canonical: true,
+        segmentCount: manifestToUpdate.segments.length || undefined,
+      });
       const images = [
         ...manifestToUpdate.images.filter((image) => image.filename !== replacement.filename),
         replacement,

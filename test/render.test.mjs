@@ -11,12 +11,14 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { OutputConflictError } from "../src/errors.mjs";
 import {
   escapeHtml,
   renderOutput,
   renderPage,
   youtubeTimestampUrl,
 } from "../src/render.mjs";
+import { openWorkspace } from "../src/workspace.mjs";
 
 const segments = [
   {
@@ -70,6 +72,39 @@ const manifest = {
   ],
 };
 
+async function createRenderableWorkspace(t, { engine = "mlx-whisper" } = {}) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-render-workspace-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const videoPath = path.join(root, "video.mov");
+  await writeFile(videoPath, "video-bytes");
+  const source = {
+    kind: "local",
+    input: videoPath,
+    fingerprint: `render-${path.basename(root)}`,
+    title: "Local render",
+    durationMs: 9_000,
+    width: 1_920,
+    height: 1_080,
+  };
+  const workspace = await openWorkspace({
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source,
+  });
+  let building = await workspace.loadManifest();
+  building = await workspace.saveManifest({
+    ...building,
+    transcript: { engine, filename: "cached.vtt" },
+    segments,
+  });
+  for (const image of manifest.images) {
+    building = await workspace.recordFrame(building, structuredClone(image));
+    await writeFile(path.join(workspace.imagesDir, image.filename), "jpeg-bytes");
+  }
+  return { root, workspace, building };
+}
+
 test("renders escaped Whisper content and association-aware screenshot galleries", () => {
   const html = renderPage({ manifest, segments });
 
@@ -100,6 +135,7 @@ test("uses safe YouTube links and local time elements for segment timestamps", (
     /href="https:\/\/www\.youtube\.com\/watch\?v=abc&amp;list=one&amp;t=1"/,
   );
   assert.match(youtubeHtml, />00:00:01\.000<\/a>/);
+  assert.match(youtubeHtml, /href="https:\/\/www\.youtube\.com\/watch\?v=abc&amp;list=one&amp;t=5">00:00:05\.000<\/a>/);
   assert.equal(
     youtubeTimestampUrl("https://www.youtube.com/watch?v=abc&list=one", 4_250),
     "https://www.youtube.com/watch?v=abc&list=one&t=4",
@@ -116,6 +152,23 @@ test("uses safe YouTube links and local time elements for segment timestamps", (
   });
   assert.match(localHtml, /<time datetime="PT1S">00:00:01\.000<\/time>/);
   assert.doesNotMatch(localHtml, /youtube\.com/);
+});
+
+test("encodes contained image filenames as single URL path segments", () => {
+  const html = renderPage({
+    manifest: {
+      ...manifest,
+      images: [{
+        ...sharedImage,
+        filename: "frame#?%.jpg",
+        associations: [{ segmentIndex: 0, requestedMs: 3_000, reasons: ["primary"] }],
+      }],
+    },
+    segments: [segments[0]],
+  });
+
+  assert.match(html, /href="images\/frame%23%3F%25\.jpg"/);
+  assert.match(html, /src="images\/frame%23%3F%25\.jpg"/);
 });
 
 test("renders a valid zero-based segment timestamp", () => {
@@ -138,6 +191,13 @@ test("publishes assets and building metadata before one final completion write",
   const writes = [];
   const workspace = {
     outputDir: path.join(dir, "output"),
+    async withRenderLease(value, operation) {
+      return operation({
+        manifest: value,
+        saveManifest: this.saveManifest.bind(this),
+        markComplete: this.markComplete.bind(this),
+      });
+    },
     async saveManifest(value) {
       writes.push({ type: "save", value });
       assert.equal(await readFile(path.join(this.outputDir, "transcript.vtt"), "utf8"), await readFile(transcriptVttPath, "utf8"));
@@ -168,6 +228,13 @@ test("stops before later writes when an earlier render publication step fails", 
   let completions = 0;
   const workspace = {
     outputDir,
+    async withRenderLease(value, operation) {
+      return operation({
+        manifest: value,
+        saveManifest: this.saveManifest.bind(this),
+        markComplete: this.markComplete.bind(this),
+      });
+    },
     async saveManifest() {
       throw new Error("manifest write failed");
     },
@@ -182,4 +249,80 @@ test("stops before later writes when an earlier render publication step fails", 
   assert.equal(completions, 0);
   assert.equal(await readFile(path.join(outputDir, "transcript.vtt"), "utf8"), "WEBVTT\n");
   await assert.rejects(access(path.join(outputDir, "index.html")));
+});
+
+test("completes a real association-aware workspace without duplicating physical screenshots", async (t) => {
+  const { root, workspace, building } = await createRenderableWorkspace(t);
+  const transcriptVttPath = path.join(root, "cached.vtt");
+  await writeFile(transcriptVttPath, "WEBVTT\n\n00:00:01.000 --> 00:00:05.000\nWhisper text\n");
+
+  const complete = await renderOutput({ workspace, manifest: building, segments, transcriptVttPath });
+  const html = await readFile(path.join(workspace.outputDir, "index.html"), "utf8");
+
+  assert.equal(complete.status, "complete");
+  assert.equal((await workspace.loadManifest()).status, "complete");
+  assert.equal((html.match(/images\/000003000-primary\.jpg/g) ?? []).length, 4);
+  assert.match(html, /2 screenshots/);
+});
+
+test("rejects stale completed rendering before it can overwrite published assets", async (t) => {
+  const { root, workspace, building } = await createRenderableWorkspace(t);
+  const firstTranscript = path.join(root, "first.vtt");
+  const staleTranscript = path.join(root, "stale.vtt");
+  await writeFile(firstTranscript, "WEBVTT\n\nfirst transcript\n");
+  await writeFile(staleTranscript, "WEBVTT\n\nstale transcript\n");
+  await renderOutput({ workspace, manifest: building, segments, transcriptVttPath: firstTranscript });
+
+  await assert.rejects(
+    renderOutput({ workspace, manifest: building, segments, transcriptVttPath: staleTranscript }),
+    OutputConflictError,
+  );
+  assert.equal(await readFile(path.join(workspace.outputDir, "transcript.vtt"), "utf8"), "WEBVTT\n\nfirst transcript\n");
+});
+
+test("concurrent same-revision renders leave artifacts from the sole completed attempt", async (t) => {
+  const { root, workspace, building } = await createRenderableWorkspace(t);
+  const firstTranscript = path.join(root, "first.vtt");
+  const secondTranscript = path.join(root, "second.vtt");
+  const firstText = "WEBVTT\n\nfirst concurrent transcript\n";
+  const secondText = "WEBVTT\n\nsecond concurrent transcript\n";
+  await writeFile(firstTranscript, firstText);
+  await writeFile(secondTranscript, secondText);
+
+  const outcomes = await Promise.allSettled([
+    renderOutput({ workspace, manifest: building, segments, transcriptVttPath: firstTranscript }),
+    renderOutput({ workspace, manifest: building, segments, transcriptVttPath: secondTranscript }),
+  ]);
+  const winner = outcomes.findIndex((outcome) => outcome.status === "fulfilled");
+
+  assert.notEqual(winner, -1);
+  assert.equal(outcomes.filter((outcome) => outcome.status === "fulfilled").length, 1);
+  assert.equal(
+    await readFile(path.join(workspace.outputDir, "transcript.vtt"), "utf8"),
+    winner === 0 ? firstText : secondText,
+  );
+});
+
+test("rejects malformed associations and blank engine before publishing assets", async (t) => {
+  for (const mutate of [
+    (value) => ({
+      ...value,
+      images: [{ ...value.images[0], associations: [
+        ...value.images[0].associations,
+        { segmentIndex: 0, requestedMs: 3_001, reasons: ["primary"] },
+      ] }],
+    }),
+    (value) => ({ ...value, transcript: { ...value.transcript, engine: "  " } }),
+  ]) {
+    const { root, workspace, building } = await createRenderableWorkspace(t);
+    const transcriptVttPath = path.join(root, "candidate.vtt");
+    await writeFile(transcriptVttPath, "WEBVTT\n\ncandidate\n");
+    await assert.rejects(
+      renderOutput({ workspace, manifest: mutate(building), segments, transcriptVttPath }),
+      OutputConflictError,
+    );
+    await assert.rejects(access(path.join(workspace.outputDir, "transcript.vtt")));
+    await assert.rejects(access(path.join(workspace.outputDir, "styles.css")));
+    await assert.rejects(access(path.join(workspace.outputDir, "index.html")));
+  }
 });

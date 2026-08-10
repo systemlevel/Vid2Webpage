@@ -505,6 +505,30 @@ test("rejects traversal and malformed physical frame records without persisting 
   );
 });
 
+test("rejects duplicate and out-of-range frame associations without persisting them", async (t) => {
+  const workspace = await createWorkspace(t);
+  let manifest = await workspace.loadManifest();
+  manifest = await workspace.saveManifest({
+    ...manifest,
+    segments: [{ startMs: 0, endMs: 8_000, text: "Whisper segment" }],
+  });
+  const originalBytes = await readFile(workspace.manifestPath, "utf8");
+  const invalidFrames = [
+    capture({
+      associations: [
+        { segmentIndex: 0, requestedMs: 4_000, reasons: ["primary"] },
+        { segmentIndex: 0, requestedMs: 4_001, reasons: ["primary"] },
+      ],
+    }),
+    capture({ associations: [{ segmentIndex: 1, requestedMs: 4_000, reasons: ["primary"] }] }),
+  ];
+
+  for (const frame of invalidFrames) {
+    await assert.rejects(workspace.recordFrame(manifest, frame), OutputConflictError);
+    assert.equal(await readFile(workspace.manifestPath, "utf8"), originalBytes);
+  }
+});
+
 test("rejects contradictory completed lifecycle state without replacing it", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "v2w-contradictory-manifest-"));
   t.after(() => rm(root, { recursive: true, force: true }));
