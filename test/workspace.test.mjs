@@ -3,11 +3,20 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import {
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import {
   access,
   link,
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   readdir,
   rm,
@@ -102,7 +111,7 @@ async function createWorkspace(t) {
   });
 }
 
-async function preparedFrame(workspace, frame = capture()) {
+async function preparedFrame(workspace, t, frame = capture()) {
   const token = randomUUID();
   const generationPath = path.join(workspace.imagesDir, `.v2w-frame-stage-${token}`);
   await mkdir(generationPath, { mode: 0o700 });
@@ -113,6 +122,10 @@ async function preparedFrame(workspace, frame = capture()) {
   const tempPath = path.join(generationPath, frame.filename);
   await writeFile(tempPath, "prepared-jpeg");
   const info = await lstat(tempPath);
+  const tempHandle = await open(tempPath, "r");
+  t.after(async () => {
+    await tempHandle.close();
+  });
   const sourcePath = path.join(workspace.cacheDir, "source-video.mov");
   await writeFile(sourcePath, "source-video-bytes");
   const sourceInfo = await lstat(sourcePath);
@@ -123,6 +136,8 @@ async function preparedFrame(workspace, frame = capture()) {
     ownerIdentity: { dev: ownerInfo.dev, ino: ownerInfo.ino },
     tempPath,
     tempIdentity: { dev: info.dev, ino: info.ino },
+    tempFd: tempHandle.fd,
+    tempHandle,
     sourcePath,
     sourceIdentity: { dev: sourceInfo.dev, ino: sourceInfo.ino },
     frame,
@@ -130,6 +145,7 @@ async function preparedFrame(workspace, frame = capture()) {
 }
 
 async function cleanupPreparedGeneration(prepared) {
+  await prepared.tempHandle?.close();
   try {
     await unlink(prepared.tempPath);
   } catch (error) {
@@ -137,6 +153,28 @@ async function cleanupPreparedGeneration(prepared) {
   }
   await unlink(prepared.ownerPath);
   await rmdir(prepared.generationPath);
+}
+
+function frameRunner(bytes, { width = 640, height = 360 } = {}) {
+  return async (command, args) => {
+    if (command === "ffmpeg") {
+      await writeFile(args.at(-1), bytes);
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return {
+      code: 0,
+      stdout: JSON.stringify({ streams: [{ width, height }] }),
+      stderr: "",
+    };
+  };
+}
+
+function identity(info) {
+  return { dev: info.dev, ino: info.ino };
+}
+
+async function frameStageNames(imagesDir) {
+  return (await readdir(imagesDir)).filter((entry) => entry.startsWith(".v2w-frame-stage-"));
 }
 
 test("creates cache, output, images, and an atomic building manifest", async (t) => {
@@ -624,7 +662,7 @@ test("completion that acquires the lock first rejects a stale frame commit befor
   const completionManifest = await completing.loadManifest();
   const staleFrameManifest = structuredClone(await extracting.loadManifest());
   const complete = await completing.markComplete(completionManifest);
-  const prepared = await preparedFrame(extracting);
+  const prepared = await preparedFrame(extracting, t);
   const finalPath = path.join(extracting.imagesDir, prepared.frame.filename);
 
   await assert.rejects(
@@ -652,7 +690,7 @@ test("frame commit that acquires the lock first makes concurrent stale completio
   const completing = await openWorkspace(options);
   const frameManifest = await extracting.loadManifest();
   const staleCompletionManifest = structuredClone(await completing.loadManifest());
-  const prepared = await preparedFrame(extracting);
+  const prepared = await preparedFrame(extracting, t);
   const finalPath = path.join(extracting.imagesDir, prepared.frame.filename);
 
   const building = await extracting.commitFrame(frameManifest, prepared);
@@ -802,13 +840,13 @@ test("prior final is restored after no-overwrite publication failure and resumed
   let failFinalPublication = true;
   const failingWorkspace = await openWorkspace({
     ...options,
-    hooks: {
-      async linkFramePath(from, to) {
+    frameFileOps: {
+      link(from, to) {
         if (to === finalPath && failFinalPublication) {
           failFinalPublication = false;
           throw publicationFailure;
         }
-        await link(from, to);
+        linkSync(from, to);
       },
     },
   });
@@ -840,7 +878,7 @@ test("prior final is restored after no-overwrite publication failure and resumed
   assert.equal((await resumed.markComplete(recovered)).status, "complete");
 });
 
-test("post-manifest backup cleanup failure is finished by lease cleanup and does not block completion", async (t) => {
+test("post-manifest backup cleanup failure leaves a committed stage that resume recovers", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "v2w-backup-cleanup-recovery-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const videoPath = path.join(root, "source-video.mov");
@@ -878,27 +916,43 @@ test("post-manifest backup cleanup failure is finished by lease cleanup and does
   let cleanupAttempts = 0;
   const replacingWorkspace = await openWorkspace({
     ...options,
-    hooks: {
-      unlinkFrameBackup() {
+    frameFileOps: {
+      unlink(filePath) {
+        if (!path.basename(filePath).startsWith("previous-")) {
+          unlinkSync(filePath);
+          return;
+        }
         cleanupAttempts += 1;
         throw cleanupFailure;
       },
     },
   });
   const changed = { ...planned, timestampMs: planned.timestampMs + 1 };
-  const replaced = await extractFrames({
+  await assert.rejects(extractFrames({
     videoPath,
     captures: [changed],
     workspace: replacingWorkspace,
     manifest: first,
     run,
     log: { info() {} },
-  });
+  }), SourceError);
 
   assert.equal(cleanupAttempts, 1);
+  const replaced = await replacingWorkspace.loadManifest();
   assert.equal(replaced.revision, 2);
-  assert.deepEqual(await readdir(replacingWorkspace.imagesDir), [planned.filename]);
-  assert.equal((await replacingWorkspace.markComplete(replaced)).status, "complete");
+  assert.equal((await frameStageNames(replacingWorkspace.imagesDir)).length, 1);
+
+  const resumed = await openWorkspace(options);
+  const recovered = await extractFrames({
+    videoPath,
+    captures: [changed],
+    workspace: resumed,
+    manifest: replaced,
+    run: async () => { throw new Error("committed replacement must be reused"); },
+    log: { info() {} },
+  });
+  assert.deepEqual(await readdir(resumed.imagesDir), [planned.filename]);
+  assert.equal((await resumed.markComplete(recovered)).status, "complete");
 });
 
 test("a recovered frame lease scavenges a token-proven abandoned private generation", async (t) => {
@@ -955,8 +1009,8 @@ test("commitFrame surfaces a real workspace no-overwrite publication failure wit
     fingerprint: source.fingerprint,
     outputDir: path.join(root, "output"),
     source,
-    hooks: {
-      linkFramePath() {
+    frameFileOps: {
+      link() {
         publicationCalls += 1;
         throw publicationFailure;
       },
@@ -964,7 +1018,7 @@ test("commitFrame surfaces a real workspace no-overwrite publication failure wit
   });
   const manifest = await workspace.loadManifest();
   const manifestBytes = await readFile(workspace.manifestPath, "utf8");
-  const prepared = await preparedFrame(workspace);
+  const prepared = await preparedFrame(workspace, t);
   const finalPath = path.join(workspace.imagesDir, prepared.frame.filename);
 
   await assert.rejects(
@@ -981,44 +1035,534 @@ test("commitFrame surfaces a real workspace no-overwrite publication failure wit
 test("atomic no-overwrite rejects a source alias introduced in the final publication window", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "v2w-frame-late-alias-"));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const sourceCheckReached = deferred();
-  const allowSourceCheck = deferred();
+  let prepared;
+  let injected = false;
   const workspace = await openWorkspace({
     cacheRoot: path.join(root, "cache"),
     fingerprint: source.fingerprint,
     outputDir: path.join(root, "output"),
     source,
-    hooks: {
-      async beforeFrameNoOverwritePublish() {
-        sourceCheckReached.resolve();
-        await allowSourceCheck.promise;
+    frameFileOps: {
+      link(from, to) {
+        if (!injected && prepared && to.endsWith(prepared.frame.filename)) {
+          injected = true;
+          linkSync(prepared.sourcePath, to);
+        }
+        linkSync(from, to);
       },
     },
   });
   const manifest = await workspace.loadManifest();
-  const prepared = await preparedFrame(workspace);
+  prepared = await preparedFrame(workspace, t);
   const finalPath = path.join(workspace.imagesDir, prepared.frame.filename);
 
-  const commit = workspace.commitFrame(manifest, prepared);
-  const commitResult = commit.then(
-    (value) => ({ status: "fulfilled", value }),
-    (reason) => ({ status: "rejected", reason }),
+  await assert.rejects(
+    workspace.commitFrame(manifest, prepared),
+    OutputConflictError,
   );
-  const phase = await Promise.race([
-    sourceCheckReached.promise.then(() => "source-check"),
-    commitResult.then(() => "commit-settled"),
-  ]);
-  assert.equal(phase, "source-check");
-  await link(prepared.sourcePath, finalPath);
-  allowSourceCheck.resolve();
-  const rejected = await commitResult;
-  assert.equal(rejected.status, "rejected");
-  assert.ok(rejected.reason instanceof OutputConflictError);
 
+  assert.equal(injected, true);
   assert.equal(await readFile(prepared.sourcePath, "utf8"), "source-video-bytes");
   assert.equal(await readFile(finalPath, "utf8"), "source-video-bytes");
   assert.equal(await readFile(prepared.tempPath, "utf8"), "prepared-jpeg");
   assert.equal((await workspace.loadManifest()).revision, 0);
+});
+
+test("publication rechecks the retained staged inode synchronously and a real resume cleans the owned residue", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-stage-publication-recheck-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const videoPath = path.join(root, "source-video.mov");
+  const foreignPath = path.join(root, "foreign-member.jpg");
+  await writeFile(videoPath, "source-video-bytes");
+  await writeFile(foreignPath, "foreign-member-bytes");
+  const sourceIdentity = identity(await lstat(videoPath));
+  const foreignIdentity = identity(await lstat(foreignPath));
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source: { ...source, input: videoPath },
+  };
+  let replacementPath;
+  let replaced = false;
+  const workspace = await openWorkspace({
+    ...options,
+    frameFileOps: {
+      lstat(filePath) {
+        if (!replaced
+          && path.extname(filePath) === ".jpg"
+          && path.basename(path.dirname(filePath)).startsWith(".v2w-frame-stage-")) {
+          replaced = true;
+          replacementPath = filePath;
+          unlinkSync(filePath);
+          linkSync(foreignPath, filePath);
+        }
+        return lstatSync(filePath);
+      },
+    },
+  });
+  const planned = capture();
+  delete planned.width;
+  delete planned.height;
+
+  await assert.rejects(extractFrames({
+    videoPath,
+    captures: [planned],
+    workspace,
+    manifest: await workspace.loadManifest(),
+    run: frameRunner("unpublishable-jpeg"),
+    log: { info() {} },
+  }), SourceError);
+
+  assert.equal(replaced, true);
+  assert.deepEqual(identity(await lstat(replacementPath)), foreignIdentity);
+  assert.equal(await readFile(replacementPath, "utf8"), "foreign-member-bytes");
+  assert.deepEqual(identity(await lstat(videoPath)), sourceIdentity);
+  assert.equal(await readFile(videoPath, "utf8"), "source-video-bytes");
+  assert.equal((await workspace.loadManifest()).revision, 0);
+  const [stageName] = await frameStageNames(workspace.imagesDir);
+  const stagePath = path.join(workspace.imagesDir, stageName);
+  const token = stageName.slice(".v2w-frame-stage-".length);
+  assert.deepEqual((await readdir(stagePath)).sort(), [
+    planned.filename,
+    `owner-${token}`,
+  ].sort());
+  assert.equal(await readFile(path.join(stagePath, `owner-${token}`), "utf8"), token);
+
+  const resumed = await openWorkspace(options);
+  const recovered = await extractFrames({
+    videoPath,
+    captures: [planned],
+    workspace: resumed,
+    manifest: await resumed.loadManifest(),
+    run: frameRunner("recovered-jpeg"),
+    log: { info() {} },
+  });
+  assert.equal(await readFile(path.join(resumed.imagesDir, planned.filename), "utf8"), "recovered-jpeg");
+  assert.deepEqual(identity(await lstat(foreignPath)), foreignIdentity);
+  assert.equal((await resumed.markComplete(recovered)).status, "complete");
+  assert.deepEqual(await readdir(resumed.imagesDir), [planned.filename]);
+});
+
+test("a final replacement after backup capture survives the synchronous remove decision", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-final-remove-recheck-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const videoPath = path.join(root, "source-video.mov");
+  const foreignPath = path.join(root, "foreign-final.jpg");
+  await writeFile(videoPath, "source-video-bytes");
+  await writeFile(foreignPath, "foreign-final-bytes");
+  const sourceIdentity = identity(await lstat(videoPath));
+  const foreignIdentity = identity(await lstat(foreignPath));
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source: { ...source, input: videoPath },
+  };
+  const planned = capture();
+  delete planned.width;
+  delete planned.height;
+  const initialWorkspace = await openWorkspace(options);
+  const initial = await extractFrames({
+    videoPath,
+    captures: [planned],
+    workspace: initialWorkspace,
+    manifest: await initialWorkspace.loadManifest(),
+    run: frameRunner("prior-jpeg"),
+    log: { info() {} },
+  });
+  const finalPath = path.join(initialWorkspace.imagesDir, planned.filename);
+  let backupLinked = false;
+  let replaced = false;
+  const replacingWorkspace = await openWorkspace({
+    ...options,
+    frameFileOps: {
+      link(from, to) {
+        linkSync(from, to);
+        if (path.basename(to).startsWith("previous-")) backupLinked = true;
+      },
+      lstat(filePath) {
+        if (filePath === finalPath && backupLinked && !replaced) {
+          replaced = true;
+          unlinkSync(finalPath);
+          linkSync(foreignPath, finalPath);
+        }
+        return lstatSync(filePath);
+      },
+    },
+  });
+  const changed = { ...planned, timestampMs: planned.timestampMs + 1 };
+
+  await assert.rejects(extractFrames({
+    videoPath,
+    captures: [changed],
+    workspace: replacingWorkspace,
+    manifest: initial,
+    run: frameRunner("must-not-publish"),
+    log: { info() {} },
+  }), SourceError);
+
+  assert.equal(replaced, true);
+  assert.deepEqual(identity(await lstat(finalPath)), foreignIdentity);
+  assert.equal(await readFile(finalPath, "utf8"), "foreign-final-bytes");
+  assert.deepEqual(identity(await lstat(foreignPath)), foreignIdentity);
+  assert.deepEqual(identity(await lstat(videoPath)), sourceIdentity);
+  assert.equal((await replacingWorkspace.loadManifest()).revision, initial.revision);
+  for (const stageName of await frameStageNames(replacingWorkspace.imagesDir)) {
+    const entries = await readdir(path.join(replacingWorkspace.imagesDir, stageName));
+    assert.equal(entries.some((entry) => entry.startsWith("owner-")), true);
+  }
+
+  const resumed = await openWorkspace(options);
+  const recovered = await extractFrames({
+    videoPath,
+    captures: [changed],
+    workspace: resumed,
+    manifest: await resumed.loadManifest(),
+    run: frameRunner("recovered-jpeg"),
+    log: { info() {} },
+  });
+  assert.equal(await readFile(finalPath, "utf8"), "recovered-jpeg");
+  assert.deepEqual(identity(await lstat(foreignPath)), foreignIdentity);
+  assert.equal((await resumed.markComplete(recovered)).status, "complete");
+});
+
+test("recovery preserves a replacement generation introduced between capture and cleanup", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-recovery-generation-replacement-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source,
+  };
+  const initialWorkspace = await openWorkspace(options);
+  const token = "00000000-0000-4000-8000-000000000201";
+  const generationPath = path.join(initialWorkspace.imagesDir, `.v2w-frame-stage-${token}`);
+  const movedGenerationPath = `${generationPath}-moved`;
+  const ownerPath = path.join(generationPath, `owner-${token}`);
+  const memberPath = path.join(generationPath, "abandoned.jpg");
+  await mkdir(generationPath, { mode: 0o700 });
+  await writeFile(ownerPath, token);
+  await writeFile(memberPath, "owned-abandoned-member");
+  const generationIdentity = identity(await lstat(generationPath));
+  const memberIdentity = identity(await lstat(memberPath));
+  let generationStats = 0;
+  let foreignGenerationIdentity;
+  let foreignMemberIdentity;
+  const workspace = await openWorkspace({
+    ...options,
+    frameFileOps: {
+      lstat(filePath) {
+        if (filePath === generationPath) {
+          generationStats += 1;
+          if (generationStats === 2) {
+            renameSync(generationPath, movedGenerationPath);
+            mkdirSync(generationPath, { mode: 0o700 });
+            writeFileSync(path.join(generationPath, `owner-${token}`), "foreign-owner");
+            writeFileSync(path.join(generationPath, "foreign.txt"), "foreign-generation");
+            foreignGenerationIdentity = identity(lstatSync(generationPath));
+            foreignMemberIdentity = identity(lstatSync(path.join(generationPath, "foreign.txt")));
+          }
+        }
+        return lstatSync(filePath);
+      },
+    },
+  });
+  let operations = 0;
+
+  await assert.rejects(workspace.withFrameLease(
+    await workspace.loadManifest(),
+    () => {
+      operations += 1;
+      return null;
+    },
+  ), OutputConflictError);
+
+  assert.equal(operations, 0);
+  assert.equal(generationStats >= 2, true);
+  assert.deepEqual(identity(await lstat(generationPath)), foreignGenerationIdentity);
+  assert.deepEqual(identity(await lstat(path.join(generationPath, "foreign.txt"))), foreignMemberIdentity);
+  assert.equal(await readFile(path.join(generationPath, "foreign.txt"), "utf8"), "foreign-generation");
+  assert.equal(await readFile(path.join(generationPath, `owner-${token}`), "utf8"), "foreign-owner");
+  assert.deepEqual(identity(await lstat(movedGenerationPath)), generationIdentity);
+  assert.deepEqual(identity(await lstat(path.join(movedGenerationPath, "abandoned.jpg"))), memberIdentity);
+  assert.equal(await readFile(path.join(movedGenerationPath, `owner-${token}`), "utf8"), token);
+});
+
+test("recovery preserves a replacement member introduced between capture and unlink", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-recovery-member-replacement-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const foreignPath = path.join(root, "foreign-recovery-member.jpg");
+  await writeFile(foreignPath, "foreign-recovery-member");
+  const foreignIdentity = identity(await lstat(foreignPath));
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source,
+  };
+  const initialWorkspace = await openWorkspace(options);
+  const token = "00000000-0000-4000-8000-000000000202";
+  const generationPath = path.join(initialWorkspace.imagesDir, `.v2w-frame-stage-${token}`);
+  const ownerPath = path.join(generationPath, `owner-${token}`);
+  const memberPath = path.join(generationPath, "abandoned.jpg");
+  await mkdir(generationPath, { mode: 0o700 });
+  await writeFile(ownerPath, token);
+  await writeFile(memberPath, "owned-abandoned-member");
+  const generationIdentity = identity(await lstat(generationPath));
+  let memberStats = 0;
+  const workspace = await openWorkspace({
+    ...options,
+    frameFileOps: {
+      lstat(filePath) {
+        if (filePath === memberPath) {
+          memberStats += 1;
+          if (memberStats === 2) {
+            unlinkSync(memberPath);
+            linkSync(foreignPath, memberPath);
+          }
+        }
+        return lstatSync(filePath);
+      },
+    },
+  });
+  let operations = 0;
+
+  await assert.rejects(workspace.withFrameLease(
+    await workspace.loadManifest(),
+    () => {
+      operations += 1;
+      return null;
+    },
+  ), OutputConflictError);
+
+  assert.equal(operations, 0);
+  assert.equal(memberStats >= 2, true);
+  assert.deepEqual(identity(await lstat(generationPath)), generationIdentity);
+  assert.deepEqual(identity(await lstat(memberPath)), foreignIdentity);
+  assert.deepEqual(identity(await lstat(foreignPath)), foreignIdentity);
+  assert.equal(await readFile(memberPath, "utf8"), "foreign-recovery-member");
+  assert.equal(await readFile(ownerPath, "utf8"), token);
+});
+
+test("EEXIST with a prior final leaves an owned recoverable stage and the next real extraction completes", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-prior-final-eexist-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const videoPath = path.join(root, "source-video.mov");
+  const foreignPath = path.join(root, "foreign-eexist.jpg");
+  await writeFile(videoPath, "source-video-bytes");
+  await writeFile(foreignPath, "foreign-eexist-bytes");
+  const sourceIdentity = identity(await lstat(videoPath));
+  const foreignIdentity = identity(await lstat(foreignPath));
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source: { ...source, input: videoPath },
+  };
+  const planned = capture();
+  delete planned.width;
+  delete planned.height;
+  const initialWorkspace = await openWorkspace(options);
+  const initial = await extractFrames({
+    videoPath,
+    captures: [planned],
+    workspace: initialWorkspace,
+    manifest: await initialWorkspace.loadManifest(),
+    run: frameRunner("prior-jpeg"),
+    log: { info() {} },
+  });
+  const finalPath = path.join(initialWorkspace.imagesDir, planned.filename);
+  let injected = false;
+  const failingWorkspace = await openWorkspace({
+    ...options,
+    frameFileOps: {
+      link(from, to) {
+        if (!injected
+          && to === finalPath
+          && path.extname(from) === ".jpg"
+          && path.basename(path.dirname(from)).startsWith(".v2w-frame-stage-")) {
+          injected = true;
+          linkSync(foreignPath, finalPath);
+        }
+        linkSync(from, to);
+      },
+    },
+  });
+  const changed = { ...planned, timestampMs: planned.timestampMs + 1 };
+
+  await assert.rejects(extractFrames({
+    videoPath,
+    captures: [changed],
+    workspace: failingWorkspace,
+    manifest: initial,
+    run: frameRunner("failed-new-jpeg"),
+    log: { info() {} },
+  }), SourceError);
+
+  assert.equal(injected, true);
+  assert.equal((await failingWorkspace.loadManifest()).revision, initial.revision);
+  assert.deepEqual(identity(await lstat(finalPath)), foreignIdentity);
+  assert.deepEqual(identity(await lstat(foreignPath)), foreignIdentity);
+  assert.deepEqual(identity(await lstat(videoPath)), sourceIdentity);
+  const [stageName] = await frameStageNames(failingWorkspace.imagesDir);
+  const stageEntries = await readdir(path.join(failingWorkspace.imagesDir, stageName));
+  assert.equal(stageEntries.some((entry) => entry.startsWith("owner-")), true);
+  assert.equal(stageEntries.some((entry) => entry.startsWith("previous-")), true);
+
+  const resumed = await openWorkspace(options);
+  const recovered = await extractFrames({
+    videoPath,
+    captures: [changed],
+    workspace: resumed,
+    manifest: await resumed.loadManifest(),
+    run: frameRunner("recovered-jpeg"),
+    log: { info() {} },
+  });
+  assert.equal(await readFile(finalPath, "utf8"), "recovered-jpeg");
+  assert.deepEqual(identity(await lstat(foreignPath)), foreignIdentity);
+  assert.equal((await resumed.markComplete(recovered)).status, "complete");
+  assert.deepEqual(await readdir(resumed.imagesDir), [planned.filename]);
+});
+
+test("manifest success plus backup cleanup failure retains its owner until a real resume recovers", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-manifest-backup-cleanup-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const videoPath = path.join(root, "source-video.mov");
+  await writeFile(videoPath, "source-video-bytes");
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source: { ...source, input: videoPath },
+  };
+  const planned = capture();
+  delete planned.width;
+  delete planned.height;
+  const initialWorkspace = await openWorkspace(options);
+  const initial = await extractFrames({
+    videoPath,
+    captures: [planned],
+    workspace: initialWorkspace,
+    manifest: await initialWorkspace.loadManifest(),
+    run: frameRunner("prior-jpeg"),
+    log: { info() {} },
+  });
+  const cleanupFailure = Object.assign(new Error("injected synchronous backup unlink failure"), {
+    code: "EIO",
+  });
+  let cleanupAttempts = 0;
+  const failingWorkspace = await openWorkspace({
+    ...options,
+    frameFileOps: {
+      unlink(filePath) {
+        if (path.basename(filePath).startsWith("previous-")) {
+          cleanupAttempts += 1;
+          throw cleanupFailure;
+        }
+        unlinkSync(filePath);
+      },
+    },
+  });
+  const changed = { ...planned, timestampMs: planned.timestampMs + 1 };
+
+  await assert.rejects(extractFrames({
+    videoPath,
+    captures: [changed],
+    workspace: failingWorkspace,
+    manifest: initial,
+    run: frameRunner("committed-new-jpeg"),
+    log: { info() {} },
+  }), (error) => error instanceof SourceError && error.cause instanceof AggregateError);
+
+  assert.equal(cleanupAttempts >= 1, true);
+  const persisted = await failingWorkspace.loadManifest();
+  assert.equal(persisted.revision, initial.revision + 1);
+  assert.equal(await readFile(path.join(failingWorkspace.imagesDir, planned.filename), "utf8"), "committed-new-jpeg");
+  const [stageName] = await frameStageNames(failingWorkspace.imagesDir);
+  const stageEntries = await readdir(path.join(failingWorkspace.imagesDir, stageName));
+  assert.equal(stageEntries.some((entry) => entry.startsWith("owner-")), true);
+  assert.equal(stageEntries.some((entry) => entry.startsWith("previous-")), true);
+
+  const resumed = await openWorkspace(options);
+  let runnerCalls = 0;
+  const recovered = await extractFrames({
+    videoPath,
+    captures: [changed],
+    workspace: resumed,
+    manifest: await resumed.loadManifest(),
+    run: async () => {
+      runnerCalls += 1;
+      throw new Error("committed frame must be reused after stage recovery");
+    },
+    log: { info() {} },
+  });
+  assert.equal(runnerCalls, 0);
+  assert.equal((await resumed.markComplete(recovered)).status, "complete");
+  assert.deepEqual(await readdir(resumed.imagesDir), [planned.filename]);
+});
+
+test("member cleanup failure removes no owner marker and the next real extraction recovers it", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-owner-last-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const videoPath = path.join(root, "source-video.mov");
+  await writeFile(videoPath, "source-video-bytes");
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source: { ...source, input: videoPath },
+  };
+  const planned = capture();
+  delete planned.width;
+  delete planned.height;
+  const runnerFailure = new Error("injected runner failure");
+  const unlinkFailure = Object.assign(new Error("injected member unlink failure"), { code: "EIO" });
+  let memberUnlinks = 0;
+  const workspace = await openWorkspace({
+    ...options,
+    frameFileOps: {
+      unlink(filePath) {
+        if (path.extname(filePath) === ".jpg") {
+          memberUnlinks += 1;
+          throw unlinkFailure;
+        }
+        unlinkSync(filePath);
+      },
+    },
+  });
+
+  await assert.rejects(extractFrames({
+    videoPath,
+    captures: [planned],
+    workspace,
+    manifest: await workspace.loadManifest(),
+    run: async () => { throw runnerFailure; },
+    log: { info() {} },
+  }), (error) => error instanceof SourceError && error.cause instanceof AggregateError);
+
+  assert.equal(memberUnlinks, 1);
+  const [stageName] = await frameStageNames(workspace.imagesDir);
+  const stagePath = path.join(workspace.imagesDir, stageName);
+  const token = stageName.slice(".v2w-frame-stage-".length);
+  assert.deepEqual((await readdir(stagePath)).sort(), [
+    planned.filename,
+    `owner-${token}`,
+  ].sort());
+  assert.equal(await readFile(path.join(stagePath, `owner-${token}`), "utf8"), token);
+
+  const resumed = await openWorkspace(options);
+  const recovered = await extractFrames({
+    videoPath,
+    captures: [planned],
+    workspace: resumed,
+    manifest: await resumed.loadManifest(),
+    run: frameRunner("recovered-jpeg"),
+    log: { info() {} },
+  });
+  assert.equal((await resumed.markComplete(recovered)).status, "complete");
+  assert.deepEqual(await readdir(resumed.imagesDir), [planned.filename]);
 });
 
 test("rejects empty fingerprints and noncanonical resumed timestamps", async (t) => {

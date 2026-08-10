@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
 import {
+  linkSync,
+  lstatSync,
+  unlinkSync,
+} from "node:fs";
+import {
   access,
   link,
   lstat,
@@ -778,8 +783,8 @@ test("cleanup failure is reported without deleting or losing ownership of the re
       commitFrame: async () => { throw new Error("must not commit failed extraction"); },
     },
     manifest: buildingManifest(),
-    fileOps: {
-      async unlink() {
+    frameFileOps: {
+      unlink() {
         throw cleanupFailure;
       },
     },
@@ -796,11 +801,12 @@ test("cleanup failure is reported without deleting or losing ownership of the re
   assert.equal((await lstat(tempPath)).isFile(), true);
 });
 
-test("initial frame-handle stat failure closes the handle and cleans only its private generation", async (t) => {
+test("initial frame-handle stat failure closes the handle and retains a recoverable owned generation", async (t) => {
   const { imagesDir } = await frameFixture(t);
   const planned = capture();
   const statFailure = new Error("initial handle stat failed");
   let closed = false;
+  let tempPath;
 
   await assert.rejects(extractFrames({
     videoPath: "/video.mov",
@@ -815,7 +821,9 @@ test("initial frame-handle stat failure closes the handle and cleans only its pr
       async open(filePath, flags, mode) {
         const handle = await open(filePath, flags, mode);
         if (path.extname(filePath) !== ".jpg") return handle;
+        tempPath = filePath;
         return {
+          fd: handle.fd,
           stat: async () => { throw statFailure; },
           async close() {
             await handle.close();
@@ -829,7 +837,14 @@ test("initial frame-handle stat failure closes the handle and cleans only its pr
   }), (error) => error === statFailure || error.cause === statFailure);
 
   assert.equal(closed, true);
-  assert.deepEqual(await readdir(imagesDir), []);
+  const [generationName] = await readdir(imagesDir);
+  const generationPath = path.join(imagesDir, generationName);
+  const token = generationName.slice(".v2w-frame-stage-".length);
+  assert.deepEqual((await readdir(generationPath)).sort(), [
+    path.basename(tempPath),
+    `owner-${token}`,
+  ].sort());
+  assert.equal(await readFile(path.join(generationPath, `owner-${token}`), "utf8"), token);
 });
 
 test("replacement before initial handle stat failure preserves the foreign member and closes the handle", async (t) => {
@@ -854,6 +869,7 @@ test("replacement before initial handle stat failure preserves the foreign membe
         if (path.extname(filePath) !== ".jpg") return handle;
         replacedPath = filePath;
         return {
+          fd: handle.fd,
           async stat() {
             await unlink(filePath);
             await writeFile(filePath, "foreign-replacement");
@@ -872,7 +888,83 @@ test("replacement before initial handle stat failure preserves the foreign membe
 
   assert.equal(closed, true);
   assert.equal(await readFile(replacedPath, "utf8"), "foreign-replacement");
-  assert.equal(path.dirname(path.dirname(replacedPath)), imagesDir);
+  const generationPath = path.dirname(replacedPath);
+  const token = path.basename(generationPath).slice(".v2w-frame-stage-".length);
+  assert.equal(path.dirname(generationPath), imagesDir);
+  assert.deepEqual((await readdir(generationPath)).sort(), [
+    path.basename(replacedPath),
+    `owner-${token}`,
+  ].sort());
+  assert.equal(await readFile(path.join(generationPath, `owner-${token}`), "utf8"), token);
+});
+
+test("handle identity is captured before pathname inspection and lstat failure preserves replacement ownership evidence", async (t) => {
+  const { root, imagesDir } = await frameFixture(t);
+  const planned = capture();
+  const lstatFailure = Object.assign(new Error("initial temp lstat failed after replacement"), {
+    code: "EIO",
+  });
+  const foreignPath = path.join(root, "foreign-member.jpg");
+  await writeFile(foreignPath, "foreign-member");
+  const foreignIdentity = await lstat(foreignPath);
+  let handleStats = 0;
+  let tempPath;
+  let replaced = false;
+
+  await assert.rejects(extractFrames({
+    videoPath: "/video.mov",
+    captures: [planned],
+    workspace: {
+      imagesDir,
+      canReuseFrame: async () => false,
+      commitFrame: async () => { throw new Error("must not commit failed reservation"); },
+    },
+    manifest: buildingManifest(),
+    fileOps: {
+      async open(filePath, flags, mode) {
+        const handle = await open(filePath, flags, mode);
+        if (path.extname(filePath) !== ".jpg") return handle;
+        tempPath = filePath;
+        return {
+          fd: handle.fd,
+          async stat() {
+            handleStats += 1;
+            return handle.stat();
+          },
+          close: () => handle.close(),
+        };
+      },
+    },
+    frameFileOps: {
+      lstat(filePath) {
+        if (filePath === tempPath && !replaced) {
+          assert.equal(handleStats, 1);
+          replaced = true;
+          unlinkSync(filePath);
+          linkSync(foreignPath, filePath);
+          throw lstatFailure;
+        }
+        return lstatSync(filePath);
+      },
+    },
+    run: async () => { throw new Error("must not run after temp lstat failure"); },
+    log: { info() {} },
+  }), (error) => error === lstatFailure || error.cause === lstatFailure);
+
+  assert.equal(handleStats, 1);
+  const replacementIdentity = await lstat(tempPath);
+  assert.deepEqual(
+    { dev: replacementIdentity.dev, ino: replacementIdentity.ino },
+    { dev: foreignIdentity.dev, ino: foreignIdentity.ino },
+  );
+  assert.equal(await readFile(tempPath, "utf8"), "foreign-member");
+  const generationPath = path.dirname(tempPath);
+  const token = path.basename(generationPath).slice(".v2w-frame-stage-".length);
+  assert.deepEqual((await readdir(generationPath)).sort(), [
+    path.basename(tempPath),
+    `owner-${token}`,
+  ].sort());
+  assert.equal(await readFile(path.join(generationPath, `owner-${token}`), "utf8"), token);
 });
 
 test("frame-handle close failure preserves the runner error and cleans the private generation", async (t) => {

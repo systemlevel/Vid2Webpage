@@ -1,11 +1,8 @@
 import { randomUUID } from "node:crypto";
 import {
-  lstat,
   mkdir,
   open,
-  rmdir,
   stat,
-  unlink,
 } from "node:fs/promises";
 import path from "node:path";
 
@@ -13,13 +10,16 @@ import { SourceError } from "./errors.mjs";
 import {
   fileIdentity,
   hasFileIdentity,
-  isNonEmptyFile,
-  pathIsOwnedRegularFile,
   pathsReferToSameFile,
 } from "./fs.mjs";
+import {
+  cleanupFrameStageSync,
+  resolveFrameFileOps,
+  verifyOpenFrameStageSync,
+} from "./frame-stage.mjs";
 import { runCommand } from "./process.mjs";
 
-const defaultFileOps = { open, lstat, mkdir, rmdir, stat, unlink };
+const defaultFileOps = { open, mkdir, stat };
 
 function frameError(filePath, message, cause) {
   return new SourceError(`${message}: ${filePath}`, { cause });
@@ -79,70 +79,25 @@ async function sourceIdentityIsCurrent(videoPath, identity, fileOps) {
   }
 }
 
-async function pathIsOwnedDirectory(directoryPath, identity, fileOps) {
+function pathsReferToSameFileSync(firstPath, secondPath, fileOps) {
   try {
-    const info = await fileOps.lstat(directoryPath);
-    return info.isDirectory() && !info.isSymbolicLink() && hasFileIdentity(info, identity);
+    const first = fileOps.stat(firstPath);
+    const second = fileOps.stat(secondPath);
+    return first.dev === second.dev && first.ino === second.ino;
   } catch {
     return false;
   }
 }
 
-async function reservationStillOwned(reservation, fileOps) {
-  try {
-    const handleInfo = await reservation.handle.stat();
-    return handleInfo.isFile()
-      && hasFileIdentity(handleInfo, reservation.tempIdentity)
-      && await pathIsOwnedDirectory(
-        reservation.generationPath,
-        reservation.generationIdentity,
-        fileOps,
-      )
-      && await pathIsOwnedRegularFile(reservation.ownerPath, reservation.ownerIdentity, {
-        inspect: fileOps.lstat,
-      })
-      && await pathIsOwnedRegularFile(reservation.tempPath, reservation.tempIdentity, {
-        inspect: fileOps.lstat,
-      });
-  } catch {
-    return false;
-  }
-}
-
-async function cleanupReservation(reservation, fileOps) {
+async function closeReservationHandles(reservation) {
   const errors = [];
-  const generationOwned = reservation.generationIdentity
-    && await pathIsOwnedDirectory(
-      reservation.generationPath,
-      reservation.generationIdentity,
-      fileOps,
-    );
-  let tempOwned = false;
-  if (generationOwned && reservation.tempIdentity) {
-    tempOwned = await pathIsOwnedRegularFile(reservation.tempPath, reservation.tempIdentity, {
-      inspect: fileOps.lstat,
-    });
-  } else if (generationOwned && reservation.handle) {
-    try {
-      const current = await fileOps.lstat(reservation.tempPath);
-      tempOwned = current.isFile() && !current.isSymbolicLink();
-    } catch {
-      tempOwned = false;
-    }
-  }
-  if (tempOwned) {
-    try {
-      await fileOps.unlink(reservation.tempPath);
-    } catch (error) {
-      errors.push(error);
-    }
-  }
   if (reservation.handle) {
     try {
       await reservation.handle.close();
     } catch (error) {
       errors.push(error);
     }
+    reservation.handle = undefined;
   }
   if (reservation.ownerHandle) {
     try {
@@ -150,49 +105,12 @@ async function cleanupReservation(reservation, fileOps) {
     } catch (error) {
       errors.push(error);
     }
+    reservation.ownerHandle = undefined;
   }
-  if (generationOwned && reservation.obsoleteBackupPath
-    && reservation.obsoleteBackupIdentity
-    && await pathIsOwnedRegularFile(
-      reservation.obsoleteBackupPath,
-      reservation.obsoleteBackupIdentity,
-      { inspect: fileOps.lstat },
-    )) {
-    try {
-      await fileOps.unlink(reservation.obsoleteBackupPath);
-    } catch (error) {
-      errors.push(error);
-    }
-  }
-
-  let ownerRemoved = !reservation.ownerIdentity;
-  if (generationOwned && reservation.ownerIdentity
-    && await pathIsOwnedRegularFile(reservation.ownerPath, reservation.ownerIdentity, {
-      inspect: fileOps.lstat,
-    })) {
-    try {
-      await fileOps.unlink(reservation.ownerPath);
-      ownerRemoved = true;
-    } catch (error) {
-      errors.push(error);
-    }
-  }
-  if (generationOwned && ownerRemoved) {
-    try {
-      await fileOps.rmdir(reservation.generationPath);
-    } catch (error) {
-      if (![
-        "ENOENT",
-        "ENOTEMPTY",
-        "EEXIST",
-      ].includes(error.code)) errors.push(error);
-    }
-  }
-  if (errors.length === 1) throw errors[0];
-  if (errors.length > 1) throw new AggregateError(errors, "Private frame generation cleanup failed");
+  return errors;
 }
 
-async function reserveOwnedTemp(finalPath, { nextTempId, fileOps }) {
+async function reserveOwnedTemp(finalPath, { nextTempId, fileOps, frameFileOps }) {
   for (;;) {
     const id = nextTempId();
     if (typeof id !== "string" || !/^[0-9a-f-]+$/u.test(id)) {
@@ -213,7 +131,7 @@ async function reserveOwnedTemp(finalPath, { nextTempId, fileOps }) {
       throw error;
     }
     try {
-      const generationInfo = await fileOps.lstat(generationPath);
+      const generationInfo = frameFileOps.lstat(generationPath);
       if (!generationInfo.isDirectory() || generationInfo.isSymbolicLink()) {
         throw frameError(generationPath, "Reserved frame generation is not a private directory");
       }
@@ -222,29 +140,43 @@ async function reserveOwnedTemp(finalPath, { nextTempId, fileOps }) {
       reservation.ownerHandle = await fileOps.open(ownerPath, "wx", 0o600);
       await reservation.ownerHandle.writeFile(id);
       const ownerInfo = await reservation.ownerHandle.stat();
+      if (!ownerInfo.isFile()) {
+        throw frameError(ownerPath, "Reserved frame owner is not a regular file");
+      }
       reservation.ownerIdentity = fileIdentity(ownerInfo);
+      const ownerPathInfo = frameFileOps.lstat(ownerPath);
+      if (!ownerPathInfo.isFile() || ownerPathInfo.isSymbolicLink()
+        || !hasFileIdentity(ownerPathInfo, reservation.ownerIdentity)) {
+        throw frameError(ownerPath, "Reserved frame owner path identity changed");
+      }
       await reservation.ownerHandle.close();
       reservation.ownerHandle = undefined;
 
       reservation.handle = await fileOps.open(tempPath, "wx", 0o600);
-      const pathInfo = await fileOps.lstat(tempPath);
-      if (!pathInfo.isFile() || pathInfo.isSymbolicLink()) {
-        throw frameError(tempPath, "Reserved frame temp path is not a regular file");
-      }
-      reservation.tempIdentity = fileIdentity(pathInfo);
       const info = await reservation.handle.stat();
-      if (!info.isFile() || !hasFileIdentity(info, reservation.tempIdentity)) {
+      if (!info.isFile()) {
         throw frameError(tempPath, "Reserved frame temp is not a regular file");
+      }
+      reservation.tempIdentity = fileIdentity(info);
+      reservation.tempFd = reservation.handle.fd;
+      const pathInfo = frameFileOps.lstat(tempPath);
+      if (!pathInfo.isFile() || pathInfo.isSymbolicLink()
+        || !hasFileIdentity(pathInfo, reservation.tempIdentity)) {
+        throw frameError(tempPath, "Reserved frame temp path identity changed");
       }
       return reservation;
     } catch (error) {
+      const cleanupErrors = await closeReservationHandles(reservation);
       try {
-        await cleanupReservation(reservation, fileOps);
+        cleanupFrameStageSync(reservation, frameFileOps);
       } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+      if (cleanupErrors.length > 0) {
         throw frameError(
           tempPath,
           "Unable to reserve and clean private frame generation",
-          new AggregateError([error, cleanupError]),
+          new AggregateError([error, ...cleanupErrors]),
         );
       }
       throw error;
@@ -323,6 +255,7 @@ export async function extractFrames({
   log = console,
   nextTempId = randomUUID,
   fileOps = {},
+  frameFileOps = {},
 }) {
   if (manifest?.status !== "building") {
     throw frameError(videoPath, "Frames can only be extracted into a building manifest");
@@ -330,6 +263,7 @@ export async function extractFrames({
   validateCaptureTimestamps(captures, videoPath);
 
   const resolvedFileOps = { ...defaultFileOps, ...fileOps };
+  const resolvedFrameFileOps = resolveFrameFileOps(frameFileOps);
   const sourceIdentity = await sourceIdentityOrNull(videoPath, resolvedFileOps);
   const withFrameLease = workspace.withFrameLease
     ? workspace.withFrameLease.bind(workspace)
@@ -337,6 +271,7 @@ export async function extractFrames({
       manifest: manifestToLease,
       canReuseFrame: (frame) => workspace.canReuseFrame(frame),
       commitFrame: (prepared) => workspace.commitFrame(manifestToLease, prepared),
+      cleanupFrame: (stage) => cleanupFrameStageSync(stage, resolvedFrameFileOps),
     });
   let currentManifest = manifest;
   const orderedCaptures = [...captures].sort((left, right) =>
@@ -370,6 +305,7 @@ export async function extractFrames({
         reservation = await reserveOwnedTemp(finalPath, {
           nextTempId,
           fileOps: resolvedFileOps,
+          frameFileOps: resolvedFrameFileOps,
         });
         let result;
         try {
@@ -381,18 +317,23 @@ export async function extractFrames({
         } catch (error) {
           throw frameError(capture.filename, "Unable to extract frame", error);
         }
-        if (!(await reservationStillOwned(reservation, resolvedFileOps))) {
+        if (!verifyOpenFrameStageSync(reservation, resolvedFrameFileOps)) {
           throw frameError(capture.filename, "Extracted frame temp ownership changed");
         }
-        if (result?.code !== 0 || !(await isNonEmptyFile(reservation.tempPath))) {
+        if (result?.code !== 0
+          || !verifyOpenFrameStageSync(reservation, resolvedFrameFileOps, {
+            requireNonEmpty: true,
+          })) {
           throw frameError(capture.filename, "Unable to extract a nonempty frame");
         }
 
         const dimensions = await probeImageDimensions(reservation.tempPath, { run });
-        if (!(await reservationStillOwned(reservation, resolvedFileOps))) {
+        if (!verifyOpenFrameStageSync(reservation, resolvedFrameFileOps, {
+          requireNonEmpty: true,
+        })) {
           throw frameError(capture.filename, "Extracted frame temp ownership changed");
         }
-        if (await pathsReferToSameFile(videoPath, finalPath)) {
+        if (pathsReferToSameFileSync(videoPath, finalPath, resolvedFrameFileOps)) {
           throw frameError(videoPath, "Frame output must not overwrite the local video");
         }
         const frame = completedFrame(capture, dimensions);
@@ -403,13 +344,18 @@ export async function extractFrames({
           ownerIdentity: reservation.ownerIdentity,
           tempPath: reservation.tempPath,
           tempIdentity: reservation.tempIdentity,
+          tempFd: reservation.tempFd,
           sourcePath: videoPath,
           sourceIdentity,
           frame,
         };
-        nextManifest = await lease.commitFrame(preparedFrame);
-        reservation.obsoleteBackupPath = preparedFrame.obsoleteBackupPath;
-        reservation.obsoleteBackupIdentity = preparedFrame.obsoleteBackupIdentity;
+        try {
+          nextManifest = await lease.commitFrame(preparedFrame);
+        } finally {
+          reservation.backupPath = preparedFrame.backupPath;
+          reservation.backupIdentity = preparedFrame.backupIdentity;
+          reservation.preserveBackup = preparedFrame.preserveBackup;
+        }
         log?.info?.(`Extracted frame ${capture.filename}`);
       } catch (error) {
         failure = error instanceof SourceError
@@ -419,10 +365,18 @@ export async function extractFrames({
 
       let cleanupError;
       if (reservation) {
+        const cleanupErrors = await closeReservationHandles(reservation);
         try {
-          await cleanupReservation(reservation, resolvedFileOps);
+          lease.cleanupFrame(reservation);
         } catch (error) {
-          cleanupError = error;
+          cleanupErrors.push(error);
+        }
+        if (cleanupErrors.length === 1) [cleanupError] = cleanupErrors;
+        if (cleanupErrors.length > 1) {
+          cleanupError = new AggregateError(
+            cleanupErrors,
+            "Private frame generation cleanup failed",
+          );
         }
       }
       if (cleanupError) {
