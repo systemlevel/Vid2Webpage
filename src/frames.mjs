@@ -8,6 +8,7 @@ import path from "node:path";
 
 import { SourceError } from "./errors.mjs";
 import {
+  capturePublicationExpectation,
   fileIdentity,
   hasFileIdentity,
   pathsReferToSameFile,
@@ -276,6 +277,9 @@ export async function extractFrames({
 
   const resolvedFileOps = { ...defaultFileOps, ...fileOps };
   const resolvedFrameFileOps = resolveFrameFileOps(frameFileOps);
+  const effectiveProtectedFiles = protectedFiles.length > 0
+    ? protectedFiles
+    : workspace.protectedFiles ?? [];
   const sourceIdentity = await sourceIdentityOrNull(videoPath, resolvedFileOps);
   const withFrameLease = workspace.withFrameLease
     ? workspace.withFrameLease.bind(workspace)
@@ -296,9 +300,18 @@ export async function extractFrames({
       if (await pathsReferToSameFile(videoPath, finalPath)) {
         throw frameError(videoPath, "Frame output must not overwrite the local video");
       }
-      if (await pathMatchesProtectedIdentity(finalPath, protectedFiles, resolvedFileOps)) {
+      if (await pathMatchesProtectedIdentity(
+        finalPath,
+        effectiveProtectedFiles,
+        resolvedFileOps,
+      )) {
         throw frameError(finalPath, "Frame output must not alias a protected local file");
       }
+      const expectedFinal = effectiveProtectedFiles.length > 0
+        ? await (lease.captureFrameDestination
+          ? lease.captureFrameDestination(capture.filename)
+          : capturePublicationExpectation(finalPath))
+        : undefined;
 
       const existing = leasedManifest.images.find((image) => image.filename === capture.filename);
       if (existing) {
@@ -308,7 +321,7 @@ export async function extractFrames({
             || await pathsReferToSameFile(videoPath, finalPath)
             || await pathMatchesProtectedIdentity(
               finalPath,
-              protectedFiles,
+              effectiveProtectedFiles,
               resolvedFileOps,
             )) {
             throw frameError(videoPath, "Reusable frame must not alias a protected local file");
@@ -327,8 +340,8 @@ export async function extractFrames({
           fileOps: resolvedFileOps,
           frameFileOps: resolvedFrameFileOps,
         });
-        reservation.protectedFiles = protectedFiles;
-        if (protectedFiles.length > 0 && typeof workspace.retentionDir === "string") {
+        reservation.protectedFiles = effectiveProtectedFiles;
+        if (effectiveProtectedFiles.length > 0 && typeof workspace.retentionDir === "string") {
           const token = path.basename(reservation.generationPath)
             .slice(".v2w-frame-stage-".length);
           reservation.retentionPath = reserveProtectedFrameRetentionPathSync(
@@ -377,7 +390,8 @@ export async function extractFrames({
           tempFd: reservation.tempFd,
           sourcePath: videoPath,
           sourceIdentity,
-          protectedFiles,
+          protectedFiles: effectiveProtectedFiles,
+          expectedFinal,
           frame,
         };
         try {

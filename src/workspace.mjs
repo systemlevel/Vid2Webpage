@@ -16,8 +16,11 @@ import { OutputConflictError } from "./errors.mjs";
 import {
   AtomicPublicationConflictError,
   canonicalPath,
+  capturePublicationExpectation,
   isNonEmptyFile,
+  isPublicationExpectation,
   pathsReferToSameFile,
+  readFileWithPublicationExpectation,
   writeFileAtomic,
 } from "./fs.mjs";
 import {
@@ -494,8 +497,20 @@ async function withMutationLock(lockPath, hooks, operation) {
   }
 }
 
-async function readManifest(manifestPath, fingerprint, imagesDir) {
-  const manifestText = await readFile(manifestPath, "utf8");
+async function readManifestState(manifestPath, fingerprint, imagesDir) {
+  let manifestText;
+  let expectation;
+  try {
+    ({ data: manifestText, expectation } = await readFileWithPublicationExpectation(
+      manifestPath,
+      "utf8",
+    ));
+  } catch (error) {
+    if (error instanceof AtomicPublicationConflictError) {
+      throw conflict(error.message);
+    }
+    throw error;
+  }
   let manifest;
   try {
     manifest = JSON.parse(manifestText);
@@ -505,7 +520,10 @@ async function readManifest(manifestPath, fingerprint, imagesDir) {
     }
     throw error;
   }
-  return validateManifest(manifest, fingerprint, imagesDir);
+  return {
+    manifest: validateManifest(manifest, fingerprint, imagesDir),
+    expectation,
+  };
 }
 
 function initialManifest(source) {
@@ -547,6 +565,7 @@ export async function openWorkspace({
   const manifestLockPath = path.join(outputDir, manifestLockFilename);
   const imagesDir = path.join(outputDir, "images");
   const resolvedFrameFileOps = resolveFrameFileOps(frameFileOps);
+  const manifestExpectations = new WeakMap();
   if (!Array.isArray(protectedFiles)
     || protectedFiles.some((protectedFile) =>
       !isPlainObject(protectedFile) || !isValidIdentity(protectedFile.identity))) {
@@ -588,8 +607,27 @@ export async function openWorkspace({
     && (!existingManifestInfo.isFile() || existingManifestInfo.isSymbolicLink())) {
     throw conflict(`Output manifest is not a safe file: ${manifestPath}`);
   }
+  const rememberManifestState = (state) => {
+    manifestExpectations.set(state.manifest, state.expectation);
+    return state.manifest;
+  };
+  const loadManifestState = async () => {
+    const state = await readManifestState(manifestPath, fingerprint, imagesDir);
+    rememberManifestState(state);
+    return state;
+  };
+  const captureDestinationExpectation = async (filePath) => {
+    try {
+      return await capturePublicationExpectation(filePath);
+    } catch (error) {
+      if (error instanceof AtomicPublicationConflictError) {
+        throw conflict(error.message);
+      }
+      throw error;
+    }
+  };
   let manifest = existingManifestInfo
-    ? await readManifest(manifestPath, fingerprint, imagesDir)
+    ? rememberManifestState(await readManifestState(manifestPath, fingerprint, imagesDir))
     : null;
   const completedReadOnly = manifest?.status === "complete";
 
@@ -609,12 +647,9 @@ export async function openWorkspace({
   if (!completedReadOnly) {
     await hooks.beforeInitializationLock?.();
     manifest = await withMutationLock(manifestLockPath, hooks, async () => {
-      const manifestInfo = await statOrNull(manifestPath);
-      if (manifestInfo && (!manifestInfo.isFile() || manifestInfo.isSymbolicLink())) {
-        throw conflict(`Output manifest is not a safe file: ${manifestPath}`);
-      }
-      if (manifestInfo) {
-        return readManifest(manifestPath, fingerprint, imagesDir);
+      const expectedDestination = await captureDestinationExpectation(manifestPath);
+      if (expectedDestination.state === "present") {
+        return (await loadManifestState()).manifest;
       }
       const outputEntries = (await readdir(outputDir))
         .filter((entry) => entry !== manifestLockFilename
@@ -624,11 +659,12 @@ export async function openWorkspace({
       }
       const createdManifest = initialManifest(source);
       try {
-        await writeFileAtomic(
+        const expectation = await writeFileAtomic(
           manifestPath,
           `${JSON.stringify(createdManifest, null, 2)}\n`,
-          publicationOptions,
+          { ...publicationOptions, expectedDestination },
         );
+        rememberManifestState({ manifest: createdManifest, expectation });
       } catch (error) {
         if (error instanceof AtomicPublicationConflictError) {
           throw conflict(error.message);
@@ -649,17 +685,21 @@ export async function openWorkspace({
   }
 
   async function loadManifest() {
-    return readManifest(manifestPath, fingerprint, imagesDir);
+    return (await loadManifestState()).manifest;
   }
 
-  async function writeManifest(nextManifest) {
+  async function writeManifest(nextManifest, expectedDestination) {
     validateManifest(nextManifest, fingerprint, imagesDir);
+    if (protectedContext.length > 0 && !isPublicationExpectation(expectedDestination)) {
+      throw conflict("Protected manifest publication requires caller-owned manifest identity");
+    }
     try {
-      await writeFileAtomic(
+      const expectation = await writeFileAtomic(
         manifestPath,
         `${JSON.stringify(nextManifest, null, 2)}\n`,
-        publicationOptions,
+        { ...publicationOptions, expectedDestination },
       );
+      rememberManifestState({ manifest: nextManifest, expectation });
     } catch (error) {
       if (error instanceof AtomicPublicationConflictError) {
         throw conflict(error.message);
@@ -669,49 +709,85 @@ export async function openWorkspace({
     return nextManifest;
   }
 
-  async function saveManifest(nextManifest) {
+  function assertManifestExpectation(expectedManifest, currentState) {
+    validateManifest(expectedManifest, fingerprint, imagesDir);
+    if (expectedManifest.revision !== currentState.manifest.revision) {
+      throw conflict("Workspace manifest revision is stale");
+    }
+    if (protectedContext.length === 0) return;
+    const expectedDestination = manifestExpectations.get(expectedManifest);
+    if (!isPublicationExpectation(expectedDestination)
+      || !isDeepStrictEqual(expectedDestination, currentState.expectation)) {
+      throw conflict("Workspace manifest identity is stale");
+    }
+  }
+
+  async function saveManifest(nextManifest, { expectedManifest = nextManifest } = {}) {
     validateManifest(nextManifest, fingerprint, imagesDir);
     if (nextManifest.status !== "building") {
       throw conflict("saveManifest only persists building manifests");
     }
-    return mutateManifest(nextManifest, () => nextManifest, "building");
+    return mutateManifest(
+      nextManifest,
+      () => nextManifest,
+      "building",
+      { expectedManifest },
+    );
   }
 
-  async function mutateManifest(callerManifest, createNextManifest, expectedStatus) {
+  async function mutateManifest(
+    callerManifest,
+    createNextManifest,
+    expectedStatus,
+    { expectedManifest = callerManifest } = {},
+  ) {
     validateManifest(callerManifest, fingerprint, imagesDir);
+    validateManifest(expectedManifest, fingerprint, imagesDir);
     if (callerManifest.status !== "building") {
       throw conflict("Completed output manifests are immutable");
     }
+    if (callerManifest.revision !== expectedManifest.revision) {
+      throw conflict("Workspace manifest revision is stale");
+    }
     return withMutationLock(manifestLockPath, hooks, async () => {
-      const current = await loadManifest();
+      const currentState = await loadManifestState();
+      const current = currentState.manifest;
       if (current.status !== "building") {
         throw conflict("Completed output manifests are immutable");
       }
-      if (callerManifest.revision !== current.revision) {
-        throw conflict("Workspace manifest revision is stale");
-      }
+      assertManifestExpectation(expectedManifest, currentState);
       const nextManifest = createNextManifest();
       validateManifest(nextManifest, fingerprint, imagesDir);
       if (nextManifest.status !== expectedStatus) {
         throw conflict("Workspace mutation has an invalid lifecycle transition");
       }
-      return writeManifest({ ...nextManifest, revision: current.revision + 1 });
+      return writeManifest(
+        { ...nextManifest, revision: current.revision + 1 },
+        currentState.expectation,
+      );
     });
   }
 
-  async function withRenderLease(manifestToRender, operation) {
+  async function withRenderLease(
+    manifestToRender,
+    operation,
+    { expectedManifest = manifestToRender } = {},
+  ) {
     validateRenderableManifest(manifestToRender, fingerprint, imagesDir);
+    validateManifest(expectedManifest, fingerprint, imagesDir);
     if (manifestToRender.status !== "building") {
       throw conflict("Cannot render a completed manifest");
     }
+    if (manifestToRender.revision !== expectedManifest.revision) {
+      throw conflict("Workspace manifest revision is stale");
+    }
     return withMutationLock(manifestLockPath, hooks, async () => {
-      let current = await loadManifest();
+      const currentState = await loadManifestState();
+      let current = currentState.manifest;
       if (current.status !== "building") {
         throw conflict("Completed output manifests are immutable");
       }
-      if (manifestToRender.revision !== current.revision) {
-        throw conflict("Workspace manifest revision is stale");
-      }
+      assertManifestExpectation(expectedManifest, currentState);
       validateRenderableManifest(current, fingerprint, imagesDir);
       let phase = "ready";
       let acceptingOperations = true;
@@ -776,7 +852,10 @@ export async function openWorkspace({
                 if (nextManifest.status !== "building" || nextManifest.revision !== current.revision) {
                   throw conflict("Render lease manifest revision is stale");
                 }
-                current = await writeManifest({ ...nextManifest, revision: current.revision + 1 });
+                current = await writeManifest(
+                  { ...nextManifest, revision: current.revision + 1 },
+                  manifestExpectations.get(current),
+                );
                 phase = "saved";
                 return current;
               } catch (error) {
@@ -800,12 +879,15 @@ export async function openWorkspace({
                 }
                 await hooks.beforeCompletionInventory?.({ manifest: current, imagesDir });
                 await validateCompleteInventory(current);
-                current = await writeManifest({
-                  ...current,
-                  status: "complete",
-                  revision: current.revision + 1,
-                  completedAt: new Date().toISOString(),
-                });
+                current = await writeManifest(
+                  {
+                    ...current,
+                    status: "complete",
+                    revision: current.revision + 1,
+                    completedAt: new Date().toISOString(),
+                  },
+                  manifestExpectations.get(current),
+                );
                 phase = "complete";
                 return current;
               } catch (error) {
@@ -869,6 +951,7 @@ export async function openWorkspace({
       sourcePath,
       sourceIdentity,
       protectedFiles: preparedProtectedFiles = [],
+      expectedFinal,
       frame,
     } = preparedFrame;
     const effectiveProtectedFiles = protectedContext.length > 0
@@ -899,7 +982,9 @@ export async function openWorkspace({
       || !(sourceIdentity === null || isValidIdentity(sourceIdentity))
       || !Array.isArray(effectiveProtectedFiles)
       || effectiveProtectedFiles.some((protectedFile) =>
-        !isPlainObject(protectedFile) || !isValidIdentity(protectedFile.identity))) {
+        !isPlainObject(protectedFile) || !isValidIdentity(protectedFile.identity))
+      || (effectiveProtectedFiles.length > 0
+        && !isPublicationExpectation(expectedFinal))) {
       throw conflict("Prepared frame temp path or identity is invalid");
     }
     return {
@@ -913,6 +998,7 @@ export async function openWorkspace({
       sourcePath,
       sourceIdentity,
       protectedFiles: effectiveProtectedFiles,
+      expectedFinal,
       frame: replacement,
       token,
     };
@@ -1046,7 +1132,10 @@ export async function openWorkspace({
       if (hookResult && typeof hookResult.then === "function") {
         throw conflict("Frame manifest failure injection must be synchronous");
       }
-      writtenManifest = await writeManifest(nextManifest);
+      writtenManifest = await writeManifest(
+        nextManifest,
+        manifestExpectations.get(current),
+      );
       prepared.preserveBackup = false;
     } catch (error) {
       try {
@@ -1070,13 +1159,12 @@ export async function openWorkspace({
       throw conflict("Cannot lease frames in a completed manifest");
     }
     return withMutationLock(manifestLockPath, hooks, async () => {
-      const current = await loadManifest();
+      const currentState = await loadManifestState();
+      const current = currentState.manifest;
       if (current.status !== "building") {
         throw conflict("Completed output manifests are immutable");
       }
-      if (manifestToUpdate.revision !== current.revision) {
-        throw conflict("Workspace manifest revision is stale");
-      }
+      assertManifestExpectation(manifestToUpdate, currentState);
       const recovery = recoverFrameStagesSync(imagesDir, resolvedFrameFileOps, {
         preserveGeneration,
         manifest: current,
@@ -1089,9 +1177,20 @@ export async function openWorkspace({
       const protectedFilenames = new Set(
         recovery.protectedStages.map((stage) => stage.filename),
       );
+      const frameExpectations = new Map();
       let committed = false;
       return operation({
         manifest: current,
+        async captureFrameDestination(filename) {
+          const finalPath = assertSafeFilename(filename, imagesDir);
+          if (!frameExpectations.has(finalPath)) {
+            frameExpectations.set(
+              finalPath,
+              await captureDestinationExpectation(finalPath),
+            );
+          }
+          return frameExpectations.get(finalPath);
+        },
         canReuseFrame: (capture) => protectedFilenames.has(capture.filename)
           ? false
           : reuseFrameFromManifest(current, capture),
@@ -1168,21 +1267,23 @@ export async function openWorkspace({
         throw conflict("Completed output manifests are immutable");
       }
       return withMutationLock(manifestLockPath, hooks, async () => {
-        const current = await loadManifest();
+        const currentState = await loadManifestState();
+        const current = currentState.manifest;
         if (current.status !== "building") {
           throw conflict("Completed output manifests are immutable");
         }
-        if (manifestToComplete.revision !== current.revision) {
-          throw conflict("Workspace manifest revision is stale");
-        }
+        assertManifestExpectation(manifestToComplete, currentState);
         await hooks.beforeCompletionInventory?.({ manifest: current, imagesDir });
         await validateCompleteInventory(current);
-        return writeManifest({
-          ...current,
-          status: "complete",
-          revision: current.revision + 1,
-          completedAt: new Date().toISOString(),
-        });
+        return writeManifest(
+          {
+            ...current,
+            status: "complete",
+            revision: current.revision + 1,
+            completedAt: new Date().toISOString(),
+          },
+          currentState.expectation,
+        );
       });
     },
     async canReuseFrame(capture) {

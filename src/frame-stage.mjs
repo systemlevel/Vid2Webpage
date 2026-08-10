@@ -15,7 +15,12 @@ import {
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
-import { fileIdentity, hasFileIdentity } from "./fs.mjs";
+import {
+  fileIdentity,
+  hasFileIdentity,
+  isPublicationExpectation,
+  publicationExpectationMatchesFileSync,
+} from "./fs.mjs";
 
 const generationPattern = /^\.v2w-frame-stage-([0-9a-f-]+)$/u;
 const backupStateSchemaVersion = 1;
@@ -653,7 +658,9 @@ function restoreBackupAfterPublishFailure(prepared, finalPath, fileOps, failure)
 
 function publishProtectedFrameSync(prepared, finalPath, fileOps, protectedFiles) {
   const backupPath = path.join(prepared.generationPath, `previous-${prepared.token}`);
-  const observed = lstatOrNull(finalPath, fileOps);
+  if (!isPublicationExpectation(prepared.expectedFinal)) {
+    throw frameConflict("Protected frame publication requires a lease-owned prior expectation");
+  }
   let captured = false;
   try {
     fileOps.rename(finalPath, backupPath);
@@ -664,13 +671,7 @@ function publishProtectedFrameSync(prepared, finalPath, fileOps, protectedFiles)
 
   if (captured) {
     const backupInfo = lstatOrNull(backupPath, fileOps);
-    if (!observed
-      || !backupInfo
-      || !observed.isFile()
-      || observed.isSymbolicLink()
-      || !backupInfo.isFile()
-      || backupInfo.isSymbolicLink()
-      || !hasFileIdentity(backupInfo, fileIdentity(observed))) {
+    if (!backupInfo || !backupInfo.isFile() || backupInfo.isSymbolicLink()) {
       if (backupInfo?.isFile() && !backupInfo.isSymbolicLink()) {
         restoreCapturedNoOverwrite(backupPath, finalPath, fileOps);
       }
@@ -679,8 +680,14 @@ function publishProtectedFrameSync(prepared, finalPath, fileOps, protectedFiles)
     prepared.backupPath = backupPath;
     prepared.backupIdentity = fileIdentity(backupInfo);
     prepared.preserveBackup = true;
-    if (infoIsProtected(backupInfo, protectedFiles)) {
-      const message = "Atomically captured frame output aliases a protected local file";
+    if (prepared.expectedFinal.state !== "present"
+      || !publicationExpectationMatchesFileSync(
+        backupPath,
+        prepared.expectedFinal,
+        fileOps,
+      )
+      || infoIsProtected(backupInfo, protectedFiles)) {
+      const message = "Atomically captured frame output does not match lease ownership";
       restoreBackupAfterPublishFailure(
         prepared,
         finalPath,
@@ -689,8 +696,8 @@ function publishProtectedFrameSync(prepared, finalPath, fileOps, protectedFiles)
       );
       throw frameConflict(message);
     }
-  } else if (observed) {
-    throw frameConflict("Frame output changed during atomic capture");
+  } else if (prepared.expectedFinal.state === "present") {
+    throw frameConflict("Expected frame output disappeared before atomic capture");
   }
 
   const currentTemp = lstatOrNull(prepared.tempPath, fileOps);

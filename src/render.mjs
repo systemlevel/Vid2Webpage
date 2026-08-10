@@ -1,7 +1,11 @@
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
-import { copyFileAtomic, writeFileAtomic } from "./fs.mjs";
+import {
+  capturePublicationExpectation,
+  copyFileAtomic,
+  writeFileAtomic,
+} from "./fs.mjs";
 import { formatVttTimestamp } from "./vtt.mjs";
 
 const pageCssPath = fileURLToPath(new URL("./page.css", import.meta.url));
@@ -232,14 +236,28 @@ export async function renderOutput({
       retentionDir: workspace.retentionDir,
       fileOps,
     };
-    await copyFileAtomic(transcriptVttPath, transcriptPath, publicationOptions);
-    await copyFileAtomic(pageCssPath, stylesheetPath, publicationOptions);
+    const [transcriptExpectation, stylesheetExpectation, htmlExpectation]
+      = protectedFiles.length > 0
+        ? await Promise.all([
+          capturePublicationExpectation(transcriptPath),
+          capturePublicationExpectation(stylesheetPath),
+          capturePublicationExpectation(htmlPath),
+        ])
+        : [undefined, undefined, undefined];
+    await copyFileAtomic(transcriptVttPath, transcriptPath, {
+      ...publicationOptions,
+      expectedDestination: transcriptExpectation,
+    });
+    await copyFileAtomic(pageCssPath, stylesheetPath, {
+      ...publicationOptions,
+      expectedDestination: stylesheetExpectation,
+    });
     const savedManifest = await lease.saveManifest(buildingManifest);
     await writeFileAtomic(
       htmlPath,
       renderPage({ manifest: savedManifest, segments }),
-      publicationOptions,
+      { ...publicationOptions, expectedDestination: htmlExpectation },
     );
     return lease.markComplete(savedManifest);
-  });
+  }, { expectedManifest: manifest });
 }

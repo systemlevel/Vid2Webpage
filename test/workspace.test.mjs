@@ -29,6 +29,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { OutputConflictError, SourceError } from "../src/errors.mjs";
+import { capturePublicationExpectation } from "../src/fs.mjs";
 import { extractFrames } from "../src/frames.mjs";
 import {
   openWorkspace as openWorkspaceProduction,
@@ -55,7 +56,10 @@ async function openWorkspace({ seedSegments = true, ...options }) {
   if (seedSegments) {
     const manifest = await workspace.loadManifest();
     if (manifest.status === "building" && manifest.segments.length === 0) {
-      await workspace.saveManifest({ ...manifest, segments: sourceSegments });
+      await workspace.saveManifest(
+        { ...manifest, segments: sourceSegments },
+        { expectedManifest: manifest },
+      );
     }
   }
   return workspace;
@@ -139,11 +143,12 @@ async function createWorkspace(t, {
 
 async function createRenderLeaseWorkspace(t, options) {
   const workspace = await createWorkspace(t, options);
+  const expectedManifest = await workspace.loadManifest();
   const manifest = await workspace.saveManifest({
-    ...(await workspace.loadManifest()),
+    ...expectedManifest,
     transcript: { engine: "mlx-whisper", filename: "transcript.vtt" },
     segments: [{ startMs: 0, endMs: 8_000, text: "Whisper segment" }],
-  });
+  }, { expectedManifest });
   return { workspace, manifest };
 }
 
@@ -211,6 +216,25 @@ function identity(info) {
 
 async function frameStageNames(imagesDir) {
   return (await readdir(imagesDir)).filter((entry) => entry.startsWith(".v2w-frame-stage-"));
+}
+
+async function findRetainedIdentity(directory, expectedIdentity) {
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const entryPath = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      const nested = await findRetainedIdentity(entryPath, expectedIdentity);
+      if (nested) return nested;
+      continue;
+    }
+    const info = await lstat(entryPath);
+    if (info.isFile()
+      && !info.isSymbolicLink()
+      && info.dev === expectedIdentity.dev
+      && info.ino === expectedIdentity.ino) {
+      return entryPath;
+    }
+  }
+  return null;
 }
 
 async function assertProtectedPriorBackup(imagesDir, expectedBytes) {
@@ -1900,6 +1924,7 @@ test("protected frame publication atomically captures a final swapped at the for
   const manifestBytes = await readFile(workspace.manifestPath, "utf8");
   const prepared = await preparedFrame(workspace, t, planned);
   await writeFile(finalPath, "prior-frame");
+  prepared.expectedFinal = await capturePublicationExpectation(finalPath);
   await writeFile(captionPath, "protected-caption");
   const captionBefore = await lstat(captionPath);
   prepared.protectedFiles = [{
@@ -1920,6 +1945,107 @@ test("protected frame publication atomically captures a final swapped at the for
   assert.deepEqual(identity(await lstat(captionPath)), identity(captionBefore));
   assert.deepEqual(identity(await lstat(finalPath)), identity(captionBefore));
   assert.equal(await readFile(workspace.manifestPath, "utf8"), manifestBytes);
+});
+
+test("protected frame lease rejects a stable foreign prior inserted after lease observation", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-frame-lease-prior-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const videoPath = path.join(root, "lesson.mov");
+  const foreignPath = path.join(root, "foreign.jpg");
+  const displacedPriorPath = path.join(root, "displaced-prior.jpg");
+  const outputDir = path.join(root, "output");
+  await writeFile(videoPath, "protected-video");
+  await writeFile(foreignPath, "stable-foreign-jpeg");
+  const videoInfo = await lstat(videoPath);
+  const foreignInfo = await lstat(foreignPath);
+  const protectedFiles = [{
+    label: "video",
+    path: videoPath,
+    canonicalPath: videoPath,
+    identity: identity(videoInfo),
+  }];
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir,
+    source: { ...source, input: videoPath },
+    protectedFiles,
+  };
+  const planned = capture();
+  delete planned.width;
+  delete planned.height;
+  const initialWorkspace = await openWorkspace(options);
+  const initial = await extractFrames({
+    videoPath,
+    captures: [planned],
+    workspace: initialWorkspace,
+    manifest: await initialWorkspace.loadManifest(),
+    run: frameRunner("owned-prior-jpeg"),
+    log: { info() {} },
+    protectedFiles,
+  });
+  const initialManifestBytes = await readFile(initialWorkspace.manifestPath, "utf8");
+  const initialImages = structuredClone(initial.images);
+  const finalPath = path.join(initialWorkspace.imagesDir, planned.filename);
+  const changed = { ...planned, timestampMs: planned.timestampMs + 1 };
+  let injected = false;
+  const replacingWorkspace = await openWorkspace(options);
+
+  await assert.rejects(extractFrames({
+    videoPath,
+    captures: [changed],
+    workspace: replacingWorkspace,
+    manifest: await replacingWorkspace.loadManifest(),
+    protectedFiles,
+    run: async (command, args) => {
+      if (command === "ffmpeg") {
+        renameSync(finalPath, displacedPriorPath);
+        linkSync(foreignPath, finalPath);
+        injected = true;
+        writeFileSync(args.at(-1), "uncommitted-new-jpeg");
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      return {
+        code: 0,
+        stdout: JSON.stringify({ streams: [{ width: 640, height: 360 }] }),
+        stderr: "",
+      };
+    },
+    log: { info() {} },
+  }), SourceError);
+
+  assert.equal(injected, true);
+  assert.equal(await readFile(finalPath, "utf8"), "stable-foreign-jpeg");
+  assert.deepEqual(identity(await lstat(finalPath)), identity(foreignInfo));
+  assert.deepEqual(identity(await lstat(foreignPath)), identity(foreignInfo));
+  assert.equal(await readFile(displacedPriorPath, "utf8"), "owned-prior-jpeg");
+  assert.equal(await readFile(replacingWorkspace.manifestPath, "utf8"), initialManifestBytes);
+  assert.deepEqual((await replacingWorkspace.loadManifest()).images, initialImages);
+  assert.deepEqual(await readdir(replacingWorkspace.imagesDir), [planned.filename]);
+  const retainedForeign = await findRetainedIdentity(
+    replacingWorkspace.retentionDir,
+    identity(foreignInfo),
+  );
+  assert.ok(retainedForeign);
+  assert.equal(path.resolve(retainedForeign).startsWith(
+    `${path.resolve(replacingWorkspace.outputDir)}${path.sep}`,
+  ), false);
+
+  await unlink(finalPath);
+  renameSync(displacedPriorPath, finalPath);
+  const resumed = await openWorkspace(options);
+  const recovered = await extractFrames({
+    videoPath,
+    captures: [changed],
+    workspace: resumed,
+    manifest: await resumed.loadManifest(),
+    run: frameRunner("recovered-jpeg"),
+    log: { info() {} },
+    protectedFiles,
+  });
+  assert.equal(await readFile(finalPath, "utf8"), "recovered-jpeg");
+  assert.equal(recovered.revision, initial.revision + 1);
+  assert.equal(await readFile(foreignPath, "utf8"), "stable-foreign-jpeg");
 });
 
 test("publication rechecks the retained staged inode synchronously and a real resume cleans the owned residue", async (t) => {
@@ -2301,15 +2427,16 @@ test("protected manifest saves retain safe prior generations outside output and 
     seedSegments: false,
   });
   const initialBytes = await readFile(workspace.manifestPath, "utf8");
+  const initialManifest = await workspace.loadManifest();
   const first = await workspace.saveManifest({
-    ...(await workspace.loadManifest()),
+    ...initialManifest,
     segments: sourceSegments,
-  });
+  }, { expectedManifest: initialManifest });
   const firstBytes = await readFile(workspace.manifestPath, "utf8");
   const second = await workspace.saveManifest({
     ...first,
     transcript: { engine: "mlx-whisper", filename: "transcript.vtt" },
-  });
+  }, { expectedManifest: first });
 
   assert.equal(second.revision, first.revision + 1);
   assert.deepEqual(JSON.parse(await readFile(workspace.manifestPath, "utf8")), second);
@@ -2373,13 +2500,75 @@ test("protected manifest publication preserves a hard-link replacement captured 
   await assert.rejects(workspace.saveManifest({
     ...manifest,
     segments: sourceSegments,
-  }), OutputConflictError);
+  }, { expectedManifest: manifest }), OutputConflictError);
 
   assert.equal(injected, true);
   assert.equal(await readFile(videoPath, "utf8"), "protected-video");
   assert.equal(await readFile(manifestPath, "utf8"), "protected-video");
   assert.deepEqual(identity(await lstat(videoPath)), identity(videoBefore));
   assert.deepEqual(identity(await lstat(manifestPath)), identity(videoBefore));
+});
+
+test("protected manifest CAS rejects a stable foreign inode inserted after revision read", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-protected-manifest-expectation-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const videoPath = path.join(root, "lesson.mov");
+  const foreignPath = path.join(root, "foreign-manifest.json");
+  const outputDir = path.join(root, "output");
+  const manifestPath = path.join(outputDir, "manifest.json");
+  await writeFile(videoPath, "protected-video");
+  const videoInfo = await lstat(videoPath);
+  let armed = false;
+  let injected = false;
+  let foreignIdentity;
+  const workspace = await openWorkspace({
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir,
+    source: { ...source, input: videoPath },
+    protectedFiles: [{
+      label: "video",
+      path: videoPath,
+      canonicalPath: videoPath,
+      identity: identity(videoInfo),
+    }],
+    publicationFileOps: {
+      lstat(filePath) {
+        if (armed && !injected && filePath === workspace.retentionDir) {
+          unlinkSync(manifestPath);
+          linkSync(foreignPath, manifestPath);
+          injected = true;
+        }
+        return lstatSync(filePath);
+      },
+    },
+    seedSegments: false,
+  });
+  const manifest = await workspace.loadManifest();
+  const foreignManifest = {
+    ...manifest,
+    source: { ...manifest.source, title: "stable foreign manifest" },
+  };
+  await writeFile(foreignPath, `${JSON.stringify(foreignManifest, null, 2)}\n`);
+  foreignIdentity = identity(await lstat(foreignPath));
+  armed = true;
+
+  await assert.rejects(workspace.saveManifest({
+    ...manifest,
+    segments: sourceSegments,
+  }, { expectedManifest: manifest }), OutputConflictError);
+
+  assert.equal(injected, true);
+  assert.deepEqual(identity(await lstat(manifestPath)), foreignIdentity);
+  assert.deepEqual(identity(await lstat(foreignPath)), foreignIdentity);
+  const durable = JSON.parse(await readFile(manifestPath, "utf8"));
+  assert.equal(durable.revision, manifest.revision);
+  assert.equal(durable.source.title, "stable foreign manifest");
+  const retainedForeign = await findRetainedIdentity(workspace.retentionDir, foreignIdentity);
+  assert.ok(retainedForeign);
+  assert.equal(path.resolve(retainedForeign).startsWith(
+    `${path.resolve(workspace.outputDir)}${path.sep}`,
+  ), false);
 });
 
 test("EEXIST with a prior final leaves an owned recoverable stage and the next real extraction completes", async (t) => {

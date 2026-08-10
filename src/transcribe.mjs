@@ -3,7 +3,11 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { TranscriptQualityError, TranscriptionError } from "./errors.mjs";
-import { copyFileAtomic, isNonEmptyFile } from "./fs.mjs";
+import {
+  capturePublicationExpectation,
+  copyFileAtomic,
+  isNonEmptyFile,
+} from "./fs.mjs";
 import { runCommand } from "./process.mjs";
 import { inspectTranscript } from "./quality.mjs";
 import { parseVtt } from "./vtt.mjs";
@@ -99,8 +103,14 @@ function commandDiagnostic(label, outcome) {
     (stderr ? `: ${stderr}` : "");
 }
 
-async function publishCandidate(candidatePath, canonicalPath, engine, inspected) {
-  await copyFileAtomic(candidatePath, canonicalPath);
+async function publishCandidate(
+  candidatePath,
+  canonicalPath,
+  engine,
+  inspected,
+  publicationOptions,
+) {
+  await copyFileAtomic(candidatePath, canonicalPath, publicationOptions);
   return { engine, vttPath: canonicalPath, cues: inspected.cues };
 }
 
@@ -111,8 +121,17 @@ export async function transcribeTimed({
   run = runCommand,
   model = "large-v3-turbo",
   vocabPrompt = "",
+  protectedFiles = [],
+  retentionDir,
 }) {
   const canonicalPath = path.join(cacheDir, "transcript.vtt");
+  const publicationOptions = protectedFiles.length > 0
+    ? {
+      protectedFiles,
+      retentionDir,
+      expectedDestination: await capturePublicationExpectation(canonicalPath),
+    }
+    : undefined;
   const invocationId = randomUUID();
   const diagnostics = [];
   let firstRunnerError = null;
@@ -136,7 +155,13 @@ export async function transcribeTimed({
     const first = firstSucceeded ? await inspectVtt(firstPath) : null;
 
     if (first?.usable && first.quality.clean) {
-      return publishCandidate(firstPath, canonicalPath, "mlx-whisper", first);
+      return publishCandidate(
+        firstPath,
+        canonicalPath,
+        "mlx-whisper",
+        first,
+        publicationOptions,
+      );
     }
 
     if (first?.usable) {
@@ -160,7 +185,13 @@ export async function transcribeTimed({
       const retrySucceeded = retryOutcome.result?.code === 0 && !retryOutcome.error;
       const retry = retrySucceeded ? await inspectVtt(retryPath) : null;
       if (retry?.usable && retry.quality.clean) {
-        return publishCandidate(retryPath, canonicalPath, "mlx-whisper", retry);
+        return publishCandidate(
+          retryPath,
+          canonicalPath,
+          "mlx-whisper",
+          retry,
+          publicationOptions,
+        );
       }
       if (retry?.usable) {
         throw new TranscriptQualityError(
@@ -220,7 +251,13 @@ export async function transcribeTimed({
     const cppSucceeded = cppOutcome.result?.code === 0 && !cppOutcome.error;
     const cpp = cppSucceeded ? await inspectVtt(cppPath) : null;
     if (cpp?.usable && cpp.quality.clean) {
-      return publishCandidate(cppPath, canonicalPath, "whisper-cpp", cpp);
+      return publishCandidate(
+        cppPath,
+        canonicalPath,
+        "whisper-cpp",
+        cpp,
+        publicationOptions,
+      );
     }
     diagnostics.push(
       cpp?.usable

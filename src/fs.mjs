@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   lstat,
   open,
@@ -10,6 +10,7 @@ import {
   linkSync,
   lstatSync,
   mkdirSync,
+  readFileSync,
   renameSync,
   statSync,
   unlinkSync,
@@ -62,6 +63,7 @@ const nativePublicationOps = {
   link: linkSync,
   lstat: lstatSync,
   mkdir: mkdirSync,
+  readFile: readFileSync,
   rename: renameSync,
   stat: statSync,
 };
@@ -80,6 +82,182 @@ function publicationInfoOrNull(filePath, operation) {
     if (error.code === "ENOENT") return null;
     throw error;
   }
+}
+
+function isStableRegularFile(info) {
+  return Boolean(info) && info.isFile() && !info.isSymbolicLink();
+}
+
+function stableFileEvidenceMatches(left, right) {
+  return isStableRegularFile(left)
+    && isStableRegularFile(right)
+    && hasFileIdentity(left, fileIdentity(right))
+    && left.size === right.size
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs;
+}
+
+function digestBytes(data) {
+  return createHash("sha256").update(data).digest("hex");
+}
+
+function absentPublicationExpectation() {
+  return Object.freeze({ state: "absent" });
+}
+
+function presentPublicationExpectation(info, data) {
+  return Object.freeze({
+    state: "present",
+    identity: Object.freeze(fileIdentity(info)),
+    size: info.size,
+    sha256: digestBytes(data),
+  });
+}
+
+export function isPublicationExpectation(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = Object.keys(value).sort();
+  if (value.state === "absent") {
+    return keys.length === 1 && keys[0] === "state";
+  }
+  return value.state === "present"
+    && keys.length === 4
+    && keys[0] === "identity"
+    && keys[1] === "sha256"
+    && keys[2] === "size"
+    && keys[3] === "state"
+    && Number.isSafeInteger(value.identity?.dev)
+    && value.identity.dev >= 0
+    && Number.isSafeInteger(value.identity?.ino)
+    && value.identity.ino >= 0
+    && Number.isSafeInteger(value.size)
+    && value.size >= 0
+    && typeof value.sha256 === "string"
+    && /^[0-9a-f]{64}$/u.test(value.sha256);
+}
+
+async function stablePublicationRead(filePath) {
+  let pathBefore;
+  try {
+    pathBefore = await lstat(filePath);
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+  if (!isStableRegularFile(pathBefore)) {
+    throw new AtomicPublicationConflictError(
+      `Publication destination is not a safe regular file: ${filePath}`,
+    );
+  }
+
+  let handle;
+  try {
+    handle = await open(filePath, "r");
+    const handleBefore = await handle.stat();
+    if (!stableFileEvidenceMatches(pathBefore, handleBefore)) {
+      throw new AtomicPublicationConflictError(
+        `Publication destination changed while capturing ownership: ${filePath}`,
+      );
+    }
+    const data = await handle.readFile();
+    const handleAfter = await handle.stat();
+    let pathAfter;
+    try {
+      pathAfter = await lstat(filePath);
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        throw new AtomicPublicationConflictError(
+          `Publication destination changed while capturing ownership: ${filePath}`,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+    if (!stableFileEvidenceMatches(handleBefore, handleAfter)
+      || !stableFileEvidenceMatches(handleAfter, pathAfter)
+      || data.byteLength !== handleAfter.size) {
+      throw new AtomicPublicationConflictError(
+        `Publication destination changed while capturing ownership: ${filePath}`,
+      );
+    }
+    return {
+      data,
+      expectation: presentPublicationExpectation(handleAfter, data),
+    };
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      throw new AtomicPublicationConflictError(
+        `Publication destination changed while capturing ownership: ${filePath}`,
+        { cause: error },
+      );
+    }
+    throw error;
+  } finally {
+    await handle?.close();
+  }
+}
+
+export async function capturePublicationExpectation(filePath) {
+  const captured = await stablePublicationRead(filePath);
+  return captured?.expectation ?? absentPublicationExpectation();
+}
+
+export async function readFileWithPublicationExpectation(filePath, encoding) {
+  const captured = await stablePublicationRead(filePath);
+  if (!captured) {
+    const error = new Error(`Publication destination is missing: ${filePath}`);
+    error.code = "ENOENT";
+    throw error;
+  }
+  return {
+    data: encoding ? captured.data.toString(encoding) : captured.data,
+    expectation: captured.expectation,
+  };
+}
+
+function syncPublicationExpectation(filePath, fileOps) {
+  const before = publicationInfoOrNull(filePath, fileOps.lstat);
+  if (!before) return absentPublicationExpectation();
+  if (!isStableRegularFile(before)) {
+    throw new AtomicPublicationConflictError(
+      `Captured publication destination is not a safe regular file: ${filePath}`,
+    );
+  }
+  const data = fileOps.readFile(filePath);
+  const after = publicationInfoOrNull(filePath, fileOps.lstat);
+  if (!stableFileEvidenceMatches(before, after)
+    || data.byteLength !== after.size) {
+    throw new AtomicPublicationConflictError(
+      `Captured publication destination changed during verification: ${filePath}`,
+    );
+  }
+  return presentPublicationExpectation(after, data);
+}
+
+function publicationExpectationsEqual(left, right) {
+  if (!isPublicationExpectation(left)
+    || !isPublicationExpectation(right)
+    || left.state !== right.state) return false;
+  if (left.state === "absent") return true;
+  return hasFileIdentity(left.identity, right.identity)
+    && left.size === right.size
+    && left.sha256 === right.sha256;
+}
+
+export function publicationExpectationMatchesFileSync(
+  filePath,
+  expectation,
+  overrides = {},
+) {
+  if (!isPublicationExpectation(expectation)) return false;
+  const fileOps = { ...nativePublicationOps, ...overrides };
+  let current;
+  try {
+    current = syncPublicationExpectation(filePath, fileOps);
+  } catch {
+    return false;
+  }
+  return publicationExpectationsEqual(current, expectation);
 }
 
 function assertUnprotectedDestination(filePath, protectedFiles) {
@@ -158,16 +336,7 @@ function validateRetentionDirectory(filePath, retentionDir, fileOps) {
   }
 }
 
-function sameEntry(left, right) {
-  return Boolean(left && right)
-    && left.isFile() === right.isFile()
-    && left.isDirectory() === right.isDirectory()
-    && left.isSymbolicLink() === right.isSymbolicLink()
-    && hasFileIdentity(left, fileIdentity(right));
-}
-
 function captureDestination(filePath, retentionDir, fileOps) {
-  const observed = publicationInfoOrNull(filePath, fileOps.lstat);
   const slotPath = retainedSlot(retentionDir, "publication", fileOps);
   const capturedPath = path.join(slotPath, "prior");
   let captured = false;
@@ -180,14 +349,24 @@ function captureDestination(filePath, retentionDir, fileOps) {
   const capturedInfo = captured
     ? publicationInfoOrNull(capturedPath, fileOps.lstat)
     : null;
-  return { captured, capturedInfo, capturedPath, observed, slotPath };
+  return { captured, capturedInfo, capturedPath, slotPath };
 }
 
 function restoreSafeCaptured(capture, filePath, fileOps) {
+  const current = publicationInfoOrNull(capture.capturedPath, fileOps.lstat);
   if (!capture.capturedInfo
     || !capture.capturedInfo.isFile()
-    || capture.capturedInfo.isSymbolicLink()) return false;
-  return restoreCapturedNoOverwrite(capture.capturedPath, filePath, fileOps);
+    || capture.capturedInfo.isSymbolicLink()
+    || !current
+    || !current.isFile()
+    || current.isSymbolicLink()
+    || !hasFileIdentity(current, fileIdentity(capture.capturedInfo))) return false;
+  if (!restoreCapturedNoOverwrite(capture.capturedPath, filePath, fileOps)) return false;
+  const restored = publicationInfoOrNull(filePath, fileOps.lstat);
+  return Boolean(restored)
+    && restored.isFile()
+    && !restored.isSymbolicLink()
+    && hasFileIdentity(restored, fileIdentity(capture.capturedInfo));
 }
 
 function retainFailedDestination(filePath, retentionDir, fileOps) {
@@ -208,6 +387,7 @@ function publishProtectedOwnedTempSync({
   identity,
   protectedFiles,
   retentionDir,
+  expectedDestination,
   fileOps: overrides,
 }) {
   const fileOps = { ...nativePublicationOps, ...overrides };
@@ -219,29 +399,36 @@ function publishProtectedOwnedTempSync({
     || !hasFileIdentity(current, identity)) {
     throw new Error(`Owned publication temp identity changed: ${temporary}`);
   }
+  const ownedExpectation = syncPublicationExpectation(temporary, fileOps);
   if (pathIsProtected(filePath, protectedFiles)) {
     throw new AtomicPublicationConflictError(
       `Publication destination is a protected path: ${filePath}`,
     );
   }
+  if (!isPublicationExpectation(expectedDestination)) {
+    throw new AtomicPublicationConflictError(
+      `Protected publication requires a caller-owned destination expectation: ${filePath}`,
+    );
+  }
 
   const capture = captureDestination(filePath, retentionDir, fileOps);
   if (capture.captured) {
-    const safePrior = capture.observed
-      && capture.capturedInfo
-      && sameEntry(capture.observed, capture.capturedInfo)
-      && capture.capturedInfo.isFile()
-      && !capture.capturedInfo.isSymbolicLink()
+    const safePrior = expectedDestination.state === "present"
+      && publicationExpectationMatchesFileSync(
+        capture.capturedPath,
+        expectedDestination,
+        fileOps,
+      )
       && !infoIsProtected(capture.capturedInfo, protectedFiles);
     if (!safePrior) {
       restoreSafeCaptured(capture, filePath, fileOps);
       throw new AtomicPublicationConflictError(
-        `Captured publication destination is protected, foreign, or uncertain: ${filePath}`,
+        `Captured publication destination does not match caller ownership: ${filePath}`,
       );
     }
-  } else if (capture.observed) {
+  } else if (expectedDestination.state === "present") {
     throw new AtomicPublicationConflictError(
-      `Publication destination changed during atomic capture: ${filePath}`,
+      `Expected publication destination disappeared before atomic capture: ${filePath}`,
     );
   }
 
@@ -258,6 +445,13 @@ function publishProtectedOwnedTempSync({
         `Published file identity changed: ${filePath}`,
       );
     }
+    const publishedExpectation = syncPublicationExpectation(filePath, fileOps);
+    if (!publicationExpectationsEqual(publishedExpectation, ownedExpectation)) {
+      throw new AtomicPublicationConflictError(
+        `Published file content changed: ${filePath}`,
+      );
+    }
+    return publishedExpectation;
   } catch (error) {
     if (linked) retainFailedDestination(filePath, retentionDir, fileOps);
     restoreSafeCaptured(capture, filePath, fileOps);
@@ -318,6 +512,7 @@ async function verifyOwnedHandle(reservation, { requireNonEmpty = false } = {}) 
 async function publishAtomically(filePath, publish, {
   protectedFiles = [],
   retentionDir,
+  expectedDestination,
   fileOps,
 } = {}) {
   const protectedMode = protectedFiles.length > 0;
@@ -325,18 +520,20 @@ async function publishAtomically(filePath, publish, {
     retentionDir: protectedMode ? retentionDir : undefined,
   });
   let published = false;
+  let publicationExpectation;
   try {
     await publish(reservation.handle);
     await verifyOwnedHandle(reservation);
     if (protectedMode) {
-      publishProtectedOwnedTempSync({
+      publicationExpectation = publishProtectedOwnedTempSync({
         ...reservation,
         protectedFiles,
         retentionDir,
+        expectedDestination,
         fileOps,
       });
     } else {
-      publishOwnedTempSync({ ...reservation, protectedFiles });
+      publicationExpectation = publishOwnedTempSync({ ...reservation, protectedFiles });
     }
     published = true;
   } finally {
@@ -348,22 +545,25 @@ async function publishAtomically(filePath, publish, {
       }
     }
   }
+  return publicationExpectation;
 }
 
 export async function writeFileAtomic(filePath, data, options) {
-  await publishAtomically(filePath, (handle) => handle.writeFile(data), options);
+  return publishAtomically(filePath, (handle) => handle.writeFile(data), options);
 }
 
 export async function copyFileAtomic(from, to, options) {
-  await publishAtomically(to, async (handle) => handle.writeFile(await readFile(from)), options);
+  return publishAtomically(to, async (handle) => handle.writeFile(await readFile(from)), options);
 }
 
 export async function reserveOwnedArtifact(filePath, {
   protectedFiles = [],
   retentionDir,
+  expectedDestination,
 } = {}) {
   const initialProtectedFiles = protectedFiles;
   const initialRetentionDir = retentionDir;
+  const initialExpectedDestination = expectedDestination;
   const reservation = await reserveOwnedTemp(filePath, {
     retentionDir: protectedFiles.length > 0 ? retentionDir : undefined,
   });
@@ -380,25 +580,32 @@ export async function reserveOwnedArtifact(filePath, {
     async publish({
       protectedFiles: publicationProtectedFiles = initialProtectedFiles,
       retentionDir: publicationRetentionDir = initialRetentionDir,
+      expectedDestination: publicationExpectedDestination = initialExpectedDestination,
     } = {}) {
       if (published || closed) throw new Error("Owned artifact reservation is no longer active");
       await verifyOwnedHandle(reservation, { requireNonEmpty: true });
       protectedMode = publicationProtectedFiles.length > 0;
+      let publicationExpectation;
       if (protectedMode) {
-        publishProtectedOwnedTempSync({
+        publicationExpectation = publishProtectedOwnedTempSync({
           ...reservation,
           protectedFiles: publicationProtectedFiles,
           retentionDir: publicationRetentionDir,
+          expectedDestination: publicationExpectedDestination,
         });
       } else {
-        publishOwnedTempSync({
+        publicationExpectation = publishOwnedTempSync({
           ...reservation,
           protectedFiles: publicationProtectedFiles,
         });
       }
       published = true;
       await close();
-      return { path: filePath, identity: reservation.identity };
+      return {
+        path: filePath,
+        identity: reservation.identity,
+        expectation: publicationExpectation,
+      };
     },
     async discard() {
       try {

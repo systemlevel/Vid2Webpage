@@ -6,6 +6,7 @@ import path from "node:path";
 import { SourceError } from "./errors.mjs";
 import {
   captureFileIdentity,
+  capturePublicationExpectation,
   hasFileIdentity,
   isNonEmptyFile,
   pathsReferToSameFile,
@@ -158,9 +159,11 @@ export async function extractAudio({
     const effectiveProtectedFiles = includesIdentity(protectedFiles, inputIdentity.identity)
       ? protectedFiles
       : [...protectedFiles, inputIdentity];
+    const effectiveRetentionDir = retentionDir ?? await directRetentionDir(outputPath);
     const reservation = await reserveOwnedArtifact(outputPath, {
       protectedFiles: effectiveProtectedFiles,
-      retentionDir: retentionDir ?? await directRetentionDir(outputPath),
+      retentionDir: effectiveRetentionDir,
+      expectedDestination: await capturePublicationExpectation(outputPath),
     });
     try {
       await extractAudio({
@@ -171,7 +174,7 @@ export async function extractAudio({
       });
       return (await reservation.publish({
         protectedFiles: effectiveProtectedFiles,
-        retentionDir: retentionDir ?? await directRetentionDir(outputPath),
+        retentionDir: effectiveRetentionDir,
       })).path;
     } finally {
       await reservation.discard();
@@ -308,9 +311,11 @@ export async function discoverLocalCaption({
       return null;
     }
     try {
+      const effectiveRetentionDir = retentionDir ?? await directRetentionDir(outputPath);
       const reservation = await reserveOwnedArtifact(outputPath, {
         protectedFiles: effectiveProtectedFiles,
-        retentionDir: retentionDir ?? await directRetentionDir(outputPath),
+        retentionDir: effectiveRetentionDir,
+        expectedDestination: await capturePublicationExpectation(outputPath),
       });
       try {
         const result = await discoverLocalCaption({
@@ -325,7 +330,7 @@ export async function discoverLocalCaption({
         if (result?.kind !== "capability-output") return null;
         return (await reservation.publish({
           protectedFiles: result.protectedFiles,
-          retentionDir: retentionDir ?? await directRetentionDir(outputPath),
+          retentionDir: effectiveRetentionDir,
         })).path;
       } finally {
         await reservation.discard();

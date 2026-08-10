@@ -14,6 +14,7 @@ import { extractFrames } from "./frames.mjs";
 import {
   canonicalPath,
   captureFileIdentity,
+  capturePublicationExpectation,
   isNonEmptyFile,
   pathMatchesFileIdentity,
   pathsReferToSameFile,
@@ -149,9 +150,13 @@ async function transcribeAuthoritatively({
 }) {
   const audioOutputPath = path.join(cacheDir, "audio.m4a");
   await rejectProtectedAlias(audioOutputPath, protectedFiles, services, "Audio output");
+  const audioExpectation = protectedFiles.length > 0
+    ? await capturePublicationExpectation(audioOutputPath)
+    : undefined;
   const audioReservation = await reserveOwnedArtifact(audioOutputPath, {
     protectedFiles,
     retentionDir,
+    expectedDestination: audioExpectation,
   });
   let audioArtifact;
   try {
@@ -188,6 +193,8 @@ async function transcribeAuthoritatively({
     cacheDir,
     tools,
     vocabPrompt,
+    protectedFiles,
+    retentionDir,
   });
   if (path.resolve(transcript?.vttPath ?? "") !== path.resolve(canonicalVttPath)
     || !whisperEngines.has(transcript?.engine)) {
@@ -456,6 +463,9 @@ export async function runPipeline(
     const captionReservation = await reserveOwnedArtifact(captionOutputPath, {
       protectedFiles,
       retentionDir: workspace.cacheRetentionDir,
+      expectedDestination: protectedFiles.length > 0
+        ? await capturePublicationExpectation(captionOutputPath)
+        : undefined,
     });
     try {
       const captionResult = await services.materializeLocalCaption({
@@ -511,14 +521,15 @@ export async function runPipeline(
     durationMs: mediaInfo.durationMs,
   });
 
+  const manifestBeforeTranscriptSave = manifest;
   manifest = await workspace.saveManifest({
-    ...manifest,
+    ...manifestBeforeTranscriptSave,
     transcript: {
       engine: transcript.engine,
       filename: "transcript.vtt",
     },
     segments: transcript.segments,
-  });
+  }, { expectedManifest: manifestBeforeTranscriptSave });
   for (const capture of captures) {
     await rejectProtectedAlias(
       path.join(workspace.imagesDir, capture.filename),

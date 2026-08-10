@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
-import { linkSync, renameSync, unlinkSync } from "node:fs";
+import {
+  linkSync,
+  lstatSync,
+  renameSync,
+  unlinkSync,
+} from "node:fs";
 import {
   access,
   link,
@@ -109,11 +114,12 @@ async function createRenderableWorkspace(t, {
     protectedFiles,
   });
   let building = await workspace.loadManifest();
+  const expectedManifest = building;
   building = await workspace.saveManifest({
     ...building,
     transcript: { engine, filename: "cached.vtt" },
     segments,
-  });
+  }, { expectedManifest });
   for (const image of manifest.images) {
     building = await workspace.recordFrame(building, structuredClone(image));
     await writeFile(path.join(workspace.imagesDir, image.filename), "jpeg-bytes");
@@ -425,6 +431,78 @@ test("render publication atomically captures a protected swap at the former rena
     { dev: destinationAfter.dev, ino: destinationAfter.ino },
     { dev: captionBefore.dev, ino: captionBefore.ino },
   );
+});
+
+test("protected render rejects a stable file inserted after expected absence is captured", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "v2w-render-expected-absence-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const outputDir = path.join(dir, "output");
+  const transcriptVttPath = path.join(dir, "cached.vtt");
+  const protectedPath = path.join(dir, "lesson.mov");
+  const foreignPath = path.join(dir, "foreign-render.vtt");
+  const destinationPath = path.join(outputDir, "transcript.vtt");
+  const retentionDir = path.join(dir, "retention");
+  await mkdir(outputDir);
+  await mkdir(retentionDir);
+  await writeFile(transcriptVttPath, "WEBVTT\n\nrendered transcript\n");
+  await writeFile(protectedPath, "protected-video");
+  await writeFile(foreignPath, "stable-foreign-render");
+  const protectedInfo = await stat(protectedPath);
+  const foreignInfo = await stat(foreignPath);
+  let injected = false;
+  let manifestSaves = 0;
+  let completions = 0;
+  const workspace = {
+    outputDir,
+    retentionDir,
+    async withRenderLease(value, operation) {
+      return operation({
+        manifest: value,
+        async saveManifest(saved) {
+          manifestSaves += 1;
+          return saved;
+        },
+        async markComplete(saved) {
+          completions += 1;
+          return { ...saved, status: "complete" };
+        },
+      });
+    },
+  };
+  const fileOps = {
+    lstat(filePath) {
+      if (!injected && filePath === retentionDir) {
+        linkSync(foreignPath, destinationPath);
+        injected = true;
+      }
+      return lstatSync(filePath);
+    },
+  };
+
+  await assert.rejects(renderOutput({
+    workspace,
+    manifest,
+    segments,
+    transcriptVttPath,
+    protectedFiles: [{
+      label: "video",
+      path: protectedPath,
+      canonicalPath: protectedPath,
+      identity: { dev: protectedInfo.dev, ino: protectedInfo.ino },
+    }],
+    fileOps,
+  }));
+
+  assert.equal(injected, true);
+  assert.equal(manifestSaves, 0);
+  assert.equal(completions, 0);
+  assert.equal(await readFile(destinationPath, "utf8"), "stable-foreign-render");
+  const destinationInfo = await stat(destinationPath);
+  assert.deepEqual(
+    { dev: destinationInfo.dev, ino: destinationInfo.ino },
+    { dev: foreignInfo.dev, ino: foreignInfo.ino },
+  );
+  assert.equal(await readFile(foreignPath, "utf8"), "stable-foreign-render");
 });
 
 test("completes a real association-aware workspace without duplicating physical screenshots", async (t) => {
