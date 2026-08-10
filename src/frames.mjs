@@ -1,10 +1,18 @@
 import { randomUUID } from "node:crypto";
-import { open, rename, rm } from "node:fs/promises";
+import { lstat, open, unlink } from "node:fs/promises";
 import path from "node:path";
 
 import { SourceError } from "./errors.mjs";
-import { isNonEmptyFile } from "./fs.mjs";
+import {
+  fileIdentity,
+  hasFileIdentity,
+  isNonEmptyFile,
+  pathIsOwnedRegularFile,
+  pathsReferToSameFile,
+} from "./fs.mjs";
 import { runCommand } from "./process.mjs";
+
+const defaultFileOps = { open, lstat, unlink };
 
 function frameError(filePath, message, cause) {
   return new SourceError(`${message}: ${filePath}`, { cause });
@@ -29,24 +37,88 @@ function safeFramePath(imagesDir, filename) {
   return finalPath;
 }
 
-async function createOwnedTemp(finalPath) {
+function validateCaptureTimestamps(captures, videoPath) {
+  if (!Array.isArray(captures)) {
+    throw frameError(videoPath, "Frame captures must be an array");
+  }
+  for (const capture of captures) {
+    const associations = capture?.associations;
+    if (!Number.isSafeInteger(capture?.requestedMs) || capture.requestedMs < 0
+      || !Number.isSafeInteger(capture?.timestampMs) || capture.timestampMs < 0
+      || !Array.isArray(associations)
+      || associations.some((association) =>
+        !Number.isSafeInteger(association?.segmentIndex) || association.segmentIndex < 0
+        || !Number.isSafeInteger(association?.requestedMs) || association.requestedMs < 0)) {
+      throw frameError(videoPath, "Frame capture has invalid timestamps");
+    }
+  }
+}
+
+async function reservationStillOwned(reservation, fileOps) {
+  try {
+    const handleInfo = await reservation.handle.stat();
+    return handleInfo.isFile()
+      && hasFileIdentity(handleInfo, reservation.tempIdentity)
+      && await pathIsOwnedRegularFile(reservation.tempPath, reservation.tempIdentity, {
+        inspect: fileOps.lstat,
+      });
+  } catch {
+    return false;
+  }
+}
+
+async function cleanupReservation(reservation, fileOps) {
+  const errors = [];
+  if (await reservationStillOwned(reservation, fileOps)) {
+    try {
+      await fileOps.unlink(reservation.tempPath);
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  try {
+    await reservation.handle.close();
+  } catch (error) {
+    errors.push(error);
+  }
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) throw new AggregateError(errors, "Owned frame temp cleanup failed");
+}
+
+async function reserveOwnedTemp(finalPath, { nextTempId, fileOps }) {
   const parsed = path.parse(finalPath);
   for (;;) {
-    const tempPath = path.join(
-      parsed.dir,
-      `${parsed.name}.part-${process.pid}-${randomUUID()}.jpg`,
-    );
+    const id = nextTempId();
+    if (typeof id !== "string" || !/^[0-9a-f-]+$/u.test(id)) {
+      throw frameError(finalPath, "Frame temp identity generator returned an invalid value");
+    }
+    const tempPath = path.join(parsed.dir, `${parsed.name}.part-${process.pid}-${id}.jpg`);
+    let handle;
     try {
-      const handle = await open(tempPath, "wx");
-      try {
-        await handle.close();
-      } catch (error) {
-        await rm(tempPath, { force: true });
-        throw error;
+      handle = await fileOps.open(tempPath, "wx");
+      const info = await handle.stat();
+      if (!info.isFile()) {
+        throw frameError(tempPath, "Reserved frame temp is not a regular file");
       }
-      return tempPath;
+      return { tempPath, tempIdentity: fileIdentity(info), handle };
     } catch (error) {
-      if (error.code === "EEXIST") continue;
+      if (!handle && error.code === "EEXIST") continue;
+      if (handle) {
+        const reservation = {
+          tempPath,
+          tempIdentity: fileIdentity(await handle.stat()),
+          handle,
+        };
+        try {
+          await cleanupReservation(reservation, fileOps);
+        } catch (cleanupError) {
+          throw frameError(
+            tempPath,
+            "Unable to reserve and clean frame temp",
+            new AggregateError([error, cleanupError]),
+          );
+        }
+      }
       throw error;
     }
   }
@@ -64,10 +136,16 @@ function completedFrame(capture, { width, height }) {
   };
 }
 
+function formatTimestampMs(timestampMs) {
+  const seconds = Math.floor(timestampMs / 1000);
+  const milliseconds = String(timestampMs % 1000).padStart(3, "0");
+  return `${seconds}.${milliseconds}`;
+}
+
 export function buildFrameArgs({ videoPath, timestampMs, outputPath }) {
   return [
     "-y",
-    "-ss", (timestampMs / 1000).toFixed(3),
+    "-ss", formatTimestampMs(timestampMs),
     "-i", videoPath,
     "-map", "0:v:0",
     "-frames:v", "1",
@@ -115,18 +193,22 @@ export async function extractFrames({
   manifest,
   run = runCommand,
   log = console,
+  nextTempId = randomUUID,
+  fileOps = {},
 }) {
   if (manifest?.status !== "building") {
     throw frameError(videoPath, "Frames can only be extracted into a building manifest");
   }
+  validateCaptureTimestamps(captures, videoPath);
 
+  const resolvedFileOps = { ...defaultFileOps, ...fileOps };
   let currentManifest = manifest;
   const orderedCaptures = [...captures].sort((left, right) =>
     left.timestampMs - right.timestampMs || left.filename.localeCompare(right.filename));
 
   for (const capture of orderedCaptures) {
     const finalPath = safeFramePath(workspace.imagesDir, capture.filename);
-    if (path.resolve(videoPath) === finalPath) {
+    if (await pathsReferToSameFile(videoPath, finalPath)) {
       throw frameError(videoPath, "Frame output must not overwrite the local video");
     }
 
@@ -139,36 +221,66 @@ export async function extractFrames({
       }
     }
 
-    let tempPath;
-    let published = false;
+    let reservation;
+    let failure;
     try {
-      tempPath = await createOwnedTemp(finalPath);
+      reservation = await reserveOwnedTemp(finalPath, {
+        nextTempId,
+        fileOps: resolvedFileOps,
+      });
       let result;
       try {
         result = await run("ffmpeg", buildFrameArgs({
           videoPath,
           timestampMs: capture.timestampMs,
-          outputPath: tempPath,
+          outputPath: reservation.tempPath,
         }));
       } catch (error) {
         throw frameError(capture.filename, "Unable to extract frame", error);
       }
-      if (result?.code !== 0 || !(await isNonEmptyFile(tempPath))) {
+      if (!(await reservationStillOwned(reservation, resolvedFileOps))) {
+        throw frameError(capture.filename, "Extracted frame temp ownership changed");
+      }
+      if (result?.code !== 0 || !(await isNonEmptyFile(reservation.tempPath))) {
         throw frameError(capture.filename, "Unable to extract a nonempty frame");
       }
 
-      const dimensions = await probeImageDimensions(tempPath, { run });
+      const dimensions = await probeImageDimensions(reservation.tempPath, { run });
+      if (!(await reservationStillOwned(reservation, resolvedFileOps))) {
+        throw frameError(capture.filename, "Extracted frame temp ownership changed");
+      }
+      if (await pathsReferToSameFile(videoPath, finalPath)) {
+        throw frameError(videoPath, "Frame output must not overwrite the local video");
+      }
       const frame = completedFrame(capture, dimensions);
-      await rename(tempPath, finalPath);
-      published = true;
-      currentManifest = await workspace.recordFrame(currentManifest, frame);
+      currentManifest = await workspace.commitFrame(currentManifest, {
+        tempPath: reservation.tempPath,
+        tempIdentity: reservation.tempIdentity,
+        frame,
+      });
       log?.info?.(`Extracted frame ${capture.filename}`);
     } catch (error) {
-      if (error instanceof SourceError) throw error;
-      throw frameError(capture.filename, "Unable to publish extracted frame", error);
-    } finally {
-      if (tempPath && !published) await rm(tempPath, { force: true });
+      failure = error instanceof SourceError
+        ? error
+        : frameError(capture.filename, "Unable to publish extracted frame", error);
     }
+
+    let cleanupError;
+    if (reservation) {
+      try {
+        await cleanupReservation(reservation, resolvedFileOps);
+      } catch (error) {
+        cleanupError = error;
+      }
+    }
+    if (cleanupError) {
+      throw frameError(
+        capture.filename,
+        "Frame temp cleanup failed",
+        new AggregateError(failure ? [failure, cleanupError] : [cleanupError]),
+      );
+    }
+    if (failure) throw failure;
   }
 
   return currentManifest;

@@ -1,8 +1,7 @@
 import path from "node:path";
-import { realpath, stat } from "node:fs/promises";
 
 import { SourceError } from "./errors.mjs";
-import { isNonEmptyFile } from "./fs.mjs";
+import { isNonEmptyFile, pathsReferToSameFile } from "./fs.mjs";
 import { runCommand } from "./process.mjs";
 
 function mediaError(videoPath, message, cause) {
@@ -15,35 +14,6 @@ function frameRate(value) {
     return null;
   }
   return numerator / denominator;
-}
-
-async function canonicalPath(filePath) {
-  try {
-    return await realpath(filePath);
-  } catch {
-    let parentPath;
-    try {
-      parentPath = await realpath(path.dirname(filePath));
-    } catch {
-      parentPath = path.resolve(path.dirname(filePath));
-    }
-    return path.join(parentPath, path.basename(filePath));
-  }
-}
-
-async function pathsReferToSameFile(firstPath, secondPath) {
-  const [firstCanonicalPath, secondCanonicalPath] = await Promise.all([
-    canonicalPath(firstPath),
-    canonicalPath(secondPath),
-  ]);
-  if (firstCanonicalPath === secondCanonicalPath) return true;
-
-  try {
-    const [firstInfo, secondInfo] = await Promise.all([stat(firstPath), stat(secondPath)]);
-    return firstInfo.dev === secondInfo.dev && firstInfo.ino === secondInfo.ino;
-  } catch {
-    return false;
-  }
 }
 
 export function buildExtractAudioArgs(inputPath, outputPath) {

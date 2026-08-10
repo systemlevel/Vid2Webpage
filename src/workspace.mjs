@@ -13,7 +13,11 @@ import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
 import { OutputConflictError } from "./errors.mjs";
-import { isNonEmptyFile, writeFileAtomic } from "./fs.mjs";
+import {
+  isNonEmptyFile,
+  pathIsOwnedRegularFile,
+  writeFileAtomic,
+} from "./fs.mjs";
 
 const manifestFilename = "manifest.json";
 const manifestLockFilename = ".v2w-manifest.lock";
@@ -533,6 +537,25 @@ export async function openWorkspace({ cacheRoot, fingerprint, outputDir, source,
     });
   }
 
+  function validatePreparedFrame({ tempPath, tempIdentity, frame }) {
+    const replacement = validateFrame(frame, imagesDir, { canonical: true });
+    const resolvedImagesDir = path.resolve(imagesDir);
+    const resolvedTempPath = typeof tempPath === "string" ? path.resolve(tempPath) : "";
+    const parsedFrame = path.parse(replacement.filename);
+    const tempBasename = path.basename(resolvedTempPath);
+    if (!resolvedTempPath
+      || path.dirname(resolvedTempPath) !== resolvedImagesDir
+      || !tempBasename.startsWith(`${parsedFrame.name}.part-`)
+      || path.extname(tempBasename).toLowerCase() !== ".jpg"
+      || !isPlainObject(tempIdentity)
+      || !hasExactKeys(tempIdentity, ["dev", "ino"])
+      || !isNonNegativeInteger(tempIdentity.dev)
+      || !isNonNegativeInteger(tempIdentity.ino)) {
+      throw conflict("Prepared frame temp path or identity is invalid");
+    }
+    return { tempPath: resolvedTempPath, tempIdentity, frame: replacement };
+  }
+
   return {
     cacheDir,
     outputDir,
@@ -540,6 +563,46 @@ export async function openWorkspace({ cacheRoot, fingerprint, outputDir, source,
     manifestPath,
     loadManifest,
     saveManifest,
+    async commitFrame(manifestToUpdate, preparedFrame) {
+      validateManifest(manifestToUpdate, fingerprint, imagesDir);
+      if (manifestToUpdate.status !== "building") {
+        throw conflict("Cannot commit frames in a completed manifest");
+      }
+      const prepared = validatePreparedFrame(preparedFrame);
+      const finalPath = assertSafeFilename(prepared.frame.filename, imagesDir);
+      return withMutationLock(manifestLockPath, hooks, async () => {
+        const current = await loadManifest();
+        if (current.status !== "building") {
+          throw conflict("Completed output manifests are immutable");
+        }
+        if (manifestToUpdate.revision !== current.revision) {
+          throw conflict("Workspace manifest revision is stale");
+        }
+        if (!(await pathIsOwnedRegularFile(prepared.tempPath, prepared.tempIdentity))
+          || !(await isNonEmptyFile(prepared.tempPath))) {
+          throw conflict("Prepared frame temp is no longer the owned nonempty file");
+        }
+        const images = [
+          ...current.images.filter((image) => image.filename !== prepared.frame.filename),
+          prepared.frame,
+        ].sort((left, right) => left.timestampMs - right.timestampMs
+          || left.filename.localeCompare(right.filename));
+        const nextManifest = {
+          ...current,
+          images,
+          revision: current.revision + 1,
+        };
+        validateManifest(nextManifest, fingerprint, imagesDir);
+        await rename(prepared.tempPath, finalPath);
+        await hooks.beforeFrameManifestWrite?.({
+          tempPath: prepared.tempPath,
+          finalPath,
+          frame: prepared.frame,
+          manifest: nextManifest,
+        });
+        return writeManifest(nextManifest);
+      });
+    },
     async recordFrame(manifestToUpdate, frame) {
       validateManifest(manifestToUpdate, fingerprint, imagesDir);
       if (manifestToUpdate.status !== "building") {

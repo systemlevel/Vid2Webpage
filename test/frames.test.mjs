@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
 import {
   access,
+  link,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
   readdir,
+  rename,
   rm,
+  symlink,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import os from "node:os";
@@ -59,6 +64,15 @@ function successfulRun({ width = 1920, height = 1080, calls = [] } = {}) {
   };
 }
 
+async function commitPreparedFrame(imagesDir, manifest, { tempPath, frame }) {
+  await rename(tempPath, path.join(imagesDir, frame.filename));
+  return {
+    ...manifest,
+    revision: manifest.revision + 1,
+    images: [...manifest.images.filter((image) => image.filename !== frame.filename), frame],
+  };
+}
+
 test("frame arguments seek to the requested decoded frame and emit one native JPEG", () => {
   const args = buildFrameArgs({
     videoPath: "/video with spaces.mov",
@@ -73,6 +87,19 @@ test("frame arguments seek to the requested decoded frame and emit one native JP
   assert.equal(args.includes("-vf"), false);
   assert.equal(args.includes("-c:v"), false);
   assert.equal(args.includes("-c:a"), false);
+});
+
+test("frame arguments format zero and maximum safe millisecond timestamps exactly", () => {
+  assert.equal(buildFrameArgs({
+    videoPath: "/video.mov",
+    timestampMs: 0,
+    outputPath: "/zero.jpg",
+  })[2], "0.000");
+  assert.equal(buildFrameArgs({
+    videoPath: "/video.mov",
+    timestampMs: Number.MAX_SAFE_INTEGER,
+    outputPath: "/maximum.jpg",
+  })[2], "9007199254740.991");
 });
 
 test("image probing selects the first video stream and returns positive integer dimensions", async () => {
@@ -126,13 +153,10 @@ test("extraction preserves every logical association and publishes native dimens
   const workspace = {
     imagesDir,
     canReuseFrame: async () => false,
-    recordFrame: async (manifest, frame) => {
+    commitFrame: async (manifest, prepared) => {
+      const { frame } = prepared;
       recorded.push(structuredClone(frame));
-      return {
-        ...manifest,
-        revision: manifest.revision + 1,
-        images: [...manifest.images, frame],
-      };
+      return commitPreparedFrame(imagesDir, manifest, prepared);
     },
   };
 
@@ -193,13 +217,10 @@ test("extraction is timestamp-ordered, sequential, and threads each manifest rev
   const workspace = {
     imagesDir,
     canReuseFrame: async () => false,
-    recordFrame: async (manifest, frame) => {
+    commitFrame: async (manifest, prepared) => {
+      const { frame } = prepared;
       recordInputs.push({ revision: manifest.revision, timestampMs: frame.timestampMs });
-      return {
-        ...manifest,
-        revision: manifest.revision + 1,
-        images: [...manifest.images, frame],
-      };
+      return commitPreparedFrame(imagesDir, manifest, prepared);
     },
   };
 
@@ -236,7 +257,7 @@ test("a matching nonempty manifest frame is reused without extraction or mutatio
         reuseChecks.push(structuredClone(frame));
         return true;
       },
-      recordFrame: async () => { throw new Error("must not record a reused frame"); },
+      commitFrame: async () => { throw new Error("must not commit a reused frame"); },
     },
     manifest,
     run: async () => { throw new Error("must not invoke FFmpeg for a reused frame"); },
@@ -263,9 +284,10 @@ test("a stale manifest image is replaced and recorded when reuse is not confirme
         assert.deepEqual(candidate, stale);
         return false;
       },
-      recordFrame: async (manifest, frame) => {
+      commitFrame: async (manifest, prepared) => {
+        const { frame } = prepared;
         recorded = frame;
-        return { ...manifest, revision: 2, images: [frame] };
+        return commitPreparedFrame(imagesDir, manifest, prepared);
       },
     },
     manifest: buildingManifest([stale], 1),
@@ -293,7 +315,7 @@ test("FFmpeg nonzero exit cleans its partial temp and preserves final and foreig
     workspace: {
       imagesDir,
       canReuseFrame: async () => false,
-      recordFrame: async () => { throw new Error("must not record failed output"); },
+      commitFrame: async () => { throw new Error("must not commit failed output"); },
     },
     manifest: buildingManifest(),
     run: async (command, args) => {
@@ -320,7 +342,7 @@ test("FFmpeg success with empty output is fatal and leaves no final image", asyn
     workspace: {
       imagesDir,
       canReuseFrame: async () => false,
-      recordFrame: async () => { throw new Error("must not record empty output"); },
+      commitFrame: async () => { throw new Error("must not commit empty output"); },
     },
     manifest: buildingManifest(),
     run: async (_command, args) => {
@@ -344,7 +366,7 @@ test("invalid probed dimensions clean the owned temp and leave no final image", 
     workspace: {
       imagesDir,
       canReuseFrame: async () => false,
-      recordFrame: async () => { throw new Error("must not record invalid dimensions"); },
+      commitFrame: async () => { throw new Error("must not commit invalid dimensions"); },
     },
     manifest: buildingManifest(),
     run: async (command, args) => {
@@ -396,7 +418,7 @@ test("concurrent invocations exclusively own unique JPEG temp siblings", async (
   const workspace = {
     imagesDir,
     canReuseFrame: async () => false,
-    recordFrame: async (manifest, frame) => ({ ...manifest, revision: 1, images: [frame] }),
+    commitFrame: async (manifest, prepared) => commitPreparedFrame(imagesDir, manifest, prepared),
   };
   const results = await Promise.allSettled([
     extractFrames({
@@ -428,6 +450,279 @@ test("concurrent invocations exclusively own unique JPEG temp siblings", async (
   assert.equal(await readFile(path.join(imagesDir, planned.filename), "utf8"), "winner-jpeg");
 });
 
+test("temp reservation retries an exclusive-name collision without touching the colliding file", async (t) => {
+  const { imagesDir } = await frameFixture(t);
+  const planned = capture();
+  const ids = [
+    "00000000-0000-4000-8000-000000000021",
+    "00000000-0000-4000-8000-000000000022",
+  ];
+  const collisionPath = path.join(
+    imagesDir,
+    `000004250-primary.part-${process.pid}-${ids[0]}.jpg`,
+  );
+  await writeFile(collisionPath, "foreign-collision");
+  let ffmpegOutputPath;
+
+  const result = await extractFrames({
+    videoPath: "/video.mov",
+    captures: [planned],
+    workspace: {
+      imagesDir,
+      canReuseFrame: async () => false,
+      commitFrame: async (manifest, prepared) => commitPreparedFrame(imagesDir, manifest, prepared),
+    },
+    manifest: buildingManifest(),
+    nextTempId: () => ids.shift(),
+    run: async (command, args) => {
+      if (command === "ffmpeg") {
+        ffmpegOutputPath = args.at(-1);
+        await writeFile(ffmpegOutputPath, "jpeg-bytes");
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      return {
+        code: 0,
+        stdout: JSON.stringify({ streams: [{ width: 1920, height: 1080 }] }),
+        stderr: "",
+      };
+    },
+    log: { info() {} },
+  });
+
+  assert.match(ffmpegOutputPath, /00000000-0000-4000-8000-000000000022\.jpg$/u);
+  assert.equal(await readFile(collisionPath, "utf8"), "foreign-collision");
+  assert.equal(result.revision, 1);
+});
+
+test("direct, symlink, and hard-link frame aliases are rejected before FFmpeg", async (t) => {
+  for (const aliasKind of ["direct", "symlink", "hard-link"]) {
+    const root = await mkdtemp(path.join(os.tmpdir(), `v2w-frame-alias-${aliasKind}-`));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const imagesDir = path.join(root, "images");
+    await mkdir(imagesDir);
+    const planned = capture({ filename: "source.jpg" });
+    const sourcePath = aliasKind === "direct"
+      ? path.join(imagesDir, planned.filename)
+      : path.join(root, "source-video.mov");
+    const finalPath = path.join(imagesDir, planned.filename);
+    await writeFile(sourcePath, "original-video-bytes");
+    if (aliasKind === "symlink") await symlink(sourcePath, finalPath);
+    if (aliasKind === "hard-link") await link(sourcePath, finalPath);
+    let runnerCalls = 0;
+
+    await assert.rejects(extractFrames({
+      videoPath: sourcePath,
+      captures: [planned],
+      workspace: {
+        imagesDir,
+        canReuseFrame: async () => false,
+        commitFrame: async () => { throw new Error("must not commit an aliased frame"); },
+      },
+      manifest: buildingManifest(),
+      run: async () => {
+        runnerCalls += 1;
+        throw new Error("must not run for an aliased frame");
+      },
+      log: { info() {} },
+    }), SourceError);
+
+    assert.equal(runnerCalls, 0, aliasKind);
+    assert.equal(await readFile(sourcePath, "utf8"), "original-video-bytes", aliasKind);
+    assert.equal(await readFile(finalPath, "utf8"), "original-video-bytes", aliasKind);
+  }
+});
+
+test("a source alias introduced during extraction is rejected before final replacement", async (t) => {
+  const { root, imagesDir } = await frameFixture(t);
+  const sourcePath = path.join(root, "source-video.mov");
+  const planned = capture();
+  const finalPath = path.join(imagesDir, planned.filename);
+  await writeFile(sourcePath, "original-video-bytes");
+  let committed = false;
+
+  await assert.rejects(extractFrames({
+    videoPath: sourcePath,
+    captures: [planned],
+    workspace: {
+      imagesDir,
+      canReuseFrame: async () => false,
+      commitFrame: async (manifest, prepared) => {
+        committed = true;
+        return commitPreparedFrame(imagesDir, manifest, prepared);
+      },
+    },
+    manifest: buildingManifest(),
+    run: async (command, args) => {
+      if (command === "ffmpeg") {
+        await writeFile(args.at(-1), "jpeg-bytes");
+        await link(sourcePath, finalPath);
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      return {
+        code: 0,
+        stdout: JSON.stringify({ streams: [{ width: 1920, height: 1080 }] }),
+        stderr: "",
+      };
+    },
+    log: { info() {} },
+  }), SourceError);
+
+  assert.equal(committed, false);
+  assert.equal(await readFile(sourcePath, "utf8"), "original-video-bytes");
+  assert.equal(await readFile(finalPath, "utf8"), "original-video-bytes");
+});
+
+test("unsafe timestamp boundaries reject before runner and temp side effects", async (t) => {
+  const { imagesDir } = await frameFixture(t);
+  const invalidCaptures = [
+    capture({ requestedMs: -1 }),
+    capture({ requestedMs: Number.MAX_SAFE_INTEGER + 1 }),
+    capture({ timestampMs: -1 }),
+    capture({ timestampMs: 1.5 }),
+    capture({ timestampMs: Number.MAX_SAFE_INTEGER + 1 }),
+  ];
+  let sideEffects = 0;
+
+  for (const planned of invalidCaptures) {
+    await assert.rejects(extractFrames({
+      videoPath: "/video.mov",
+      captures: [planned],
+      workspace: {
+        imagesDir,
+        canReuseFrame: async () => false,
+        commitFrame: async () => {
+          sideEffects += 1;
+          throw new Error("must not commit invalid timestamps");
+        },
+      },
+      manifest: buildingManifest(),
+      run: async () => {
+        sideEffects += 1;
+        throw new Error("must not run invalid timestamps");
+      },
+      log: { info() {} },
+    }), SourceError);
+  }
+
+  assert.equal(sideEffects, 0);
+  assert.deepEqual(await readdir(imagesDir), []);
+});
+
+test("temp pathname replacement and symlink attacks preserve foreign paths and targets", async (t) => {
+  for (const attackKind of ["replacement", "symlink"]) {
+    const { root, imagesDir } = await frameFixture(t);
+    const planned = capture({ filename: `000004250-${attackKind}.jpg` });
+    const foreignTarget = path.join(root, `${attackKind}-foreign.jpg`);
+    await writeFile(foreignTarget, "foreign-target");
+    let attackedPath;
+
+    await assert.rejects(extractFrames({
+      videoPath: "/video.mov",
+      captures: [planned],
+      workspace: {
+        imagesDir,
+        canReuseFrame: async () => false,
+        commitFrame: async () => { throw new Error("must not commit replaced temp"); },
+      },
+      manifest: buildingManifest(),
+      run: async (command, args) => {
+        assert.equal(command, "ffmpeg");
+        attackedPath = args.at(-1);
+        await unlink(attackedPath);
+        if (attackKind === "symlink") {
+          await symlink(foreignTarget, attackedPath);
+        } else {
+          await writeFile(attackedPath, "foreign-replacement");
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      },
+      log: { info() {} },
+    }), SourceError);
+
+    const attackedInfo = await lstat(attackedPath);
+    assert.equal(attackedInfo.isSymbolicLink(), attackKind === "symlink");
+    assert.equal(
+      await readFile(attackedPath, "utf8"),
+      attackKind === "symlink" ? "foreign-target" : "foreign-replacement",
+    );
+    assert.equal(await readFile(foreignTarget, "utf8"), "foreign-target");
+  }
+});
+
+test("thrown FFmpeg and commit rename failures clean only the still-owned temp", async (t) => {
+  for (const failureKind of ["runner", "rename"]) {
+    const { imagesDir } = await frameFixture(t);
+    const planned = capture({ filename: `000004250-${failureKind}.jpg` });
+    let tempPath;
+    const injected = Object.assign(new Error(`${failureKind} failed`), { code: "EIO" });
+
+    await assert.rejects(extractFrames({
+      videoPath: "/video.mov",
+      captures: [planned],
+      workspace: {
+        imagesDir,
+        canReuseFrame: async () => false,
+        commitFrame: async (_manifest, prepared) => {
+          tempPath = prepared.tempPath;
+          throw injected;
+        },
+      },
+      manifest: buildingManifest(),
+      run: async (command, args) => {
+        if (command === "ffmpeg") {
+          tempPath = args.at(-1);
+          if (failureKind === "runner") throw injected;
+          await writeFile(tempPath, "jpeg-bytes");
+          return { code: 0, stdout: "", stderr: "" };
+        }
+        return {
+          code: 0,
+          stdout: JSON.stringify({ streams: [{ width: 1920, height: 1080 }] }),
+          stderr: "",
+        };
+      },
+      log: { info() {} },
+    }), SourceError);
+
+    await assert.rejects(access(tempPath));
+    await assert.rejects(access(path.join(imagesDir, planned.filename)));
+  }
+});
+
+test("cleanup failure is reported without deleting or losing ownership of the reserved temp", async (t) => {
+  const { imagesDir } = await frameFixture(t);
+  const planned = capture();
+  const runnerFailure = new Error("runner failed");
+  const cleanupFailure = new Error("cleanup failed");
+  let tempPath;
+
+  await assert.rejects(extractFrames({
+    videoPath: "/video.mov",
+    captures: [planned],
+    workspace: {
+      imagesDir,
+      canReuseFrame: async () => false,
+      commitFrame: async () => { throw new Error("must not commit failed extraction"); },
+    },
+    manifest: buildingManifest(),
+    fileOps: {
+      async unlink() {
+        throw cleanupFailure;
+      },
+    },
+    run: async (_command, args) => {
+      tempPath = args.at(-1);
+      throw runnerFailure;
+    },
+    log: { info() {} },
+  }), (error) => error instanceof SourceError
+    && error.cause instanceof AggregateError
+    && error.cause.errors.some((cause) => cause === cleanupFailure)
+    && error.cause.errors.some((cause) => cause.cause === runnerFailure));
+
+  assert.equal((await lstat(tempPath)).isFile(), true);
+});
+
 test("capture failures stop the sequential plan and never publish the failing frame", async (t) => {
   const { imagesDir } = await frameFixture(t);
   const first = capture();
@@ -449,11 +744,7 @@ test("capture failures stop the sequential plan and never publish the failing fr
   const workspace = {
     imagesDir,
     canReuseFrame: async () => false,
-    recordFrame: async (manifest, frame) => ({
-      ...manifest,
-      revision: manifest.revision + 1,
-      images: [...manifest.images, frame],
-    }),
+    commitFrame: async (manifest, prepared) => commitPreparedFrame(imagesDir, manifest, prepared),
   };
 
   await assert.rejects(extractFrames({
@@ -489,7 +780,7 @@ test("extraction rejects unsafe filenames and complete manifests before writing"
   const workspace = {
     imagesDir,
     canReuseFrame: async () => false,
-    recordFrame: async () => { throw new Error("must not record rejected captures"); },
+    commitFrame: async () => { throw new Error("must not commit rejected captures"); },
   };
   const run = async () => { throw new Error("must not run for rejected captures"); };
 
@@ -524,7 +815,7 @@ test("frame extraction never mutates the local video", async (t) => {
     workspace: {
       imagesDir,
       canReuseFrame: async () => false,
-      recordFrame: async (manifest, frame) => ({ ...manifest, revision: 1, images: [frame] }),
+      commitFrame: async (manifest, prepared) => commitPreparedFrame(imagesDir, manifest, prepared),
     },
     manifest: buildingManifest(),
     run: successfulRun(),

@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -86,6 +95,20 @@ async function createWorkspace(t) {
     outputDir: path.join(root, "output"),
     source,
   });
+}
+
+async function preparedFrame(workspace, frame = capture()) {
+  const tempPath = path.join(
+    workspace.imagesDir,
+    `${path.parse(frame.filename).name}.part-${process.pid}-00000000-0000-4000-8000-000000000011.jpg`,
+  );
+  await writeFile(tempPath, "prepared-jpeg");
+  const info = await lstat(tempPath);
+  return {
+    tempPath,
+    tempIdentity: { dev: info.dev, ino: info.ino },
+    frame,
+  };
 }
 
 test("creates cache, output, images, and an atomic building manifest", async (t) => {
@@ -407,6 +430,150 @@ test("concurrent output mutations leave exactly one revision-one terminal or bui
   } else {
     assert.deepEqual(manifest.images.map((image) => image.filename), ["000004000-primary.jpg"]);
   }
+});
+
+test("completion that acquires the lock first rejects a stale frame commit before JPEG rename", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-frame-complete-first-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source,
+  };
+  const completionLocked = deferred();
+  const allowCompletion = deferred();
+  let armCompletion = false;
+  const completing = await openWorkspace({
+    ...options,
+    hooks: {
+      async afterLockPublished() {
+        if (!armCompletion) return;
+        completionLocked.resolve();
+        await allowCompletion.promise;
+      },
+    },
+  });
+  const extracting = await openWorkspace(options);
+  const completionManifest = await completing.loadManifest();
+  const staleFrameManifest = structuredClone(await extracting.loadManifest());
+  const prepared = await preparedFrame(extracting);
+  const finalPath = path.join(extracting.imagesDir, prepared.frame.filename);
+
+  armCompletion = true;
+  const completion = completing.markComplete(completionManifest);
+  await completionLocked.promise;
+  try {
+    await assert.rejects(
+      extracting.commitFrame(staleFrameManifest, prepared),
+      OutputConflictError,
+    );
+  } finally {
+    allowCompletion.resolve();
+  }
+  await assert.rejects(access(finalPath));
+  assert.equal(await readFile(prepared.tempPath, "utf8"), "prepared-jpeg");
+
+  const complete = await completion;
+  assert.equal(complete.status, "complete");
+  assert.deepEqual(complete.images, []);
+  await assert.rejects(access(finalPath));
+});
+
+test("frame commit that acquires the lock first makes concurrent stale completion reject", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-frame-commit-first-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source,
+  };
+  const frameLocked = deferred();
+  const allowFrameCommit = deferred();
+  let armFrame = false;
+  const extracting = await openWorkspace({
+    ...options,
+    hooks: {
+      async afterLockPublished() {
+        if (!armFrame) return;
+        frameLocked.resolve();
+        await allowFrameCommit.promise;
+      },
+    },
+  });
+  const completing = await openWorkspace(options);
+  const frameManifest = await extracting.loadManifest();
+  const staleCompletionManifest = structuredClone(await completing.loadManifest());
+  const prepared = await preparedFrame(extracting);
+  const finalPath = path.join(extracting.imagesDir, prepared.frame.filename);
+
+  armFrame = true;
+  const frameCommit = extracting.commitFrame(frameManifest, prepared);
+  const frameCommitResult = frameCommit.then(
+    (value) => ({ status: "fulfilled", value }),
+    (reason) => ({ status: "rejected", reason }),
+  );
+  const phase = await Promise.race([
+    frameLocked.promise.then(() => "frame-locked"),
+    frameCommitResult.then(() => "frame-settled"),
+  ]);
+  assert.equal(phase, "frame-locked");
+  await assert.rejects(
+    completing.markComplete(staleCompletionManifest),
+    OutputConflictError,
+  );
+  await assert.rejects(access(finalPath));
+
+  allowFrameCommit.resolve();
+  const completedFrameCommit = await frameCommitResult;
+  assert.equal(completedFrameCommit.status, "fulfilled");
+  const building = completedFrameCommit.value;
+  assert.equal(building.status, "building");
+  assert.equal(building.revision, 1);
+  assert.equal(await readFile(finalPath, "utf8"), "prepared-jpeg");
+  const complete = await completing.markComplete(building);
+  assert.equal(complete.status, "complete");
+  assert.deepEqual(complete.images, [prepared.frame]);
+  assert.equal(await readFile(finalPath, "utf8"), "prepared-jpeg");
+});
+
+test("manifest publication failure after frame rename remains building and recoverable", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-frame-manifest-failure-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const failure = new Error("injected manifest write failure");
+  const workspace = await openWorkspace({
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source,
+    hooks: {
+      beforeFrameManifestWrite() {
+        throw failure;
+      },
+    },
+  });
+  const manifest = await workspace.loadManifest();
+  const prepared = await preparedFrame(workspace);
+  const finalPath = path.join(workspace.imagesDir, prepared.frame.filename);
+
+  await assert.rejects(
+    workspace.commitFrame(manifest, prepared),
+    (error) => error === failure,
+  );
+
+  const persisted = await workspace.loadManifest();
+  assert.equal(persisted.status, "building");
+  assert.equal(persisted.revision, 0);
+  assert.deepEqual(persisted.images, []);
+  assert.equal(await readFile(finalPath, "utf8"), "prepared-jpeg");
+  await assert.rejects(access(prepared.tempPath));
+  assert.equal((await openWorkspace({
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source,
+  })).outputDir, workspace.outputDir);
 });
 
 test("rejects empty fingerprints and noncanonical resumed timestamps", async (t) => {
