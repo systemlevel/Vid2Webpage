@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   lstat,
   mkdtemp,
@@ -41,6 +42,10 @@ function identity(info) {
   return { dev: info.dev, ino: info.ino };
 }
 
+function sha256(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
 async function outputInventory(outputDir) {
   const files = [];
   const directories = [];
@@ -59,11 +64,29 @@ async function outputInventory(outputDir) {
   return { files: files.sort(), directories: directories.sort() };
 }
 
+test("fixture and observation helpers delegate logical FFmpeg command names", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-ffmpeg-contract-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const calls = [];
+  const run = async (command, args, options) => {
+    calls.push({ command, args: [...args], options });
+    if (command === "ffmpeg") await writeFile(args.at(-1), "fixture-bytes");
+    return { code: 0, stdout: "", stderr: "" };
+  };
+
+  await createFixtureVideo(root, { run });
+  const observed = createObservedRealRunner({ run });
+  await observed.run("ffprobe", ["-version"]);
+
+  assert.deepEqual(calls.map((call) => call.command), ["ffmpeg", "ffprobe"]);
+});
+
 test("real hard cuts add coalesced native JPEGs through owned stages and render only Whisper text", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "v2w-ffmpeg-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const videoPath = await createFixtureVideo(root);
   const videoBefore = await stat(videoPath);
+  const videoSha256Before = sha256(await readFile(videoPath));
   const protectedVideo = {
     label: "video",
     path: videoPath,
@@ -169,20 +192,32 @@ test("real hard cuts add coalesced native JPEGs through owned stages and render 
   const screenshots = observed.invocations.filter((invocation) =>
     invocation.stageBefore !== undefined);
   assert.equal(screenshots.length, manifest.images.length);
+  const expectedSeekByFilename = new Map([
+    ["000002300-scene.jpg", "2.300"],
+    ["000002500-primary.jpg", "2.500"],
+    ["000004300-primary.jpg", "4.300"],
+  ]);
   for (const invocation of screenshots) {
     assert.equal(invocation.code, 0);
     assert.match(
       path.basename(path.dirname(invocation.outputPath)),
       /^\.v2w-frame-stage-[0-9a-f-]+$/u,
     );
-    assert.ok(invocation.args.includes("-y"));
-    const qualityIndex = invocation.args.indexOf("-q:v");
-    assert.equal(invocation.args[qualityIndex + 1], "2");
-    assert.equal(invocation.args.includes("-s"), false);
-    assert.equal(invocation.args.includes("-vf"), false);
-    assert.equal(invocation.args.includes("-filter:v"), false);
-    assert.equal(invocation.args.includes("-filter_complex"), false);
-    assert.equal(invocation.args.some((argument) => argument.includes("scale=")), false);
+    const filename = path.basename(invocation.outputPath);
+    assert.deepEqual(invocation.args, [
+      "-y",
+      "-ss", expectedSeekByFilename.get(filename),
+      "-i", videoPath,
+      "-map", "0:v:0",
+      "-frames:v", "1",
+      "-q:v", "2",
+      "-update", "1",
+      invocation.outputPath,
+    ]);
+    assert.equal(invocation.args[0], "-y");
+    assert.equal(invocation.args.filter((argument) => argument === "-y").length, 1);
+    assert.equal(invocation.args.filter((argument) => argument === "-q:v").length, 1);
+    assert.equal(invocation.args[invocation.args.indexOf("-q:v") + 1], "2");
     assert.deepEqual(
       {
         size: invocation.stageBefore.size,
@@ -249,6 +284,7 @@ test("real hard cuts add coalesced native JPEGs through owned stages and render 
     /(?:\.part-|\.v2w-frame-stage-|retention|\.(?:mp4|m4a|wav))$/u.test(file)), false);
   assert.deepEqual(identity(await stat(videoPath)), identity(videoBefore));
   assert.equal((await stat(videoPath)).size, videoBefore.size);
+  assert.equal(sha256(await readFile(videoPath)), videoSha256Before);
 
   if (process.env.V2W_FFMPEG_DIAGNOSTICS === "1") {
     t.diagnostic(JSON.stringify({

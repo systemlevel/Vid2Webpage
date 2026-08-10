@@ -3,11 +3,6 @@ import path from "node:path";
 
 import { runCommand } from "../../src/process.mjs";
 
-const executables = Object.freeze({
-  ffmpeg: "/opt/homebrew/bin/ffmpeg",
-  ffprobe: "/opt/homebrew/bin/ffprobe",
-});
-
 function fileSnapshot(info) {
   return {
     dev: info.dev,
@@ -25,7 +20,7 @@ function isScreenshotCommand(command, args) {
     && path.extname(args.at(-1)).toLowerCase() === ".jpg";
 }
 
-export function createObservedRealRunner() {
+export function createObservedRealRunner({ run: delegate = runCommand } = {}) {
   const invocations = [];
   const run = async (command, args, options) => {
     const outputPath = args.at(-1);
@@ -33,7 +28,7 @@ export function createObservedRealRunner() {
     const stageBefore = screenshot
       ? fileSnapshot(await lstat(outputPath))
       : undefined;
-    const result = await runCommand(executables[command] ?? command, args, options);
+    const result = await delegate(command, args, options);
     const stageAfter = screenshot
       ? fileSnapshot(await lstat(outputPath))
       : undefined;
@@ -50,9 +45,9 @@ export function createObservedRealRunner() {
   return { run, invocations };
 }
 
-export async function createFixtureVideo(directory) {
+export async function createFixtureVideo(directory, { run = runCommand } = {}) {
   const outputPath = path.join(directory, "hard-cuts.mp4");
-  const result = await runCommand(executables.ffmpeg, [
+  const result = await run("ffmpeg", [
     "-y",
     "-f", "lavfi", "-i", "color=c=red:s=640x360:r=10:d=2",
     "-f", "lavfi", "-i", "color=c=blue:s=640x360:r=10:d=2",
