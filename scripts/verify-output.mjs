@@ -9,6 +9,212 @@ const requiredFiles = [
   "styles.css",
   "transcript.vtt",
 ];
+const frameKeys = [
+  "associations",
+  "filename",
+  "height",
+  "reasons",
+  "requestedMs",
+  "timestampMs",
+  "width",
+];
+const associationKeys = ["reasons", "requestedMs", "segmentIndex"];
+const segmentKeys = ["endMs", "startMs", "text"];
+const reasonPriority = new Map([
+  ["primary", 0],
+  ["scene", 1],
+  ["caption", 2],
+]);
+
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasExactKeys(value, expectedKeys) {
+  if (!isPlainObject(value)) return false;
+  const actualKeys = Object.keys(value).sort();
+  return sameSortedValues(actualKeys, [...expectedKeys].sort());
+}
+
+function compareReasons(left, right) {
+  return reasonPriority.get(left) - reasonPriority.get(right)
+    || left.localeCompare(right);
+}
+
+function compareReasonArrays(left, right) {
+  for (let index = 0; index < Math.min(left.length, right.length); index += 1) {
+    const comparison = left[index].localeCompare(right[index]);
+    if (comparison !== 0) return comparison;
+  }
+  return left.length - right.length;
+}
+
+function compareAssociations(left, right) {
+  return left.segmentIndex - right.segmentIndex
+    || left.requestedMs - right.requestedMs
+    || compareReasonArrays(left.reasons, right.reasons);
+}
+
+function validateReasons(reasons, description) {
+  assert.ok(
+    Array.isArray(reasons)
+      && reasons.length > 0
+      && reasons.every((reason) => typeof reason === "string" && reasonPriority.has(reason))
+      && new Set(reasons).size === reasons.length,
+    `${description} must contain unique known reasons`,
+  );
+  const canonical = [...reasons].sort(compareReasons);
+  assert.deepEqual(reasons, canonical, `${description} must use canonical reason order`);
+  return canonical;
+}
+
+function validateSegments(segments) {
+  assert.ok(Array.isArray(segments) && segments.length > 0, "Transcript segments must be a nonempty array");
+  for (const [index, segment] of segments.entries()) {
+    assert.ok(hasExactKeys(segment, segmentKeys), `Transcript segment ${index} has an invalid shape`);
+    assert.ok(
+      Number.isSafeInteger(segment.startMs)
+        && segment.startMs >= 0
+        && Number.isSafeInteger(segment.endMs)
+        && segment.endMs > segment.startMs
+        && typeof segment.text === "string",
+      `Transcript segment ${index} has invalid bounds or text`,
+    );
+  }
+}
+
+function assertSafeImageFilename(filename) {
+  assert.ok(
+    typeof filename === "string"
+      && filename.length > 0
+      && filename !== "."
+      && filename !== ".."
+      && filename === path.basename(filename)
+      && !filename.includes("/")
+      && !filename.includes("\\")
+      && filename.toLowerCase().endsWith(".jpg"),
+    `Manifest image filename must be a safe JPEG basename: ${filename}`,
+  );
+}
+
+function validateManifestImages(images, segmentCount) {
+  assert.ok(Array.isArray(images), "Manifest images must be an array");
+  const filenames = [];
+  const filenameSet = new Set();
+  for (const [imageIndex, image] of images.entries()) {
+    assert.ok(hasExactKeys(image, frameKeys), `Frame record ${imageIndex} has an invalid shape`);
+    assert.ok(
+      Number.isSafeInteger(image.requestedMs) && image.requestedMs >= 0
+        && Number.isSafeInteger(image.timestampMs) && image.timestampMs >= 0
+        && Number.isSafeInteger(image.width) && image.width > 0
+        && Number.isSafeInteger(image.height) && image.height > 0,
+      `Frame record ${imageIndex} has invalid timestamps or dimensions`,
+    );
+    assertSafeImageFilename(image.filename);
+    const frameReasons = validateReasons(image.reasons, `Frame record ${imageIndex} reasons`);
+    assert.ok(
+      Array.isArray(image.associations) && image.associations.length > 0,
+      `Frame record ${imageIndex} must include associations`,
+    );
+
+    const associatedSegments = new Set();
+    const associations = image.associations.map((association, associationIndex) => {
+      assert.ok(
+        hasExactKeys(association, associationKeys),
+        `Frame association ${imageIndex}:${associationIndex} has an invalid shape`,
+      );
+      assert.ok(
+        Number.isSafeInteger(association.segmentIndex)
+          && association.segmentIndex >= 0
+          && association.segmentIndex < segmentCount
+          && Number.isSafeInteger(association.requestedMs)
+          && association.requestedMs >= 0,
+        `Frame association ${imageIndex}:${associationIndex} has invalid bounds`,
+      );
+      assert.ok(
+        !associatedSegments.has(association.segmentIndex),
+        `Frame ${imageIndex} associations must contain each segment only once`,
+      );
+      associatedSegments.add(association.segmentIndex);
+      return {
+        segmentIndex: association.segmentIndex,
+        requestedMs: association.requestedMs,
+        reasons: validateReasons(
+          association.reasons,
+          `Frame association ${imageIndex}:${associationIndex} reasons`,
+        ),
+      };
+    });
+
+    assert.deepEqual(
+      associations,
+      [...associations].sort(compareAssociations),
+      `Frame ${imageIndex} associations must use canonical order`,
+    );
+    const associationReasonUnion = [...new Set(
+      associations.flatMap((association) => association.reasons),
+    )].sort(compareReasons);
+    assert.deepEqual(
+      frameReasons,
+      associationReasonUnion,
+      `Frame ${imageIndex} reasons must exactly match the association reason union`,
+    );
+    assert.ok(
+      !filenameSet.has(image.filename),
+      `Duplicate manifest image filename: ${image.filename}`,
+    );
+    filenameSet.add(image.filename);
+    filenames.push(image.filename);
+  }
+  return filenames;
+}
+
+function parseImageReferences(html) {
+  const tags = [...html.matchAll(/<img\b[^>]*>/giu)].map((match) => match[0]);
+  return tags.map((tag, index) => {
+    const assignments = [...tag.matchAll(/\ssrc\s*=/giu)];
+    assert.equal(
+      assignments.length,
+      1,
+      `HTML img ${index} must contain exactly one src attribute`,
+    );
+    const quotedSources = [...tag.matchAll(/\ssrc\s*=\s*(["'])(.*?)\1/giu)];
+    assert.equal(
+      quotedSources.length,
+      1,
+      `HTML img ${index} must contain exactly one quoted src attribute`,
+    );
+    const rawReference = quotedSources[0][2];
+    assert.ok(!rawReference.includes("&"), `HTML img ${index} src must not contain an HTML entity`);
+    assert.ok(
+      !rawReference.includes("?") && !rawReference.includes("#"),
+      `HTML img ${index} src must not contain a raw query or fragment`,
+    );
+    assert.ok(
+      rawReference.startsWith("images/"),
+      `HTML img ${index} src must be a relative images path`,
+    );
+
+    let decodedReference;
+    try {
+      decodedReference = decodeURIComponent(rawReference);
+    } catch (error) {
+      throw new URIError(`HTML img ${index} src has malformed percent encoding`, { cause: error });
+    }
+    const decodedParts = decodedReference.split("/");
+    assert.ok(
+      decodedParts.length === 2
+        && decodedParts[0] === "images"
+        && decodedParts[1].length > 0
+        && decodedParts[1] !== "."
+        && decodedParts[1] !== ".."
+        && !decodedParts[1].includes("\\"),
+      `HTML img ${index} decoded src is not exactly one contained image path: ${decodedReference}`,
+    );
+    assertSafeImageFilename(decodedParts[1]);
+    return decodedReference;
+  });
+}
 
 function containedPath(parent, child) {
   const relative = path.relative(path.resolve(parent), path.resolve(child));
@@ -99,8 +305,11 @@ for (const argument of process.argv.slice(2)) {
 
   const manifest = JSON.parse(manifestText);
   assert.equal(manifest.status, "complete", "manifest status must be complete");
-  assert.ok(Array.isArray(manifest.segments), "manifest segments must be an array");
-  assert.ok(Array.isArray(manifest.images), "manifest images must be an array");
+  validateSegments(manifest.segments);
+  const manifestFilenames = validateManifestImages(
+    manifest.images,
+    manifest.segments.length,
+  );
 
   for (let segmentIndex = 0; segmentIndex < manifest.segments.length; segmentIndex += 1) {
     assert.ok(
@@ -111,31 +320,6 @@ for (const argument of process.argv.slice(2)) {
     );
   }
 
-  const manifestFilenames = [];
-  const filenameSet = new Set();
-  for (const image of manifest.images) {
-    assert.ok(
-      Number.isFinite(image.width) && image.width > 0
-        && Number.isFinite(image.height) && image.height > 0,
-      `Manifest image has invalid dimensions: ${image.filename}`,
-    );
-    assert.ok(
-      typeof image.filename === "string"
-        && image.filename.length > 0
-        && image.filename === path.basename(image.filename)
-        && !image.filename.includes("/")
-        && !image.filename.includes("\\")
-        && image.filename.toLowerCase().endsWith(".jpg"),
-      `Manifest image filename must be a safe JPEG basename: ${image.filename}`,
-    );
-    assert.ok(
-      !filenameSet.has(image.filename),
-      `Duplicate manifest image filename: ${image.filename}`,
-    );
-    filenameSet.add(image.filename);
-    manifestFilenames.push(image.filename);
-  }
-
   const physicalFilenames = await inspectInventory(outputDir);
   const expectedPhysicalFilenames = [...manifestFilenames].sort();
   assert.ok(
@@ -143,17 +327,12 @@ for (const argument of process.argv.slice(2)) {
     `Physical JPEG inventory does not match manifest: actual=${physicalFilenames.join(",")} expected=${expectedPhysicalFilenames.join(",")}`,
   );
 
-  const references = [...html.matchAll(/<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>/giu)]
-    .map((match) => match[1]);
+  const references = parseImageReferences(html);
   for (const reference of references) {
     const referencedPath = path.resolve(outputDir, reference);
     assert.ok(
       containedPath(outputDir, referencedPath),
       `HTML image reference escapes output: ${reference}`,
-    );
-    assert.ok(
-      reference === path.posix.join("images", path.posix.basename(reference)),
-      `HTML image reference is not a contained image path: ${reference}`,
     );
   }
   const uniqueReferences = [...new Set(references)].sort();
