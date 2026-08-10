@@ -1,10 +1,27 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import {
+  access,
+  link,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { copyFileAtomic, isNonEmptyFile, writeFileAtomic } from "../src/fs.mjs";
+import {
+  canonicalPath,
+  captureFileIdentity,
+  copyFileAtomic,
+  isNonEmptyFile,
+  pathMatchesFileIdentity,
+  writeFileAtomic,
+} from "../src/fs.mjs";
 
 test("atomic helpers publish complete files", async (t) => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "v2w-fs-"));
@@ -50,4 +67,35 @@ test("isNonEmptyFile rejects empty and missing paths", async (t) => {
 
   assert.equal(await isNonEmptyFile(empty), false);
   assert.equal(await isNonEmptyFile(path.join(dir, "missing.txt")), false);
+});
+
+test("canonicalPath resolves symlinked existing ancestors of missing descendants", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "v2w-canonical-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const actual = path.join(dir, "actual");
+  const alias = path.join(dir, "alias");
+  await mkdir(actual);
+  await symlink(actual, alias);
+
+  assert.equal(
+    await canonicalPath(path.join(alias, "missing", "output")),
+    path.join(await realpath(actual), "missing", "output"),
+  );
+});
+
+test("captured file identity recognizes direct, symlink, and hard-link aliases", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "v2w-identity-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const original = path.join(dir, "caption.vtt");
+  const symbolic = path.join(dir, "caption-symbolic.vtt");
+  const hard = path.join(dir, "caption-hard.vtt");
+  await writeFile(original, "caption");
+  await symlink(original, symbolic);
+  await link(original, hard);
+  const captured = await captureFileIdentity(original);
+
+  assert.equal(await pathMatchesFileIdentity(original, captured), true);
+  assert.equal(await pathMatchesFileIdentity(symbolic, captured), true);
+  assert.equal(await pathMatchesFileIdentity(hard, captured), true);
+  assert.equal(await pathMatchesFileIdentity(path.join(dir, "missing.vtt"), captured), false);
 });

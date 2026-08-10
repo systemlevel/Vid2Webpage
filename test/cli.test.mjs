@@ -62,14 +62,29 @@ test("passes parsed input, output, cwd, and env to the pipeline", async () => {
   );
 
   assert.equal(code, 0);
-  assert.deepEqual(received, [{
+  assert.deepEqual(received.map(({ onWarning, ...options }) => options), [{
     input: "clip.mov",
     output: "site",
     cwd: "/chosen/work",
     env: { V2W_DEBUG: "0" },
   }]);
+  assert.equal(typeof received[0].onWarning, "function");
   assert.equal(capture.stdout.join(""), "");
   assert.equal(capture.stderr.join(""), "");
+});
+
+test("routes nonfatal pipeline cleanup warnings to stderr without changing success", async () => {
+  const capture = captureIo();
+  const code = await runCli(["clip.mov"], capture.io, async (options) => {
+    options.onWarning("Unable to remove temporary audio: busy");
+  });
+
+  assert.equal(code, 0);
+  assert.equal(capture.stdout.join(""), "");
+  assert.equal(
+    capture.stderr.join(""),
+    "Warning: Unable to remove temporary audio: busy\n",
+  );
 });
 
 test("maps usage errors to exit 2 and prints usage on stderr", async () => {

@@ -48,17 +48,45 @@ export async function isNonEmptyFile(filePath) {
   }
 }
 
-async function canonicalPath(filePath) {
-  try {
-    return await realpath(filePath);
-  } catch {
-    let parentPath;
+export async function canonicalPath(filePath) {
+  let candidate = path.resolve(filePath);
+  const missingSegments = [];
+  for (;;) {
     try {
-      parentPath = await realpath(path.dirname(filePath));
-    } catch {
-      parentPath = path.resolve(path.dirname(filePath));
+      const existingPath = await realpath(candidate);
+      return path.join(existingPath, ...missingSegments);
+    } catch (error) {
+      if (error.code !== "ENOENT" && error.code !== "ENOTDIR") throw error;
+      const parent = path.dirname(candidate);
+      if (parent === candidate) throw error;
+      missingSegments.unshift(path.basename(candidate));
+      candidate = parent;
     }
-    return path.join(parentPath, path.basename(filePath));
+  }
+}
+
+export async function captureFileIdentity(filePath) {
+  const before = await stat(filePath);
+  const canonical = await canonicalPath(filePath);
+  const after = await stat(filePath);
+  if (!before.isFile() || !after.isFile()) {
+    throw new TypeError(`Protected path is not a file: ${filePath}`);
+  }
+  if (!hasFileIdentity(after, fileIdentity(before))) {
+    throw new Error(`Protected file identity changed while inspecting: ${filePath}`);
+  }
+  return {
+    canonicalPath: canonical,
+    identity: fileIdentity(after),
+  };
+}
+
+export async function pathMatchesFileIdentity(filePath, protectedFile) {
+  if (await canonicalPath(filePath) === protectedFile?.canonicalPath) return true;
+  try {
+    return hasFileIdentity(await stat(filePath), protectedFile?.identity);
+  } catch {
+    return false;
   }
 }
 

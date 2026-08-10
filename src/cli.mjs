@@ -33,6 +33,7 @@ export async function runCli(
       output: options.output,
       cwd,
       env,
+      onWarning: (message) => stderr.write(`Warning: ${message}\n`),
     });
     return 0;
   } catch (error) {

@@ -1,11 +1,23 @@
 import { mkdir, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 import { safeOutputName } from "./args.mjs";
-import { TranscriptQualityError, TranscriptionError } from "./errors.mjs";
+import {
+  OutputConflictError,
+  SourceError,
+  TranscriptQualityError,
+  TranscriptionError,
+} from "./errors.mjs";
 import { extractFrames } from "./frames.mjs";
-import { isNonEmptyFile, pathsReferToSameFile } from "./fs.mjs";
+import {
+  canonicalPath,
+  captureFileIdentity,
+  isNonEmptyFile,
+  pathMatchesFileIdentity,
+  pathsReferToSameFile,
+} from "./fs.mjs";
 import { discoverLocalCaption, extractAudio, probeMedia } from "./media.mjs";
 import { defaultCacheRoot, preflight } from "./preflight.mjs";
 import { inspectTranscript } from "./quality.mjs";
@@ -31,6 +43,8 @@ const whisperEngines = new Set(["mlx-whisper", "whisper-cpp"]);
 export const DEFAULT_SERVICES = Object.freeze({
   basenameWithoutExtension: (file) => path.basename(file, path.extname(file)),
   buildCapturePlan,
+  canonicalPath,
+  captureFileIdentity,
   classifySource,
   defaultCacheRoot,
   detectSceneChanges,
@@ -48,6 +62,7 @@ export const DEFAULT_SERVICES = Object.freeze({
   localFingerprint,
   openWorkspace,
   parseVtt,
+  pathMatchesFileIdentity,
   pathsReferToSameFile,
   preflight,
   probeMedia,
@@ -98,7 +113,15 @@ async function reusableTranscript(manifest, cacheDir, services) {
 
   const vttPath = path.join(cacheDir, "transcript.vtt");
   const inspected = await inspectWhisperVtt(vttPath, services);
-  if (!inspected?.quality?.clean) return null;
+  const authoritativeSegments = Array.isArray(manifest.segments)
+    ? manifest.segments.map(({ startMs, endMs, text }) => ({ startMs, endMs, text }))
+    : [];
+  if (!inspected?.quality?.clean
+    || authoritativeSegments.length === 0
+    || !authoritativeSegments.every(isTimedSegment)
+    || !isDeepStrictEqual(authoritativeSegments, inspected.segments)) {
+    return null;
+  }
   return {
     engine: recorded.engine,
     vttPath,
@@ -110,12 +133,23 @@ async function transcribeAuthoritatively({
   videoPath,
   cacheDir,
   tools,
+  protectedFiles,
   services,
 }) {
+  const audioOutputPath = path.join(cacheDir, "audio.m4a");
+  await rejectProtectedAlias(audioOutputPath, protectedFiles, services, "Audio output");
   const audioPath = await services.extractAudio({
     inputPath: videoPath,
-    outputPath: path.join(cacheDir, "audio.m4a"),
+    outputPath: audioOutputPath,
   });
+  await rejectProtectedAlias(audioPath, protectedFiles, services, "Extracted audio");
+  const canonicalVttPath = path.join(cacheDir, "transcript.vtt");
+  await rejectProtectedAlias(
+    canonicalVttPath,
+    protectedFiles,
+    services,
+    "Transcript output",
+  );
   const vocabPrompt = await services.loadVocabPrompt();
   const transcript = await services.transcribeTimed({
     audioPath,
@@ -123,7 +157,6 @@ async function transcribeAuthoritatively({
     tools,
     vocabPrompt,
   });
-  const canonicalVttPath = path.join(cacheDir, "transcript.vtt");
   if (path.resolve(transcript?.vttPath ?? "") !== path.resolve(canonicalVttPath)
     || !whisperEngines.has(transcript?.engine)) {
     throw new TranscriptionError(
@@ -169,19 +202,66 @@ function isContainedCacheFile(file, cacheDir) {
     && !path.isAbsolute(relative);
 }
 
+function pathContainsOrEquals(parent, child) {
+  const relative = path.relative(parent, child);
+  return relative === "" || (!path.isAbsolute(relative)
+    && relative !== ".."
+    && !relative.startsWith(`..${path.sep}`));
+}
+
+async function rejectOutputCacheOverlap(outputDir, cacheDir, services) {
+  const [canonicalOutput, canonicalCache] = await Promise.all([
+    services.canonicalPath(outputDir),
+    services.canonicalPath(cacheDir),
+  ]);
+  if (pathContainsOrEquals(canonicalOutput, canonicalCache)
+    || pathContainsOrEquals(canonicalCache, canonicalOutput)) {
+    throw new OutputConflictError(
+      `Output and cache directories must be isolated: ${outputDir}`,
+    );
+  }
+}
+
+async function rejectProtectedAlias(file, protectedFiles, services, description) {
+  for (const protectedFile of protectedFiles) {
+    if (await services.pathMatchesFileIdentity(file, protectedFile)) {
+      throw new SourceError(
+        `${description} must not alias local ${protectedFile.label}: ${file}`,
+      );
+    }
+  }
+}
+
+async function protectLocalFile(file, label, services) {
+  return {
+    ...(await services.captureFileIdentity(file)),
+    path: file,
+    label,
+  };
+}
+
 async function cleanupAfterSuccess({
   files,
   cacheDir,
-  localSourcePath,
+  onWarning,
+  protectedFiles,
   services,
 }) {
   for (const file of new Set(files)) {
     if (!isContainedCacheFile(file, cacheDir)) continue;
-    if (localSourcePath
-      && await services.pathsReferToSameFile(file, localSourcePath)) {
-      continue;
+    try {
+      if ((await Promise.all(protectedFiles.map((protectedFile) =>
+        services.pathMatchesFileIdentity(file, protectedFile)))).some(Boolean)) continue;
+      await services.removeTemporary(file);
+    } catch (error) {
+      try {
+        onWarning(
+          `Unable to remove temporary file ${file}: ${error?.message ?? String(error)}`,
+        );
+      } catch {
+        // Cleanup warnings must never turn a durable completion into failure.
+      }
     }
-    await services.removeTemporary(file);
   }
 }
 
@@ -211,6 +291,7 @@ export async function runPipeline(
     output,
     cwd = process.cwd(),
     env = process.env,
+    onWarning = () => {},
   },
   services = DEFAULT_SERVICES,
 ) {
@@ -231,7 +312,13 @@ export async function runPipeline(
   }
 
   const cacheDir = services.workspaceCacheDir(cacheRoot, fingerprint);
+  const outputDir = path.resolve(cwd, output ?? services.safeOutputName(title));
+  await rejectOutputCacheOverlap(outputDir, cacheDir, services);
+  const protectedFiles = classified.kind === "local"
+    ? [await protectLocalFile(classified.path, "video", services)]
+    : [];
   await services.ensureDirectory(cacheDir);
+  await rejectOutputCacheOverlap(outputDir, cacheDir, services);
   const cleanupFiles = [];
   let videoPath = classified.path;
   let captionPath = null;
@@ -250,11 +337,27 @@ export async function runPipeline(
 
   const mediaInfo = await services.probeMedia(videoPath);
   if (classified.kind === "local") {
+    const captionOutputPath = path.join(cacheDir, "captions.vtt");
+    await rejectProtectedAlias(
+      captionOutputPath,
+      protectedFiles,
+      services,
+      "Caption cache output",
+    );
     captionPath = await services.discoverLocalCaption({
       videoPath,
       mediaInfo,
-      outputPath: path.join(cacheDir, "captions.vtt"),
+      outputPath: captionOutputPath,
     });
+    if (captionPath) {
+      await rejectProtectedAlias(
+        captionPath,
+        protectedFiles,
+        services,
+        "Local caption",
+      );
+      protectedFiles.push(await protectLocalFile(captionPath, "caption", services));
+    }
   }
 
   const source = manifestSource({
@@ -264,7 +367,7 @@ export async function runPipeline(
     mediaInfo,
     title,
   });
-  const outputDir = path.resolve(cwd, output ?? services.safeOutputName(title));
+  await rejectOutputCacheOverlap(outputDir, cacheDir, services);
   const workspace = await services.openWorkspace({
     cacheRoot,
     fingerprint,
@@ -277,18 +380,26 @@ export async function runPipeline(
     await cleanupAfterSuccess({
       files: cleanupFiles,
       cacheDir,
-      localSourcePath: classified.kind === "local" ? classified.path : null,
+      onWarning,
+      protectedFiles,
       services,
     });
     return manifest;
   }
 
+  await rejectProtectedAlias(
+    path.join(cacheDir, "transcript.vtt"),
+    protectedFiles,
+    services,
+    "Transcript cache",
+  );
   let transcript = await reusableTranscript(manifest, cacheDir, services);
   if (!transcript) {
     transcript = await transcribeAuthoritatively({
       videoPath,
       cacheDir,
       tools,
+      protectedFiles,
       services,
     });
     cleanupFiles.push(transcript.audioPath);
@@ -313,12 +424,29 @@ export async function runPipeline(
     },
     segments: transcript.segments,
   });
+  for (const capture of captures) {
+    await rejectProtectedAlias(
+      path.join(workspace.imagesDir, capture.filename),
+      protectedFiles,
+      services,
+      "Frame output",
+    );
+  }
   manifest = await services.extractFrames({
     videoPath,
     captures,
     workspace,
     manifest,
   });
+  for (const filename of ["transcript.vtt", "styles.css", "index.html"]) {
+    await rejectProtectedAlias(
+      path.join(workspace.outputDir, filename),
+      protectedFiles,
+      services,
+      "Rendered output",
+    );
+  }
+  await rejectOutputCacheOverlap(outputDir, cacheDir, services);
   const completedManifest = await services.renderOutput({
     workspace,
     manifest,
@@ -329,7 +457,8 @@ export async function runPipeline(
   await cleanupAfterSuccess({
     files: cleanupFiles,
     cacheDir,
-    localSourcePath: classified.kind === "local" ? classified.path : null,
+    onWarning,
+    protectedFiles,
     services,
   });
   return completedManifest;

@@ -30,7 +30,10 @@ import test from "node:test";
 
 import { OutputConflictError, SourceError } from "../src/errors.mjs";
 import { extractFrames } from "../src/frames.mjs";
-import { openWorkspace, workspaceCacheDir } from "../src/workspace.mjs";
+import {
+  openWorkspace as openWorkspaceProduction,
+  workspaceCacheDir,
+} from "../src/workspace.mjs";
 
 const source = {
   kind: "local",
@@ -40,11 +43,23 @@ const source = {
   durationMs: 10000,
   width: 640,
   height: 360,
-  initialSegments: [
-    { startMs: 0, endMs: 5_000, text: "first" },
-    { startMs: 5_000, endMs: 10_000, text: "second" },
-  ],
 };
+
+const sourceSegments = [
+  { startMs: 0, endMs: 5_000, text: "first" },
+  { startMs: 5_000, endMs: 10_000, text: "second" },
+];
+
+async function openWorkspace({ seedSegments = true, ...options }) {
+  const workspace = await openWorkspaceProduction(options);
+  if (seedSegments) {
+    const manifest = await workspace.loadManifest();
+    if (manifest.status === "building" && manifest.segments.length === 0) {
+      await workspace.saveManifest({ ...manifest, segments: sourceSegments });
+    }
+  }
+  return workspace;
+}
 
 const manifestLockFilename = ".v2w-manifest.lock";
 const deadOwnerPid = 2147483000;
@@ -104,16 +119,22 @@ function capture({
   return { filename, requestedMs, timestampMs, reasons, associations, width: 640, height: 360 };
 }
 
-async function createWorkspace(t, { hooks = {}, workspaceSource = source } = {}) {
+async function createWorkspace(t, {
+  hooks = {},
+  workspaceSource = source,
+  seedSegments = true,
+} = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "v2w-workspace-"));
   t.after(() => rm(root, { recursive: true, force: true }));
-  return openWorkspace({
+  const workspace = await openWorkspace({
     cacheRoot: path.join(root, "cache"),
     fingerprint: workspaceSource.fingerprint,
     outputDir: path.join(root, "output"),
     source: workspaceSource,
     hooks,
+    seedSegments,
   });
+  return workspace;
 }
 
 async function createRenderLeaseWorkspace(t, options) {
@@ -257,16 +278,16 @@ async function leaveProtectedPriorBackup({
 }
 
 test("creates cache, output, images, and an atomic building manifest", async (t) => {
-  const workspace = await createWorkspace(t);
+  const workspace = await createWorkspace(t, { seedSegments: false });
   const manifest = await workspace.loadManifest();
 
   assert.equal(workspace.cacheDir, workspaceCacheDir(path.dirname(workspace.cacheDir), source.fingerprint));
   assert.deepEqual(manifest, {
     schemaVersion: 1,
     status: "building",
-    source: Object.fromEntries(Object.entries(source).filter(([key]) => key !== "initialSegments")),
+    source,
     transcript: null,
-    segments: source.initialSegments,
+    segments: [],
     images: [],
     revision: 0,
     createdAt: manifest.createdAt,
@@ -560,8 +581,7 @@ test("durable manifest saves reject out-of-range associations", async (t) => {
 });
 
 test("durable manifests reject images when no transcript segments exist", async (t) => {
-  const { initialSegments, ...sourceWithoutSegments } = source;
-  const workspace = await createWorkspace(t, { workspaceSource: sourceWithoutSegments });
+  const workspace = await createWorkspace(t, { seedSegments: false });
   const manifest = await workspace.loadManifest();
   const originalBytes = await readFile(workspace.manifestPath, "utf8");
   await assert.rejects(
@@ -683,9 +703,9 @@ test("serializes revisions and rejects stale save, record, and completion attemp
   const firstManifest = await first.loadManifest();
   const staleManifest = structuredClone(await second.loadManifest());
 
-  assert.equal(firstManifest.revision, 0);
+  assert.equal(firstManifest.revision, 1);
   const advanced = await first.recordFrame(firstManifest, capture());
-  assert.equal(advanced.revision, 1);
+  assert.equal(advanced.revision, 2);
   const advancedBytes = await readFile(first.manifestPath, "utf8");
 
   for (const mutate of [
@@ -698,7 +718,7 @@ test("serializes revisions and rejects stale save, record, and completion attemp
   }
 });
 
-test("concurrent output mutations leave exactly one revision-one terminal or building result", async (t) => {
+test("concurrent output mutations leave exactly one terminal or building result", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "v2w-concurrent-revision-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const options = {
@@ -721,7 +741,7 @@ test("concurrent output mutations leave exactly one revision-one terminal or bui
   assert.ok(results.some((result) => result.status === "rejected" && result.reason instanceof OutputConflictError));
 
   const manifest = await (await openWorkspace(options)).loadManifest();
-  assert.equal(manifest.revision, 1);
+  assert.equal(manifest.revision, 2);
   if (manifest.status === "complete") {
     assert.equal(manifest.images.length, 0);
   } else {
@@ -850,7 +870,7 @@ test("frame lease keeps completion inventory out until extraction and stage clea
   allowFfmpeg.resolve();
   const building = await extraction;
   assert.equal(scansDuringFrameLease, 0);
-  assert.equal(building.revision, 1);
+  assert.equal(building.revision, 2);
   assert.deepEqual(await readdir(extracting.imagesDir), [planned.filename]);
   const complete = await completing.markComplete(building);
   assert.equal(complete.status, "complete");
@@ -909,7 +929,7 @@ test("frame commit that acquires the lock first makes concurrent stale completio
     OutputConflictError,
   );
   assert.equal(building.status, "building");
-  assert.equal(building.revision, 1);
+  assert.equal(building.revision, 2);
   assert.equal(await readFile(finalPath, "utf8"), "prepared-jpeg");
   const complete = await completing.markComplete(building);
   assert.equal(complete.status, "complete");
@@ -970,7 +990,7 @@ test("manifest publication failure after frame rename remains building and recov
   const persisted = await workspace.loadManifest();
   const persistedBytes = await readFile(workspace.manifestPath, "utf8");
   assert.equal(persisted.status, "building");
-  assert.equal(persisted.revision, 0);
+  assert.equal(persisted.revision, 1);
   assert.deepEqual(persisted.images, []);
   assert.equal(await readFile(finalPath, "utf8"), "prepared-jpeg");
   assert.deepEqual(await readdir(workspace.imagesDir), [planned.filename]);
@@ -999,7 +1019,7 @@ test("manifest publication failure after frame rename remains building and recov
     },
     log: { info() {} },
   });
-  assert.equal(recovered.revision, 1);
+  assert.equal(recovered.revision, 2);
   assert.equal(await readFile(finalPath, "utf8"), "recovered-jpeg");
   const complete = await resumed.markComplete(recovered);
   assert.equal(complete.status, "complete");
@@ -1069,7 +1089,7 @@ test("prior final is restored after no-overwrite publication failure and resumed
     log: { info() {} },
   }), (error) => error instanceof SourceError && error.cause === publicationFailure);
 
-  assert.equal((await failingWorkspace.loadManifest()).revision, 1);
+  assert.equal((await failingWorkspace.loadManifest()).revision, 2);
   assert.equal(await readFile(finalPath, "utf8"), "prior-jpeg");
   await assertProtectedPriorBackup(failingWorkspace.imagesDir, "prior-jpeg");
 
@@ -1082,7 +1102,7 @@ test("prior final is restored after no-overwrite publication failure and resumed
     run: runner("recovered-jpeg"),
     log: { info() {} },
   });
-  assert.equal(recovered.revision, 2);
+  assert.equal(recovered.revision, 3);
   assert.equal(await readFile(finalPath, "utf8"), "recovered-jpeg");
   assert.equal((await resumed.markComplete(recovered)).status, "complete");
 });
@@ -1681,7 +1701,7 @@ test("post-manifest backup cleanup failure leaves a committed stage that resume 
 
   assert.equal(cleanupAttempts, 1);
   const replaced = await replacingWorkspace.loadManifest();
-  assert.equal(replaced.revision, 2);
+  assert.equal(replaced.revision, 3);
   assert.equal((await frameStageNames(replacingWorkspace.imagesDir)).length, 1);
 
   const resumed = await openWorkspace(options);
@@ -1807,7 +1827,7 @@ test("atomic no-overwrite rejects a source alias introduced in the final publica
   assert.equal(await readFile(prepared.sourcePath, "utf8"), "source-video-bytes");
   assert.equal(await readFile(finalPath, "utf8"), "source-video-bytes");
   assert.equal(await readFile(prepared.tempPath, "utf8"), "prepared-jpeg");
-  assert.equal((await workspace.loadManifest()).revision, 0);
+  assert.equal((await workspace.loadManifest()).revision, 1);
 });
 
 test("publication rechecks the retained staged inode synchronously and a real resume cleans the owned residue", async (t) => {
@@ -1861,7 +1881,7 @@ test("publication rechecks the retained staged inode synchronously and a real re
   assert.equal(await readFile(replacementPath, "utf8"), "foreign-member-bytes");
   assert.deepEqual(identity(await lstat(videoPath)), sourceIdentity);
   assert.equal(await readFile(videoPath, "utf8"), "source-video-bytes");
-  assert.equal((await workspace.loadManifest()).revision, 0);
+  assert.equal((await workspace.loadManifest()).revision, 1);
   const [stageName] = await frameStageNames(workspace.imagesDir);
   const stagePath = path.join(workspace.imagesDir, stageName);
   const token = stageName.slice(".v2w-frame-stage-".length);
@@ -2434,7 +2454,7 @@ test("a creator killed before lock publication cannot strand first-time initiali
     await assert.doesNotReject(access(prepared.candidatePath));
 
     const workspace = await openWorkspace(options);
-    assert.equal((await workspace.loadManifest()).revision, 0);
+    assert.equal((await workspace.loadManifest()).revision, 1);
   } finally {
     if (child.exitCode === null && child.signalCode === null) {
       const childExit = once(child, "exit");
@@ -2563,7 +2583,7 @@ test("two stale reclaimers cannot both own or delete a replacement lock", async 
     allowFirstMutation.resolve();
     const completedFirst = await firstResult;
     assert.equal(completedFirst.status, "fulfilled");
-    assert.equal(completedFirst.value.revision, 1);
+    assert.equal(completedFirst.value.revision, 2);
   } finally {
     allowFirstUnlink.resolve();
     allowSecondUnlink.resolve();
@@ -2576,7 +2596,7 @@ test("two stale reclaimers cannot both own or delete a replacement lock", async 
   assert.ok(results.some((result) => result.status === "rejected"
     && result.reason instanceof OutputConflictError));
   const persisted = await first.loadManifest();
-  assert.equal(persisted.revision, 1);
+  assert.equal(persisted.revision, 2);
   await assert.rejects(access(lockPath));
 });
 
@@ -2658,7 +2678,7 @@ test("a delayed stale reclaimer cannot remove a live replacement owner", async (
     allowReplacement.resolve();
     const completedReplacement = await replacementResult;
     assert.equal(completedReplacement.status, "fulfilled");
-    assert.equal(completedReplacement.value.revision, 1);
+    assert.equal(completedReplacement.value.revision, 2);
     await assert.rejects(access(lockPath));
   } finally {
     allowStaleReclaimer.resolve();
@@ -2755,12 +2775,12 @@ test("lock publication is complete and failed acquisition cleans only its candid
     allowReplacement.resolve();
     const completedReplacement = await replacementResult;
     assert.equal(completedReplacement.status, "fulfilled");
-    assert.equal(completedReplacement.value.revision, 1);
+    assert.equal(completedReplacement.value.revision, 2);
     await assert.rejects(access(lockPath));
 
     await mkdir(lockPath);
     const afterInterruptedRecovery = await candidateWorkspace.saveManifest(completedReplacement.value);
-    assert.equal(afterInterruptedRecovery.revision, 2);
+    assert.equal(afterInterruptedRecovery.revision, 3);
     await assert.rejects(access(lockPath));
   } finally {
     allowCandidatePublication.resolve();

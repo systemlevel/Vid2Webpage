@@ -474,13 +474,12 @@ async function readManifest(manifestPath, fingerprint, imagesDir) {
 }
 
 function initialManifest(source) {
-  const { initialSegments = [], ...manifestSource } = source;
   return {
     schemaVersion: 1,
     status: "building",
-    source: manifestSource,
+    source,
     transcript: null,
-    segments: initialSegments,
+    segments: [],
     images: [],
     revision: 0,
     createdAt: new Date().toISOString(),

@@ -4,6 +4,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   rm,
   stat,
   symlink,
@@ -15,6 +16,7 @@ import test from "node:test";
 
 import { safeOutputName } from "../src/args.mjs";
 import { runPipeline } from "../src/app.mjs";
+import { OutputConflictError, SourceError } from "../src/errors.mjs";
 import { isNonEmptyFile, pathsReferToSameFile } from "../src/fs.mjs";
 import { parseVtt } from "../src/vtt.mjs";
 
@@ -41,15 +43,19 @@ async function makeHarness({
   captionPath = null,
   completed = false,
   manifestTranscript = null,
+  manifestSegments,
   cachedTranscriptText,
   extractedAudioPath,
   downloadedVideoPath,
   failRender = false,
+  cacheRoot: selectedCacheRoot,
+  removalFailures = [],
+  renderHook,
 } = {}) {
   const calls = [];
   const removed = [];
   const fingerprint = `${kind}-fingerprint`;
-  const cacheRoot = path.join(root, "cache");
+  const cacheRoot = selectedCacheRoot ?? path.join(root, "cache");
   const cacheDir = path.join(cacheRoot, fingerprint);
   await mkdir(cacheDir, { recursive: true });
   if (cachedTranscriptText !== undefined) {
@@ -61,9 +67,9 @@ async function makeHarness({
     status: completed ? "complete" : "building",
     source: null,
     transcript: manifestTranscript,
-    segments: completed
+    segments: manifestSegments ?? (completed
       ? [{ startMs: 0, endMs: 8_000, text: "Already complete" }]
-      : [],
+      : []),
     images: [],
     revision: 0,
   };
@@ -259,15 +265,43 @@ async function makeHarness({
       assert.doesNotMatch(JSON.stringify(segments), /caption poison|returned cue poison/);
       assert.equal(transcriptVttPath, path.join(cacheDir, "transcript.vtt"));
       if (failRender) throw new Error("render failed");
+      await renderHook?.();
       return { ...value, status: "complete", segments };
     },
     removeTemporary: async (file) => {
       calls.push(`remove:${path.basename(file)}`);
       removed.push(file);
+      if (removalFailures.includes(path.basename(file))) {
+        throw new Error(`cannot remove ${path.basename(file)}`);
+      }
       await rm(file, { force: true });
     },
     isNonEmptyFile,
     pathsReferToSameFile,
+    canonicalPath: async (file) => {
+      try {
+        return await realpath(file);
+      } catch {
+        return path.join(await realpath(path.dirname(file)), path.basename(file));
+      }
+    },
+    captureFileIdentity: async (file) => {
+      const info = await stat(file);
+      return {
+        canonicalPath: await realpath(file),
+        identity: { dev: info.dev, ino: info.ino },
+      };
+    },
+    pathMatchesFileIdentity: async (file, protectedFile) => {
+      try {
+        const info = await stat(file);
+        const canonical = await realpath(file);
+        return canonical === protectedFile.canonicalPath
+          || (info.dev === protectedFile.identity.dev && info.ino === protectedFile.identity.ino);
+      } catch {
+        return false;
+      }
+    },
     safeOutputName,
     basenameWithoutExtension: (file) => path.basename(file, path.extname(file)),
     readText: (file) => readFile(file, "utf8"),
@@ -375,6 +409,7 @@ test("reuses only a recorded nonempty clean Whisper transcript", async (t) => {
     sourcePath,
     captionPath: sidecarPath,
     manifestTranscript: { engine: "mlx-whisper", filename: "transcript.vtt" },
+    manifestSegments: parseVtt(whisperVtt),
     cachedTranscriptText: whisperVtt,
   });
 
@@ -390,6 +425,34 @@ test("reuses only a recorded nonempty clean Whisper transcript", async (t) => {
   assert.deepEqual(harness.removed, []);
 });
 
+test("retranscribes when clean cached VTT does not match persisted Whisper segments", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-app-provenance-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const sourcePath = path.join(root, "lesson.mov");
+  const sidecarPath = path.join(root, "lesson.vtt");
+  await writeFile(sourcePath, "local-video");
+  await writeFile(sidecarPath, captionVtt);
+  const harness = await makeHarness({
+    kind: "local",
+    root,
+    sourcePath,
+    captionPath: sidecarPath,
+    manifestTranscript: { engine: "mlx-whisper", filename: "transcript.vtt" },
+    manifestSegments: parseVtt(whisperVtt),
+    cachedTranscriptText: captionVtt,
+  });
+
+  const result = await runPipeline({
+    input: sourcePath,
+    cwd: root,
+    env: { XDG_CACHE_HOME: path.join(root, "cache-parent") },
+  }, harness.services);
+
+  assert.equal(harness.calls.filter((call) => call === "transcribe").length, 1);
+  assert.deepEqual(result.segments, parseVtt(whisperVtt));
+  assert.doesNotMatch(JSON.stringify(result.segments), /caption poison/);
+});
+
 for (const invalidCache of [
   { name: "empty", text: "", transcript: { engine: "mlx-whisper", filename: "transcript.vtt" } },
   { name: "unparseable", text: "not a VTT", transcript: { engine: "mlx-whisper", filename: "transcript.vtt" } },
@@ -397,6 +460,7 @@ for (const invalidCache of [
   { name: "unrecorded", text: whisperVtt, transcript: null },
   { name: "wrong engine", text: whisperVtt, transcript: { engine: "caption-import", filename: "transcript.vtt" } },
   { name: "wrong filename", text: whisperVtt, transcript: { engine: "mlx-whisper", filename: "../transcript.vtt" } },
+  { name: "missing provenance", text: whisperVtt, transcript: { engine: "mlx-whisper", filename: "transcript.vtt" } },
 ]) {
   test(`retranscribes instead of reusing the ${invalidCache.name} cache`, async (t) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "v2w-app-invalid-cache-"));
@@ -427,7 +491,7 @@ for (const invalidCache of [
 }
 
 for (const aliasKind of ["direct", "symlink", "hard-link"]) {
-  test(`successful cleanup never removes a ${aliasKind} alias of the local source`, async (t) => {
+  test(`rejects a returned ${aliasKind} audio alias of the local source`, async (t) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "v2w-app-alias-"));
     t.after(() => rm(root, { recursive: true, force: true }));
     const sourcePath = path.join(root, "lesson.mov");
@@ -453,17 +517,17 @@ for (const aliasKind of ["direct", "symlink", "hard-link"]) {
       extractedAudioPath: audioAlias,
     });
 
-    const result = await runPipeline({
+    await assert.rejects(runPipeline({
       input: sourcePath,
       cwd: root,
       env: { XDG_CACHE_HOME: path.join(root, "cache-parent") },
-    }, harness.services);
+    }, harness.services), SourceError);
 
-    assert.equal(result.status, "complete");
     assert.equal(await readFile(sourcePath, "utf8"), "local-video");
     assert.equal(await readFile(sidecarPath, "utf8"), captionVtt);
     assert.equal((await stat(audioAlias)).isFile(), true);
     assert.deepEqual(harness.removed, []);
+    assert.equal(harness.calls.includes("transcribe"), false);
   });
 }
 
@@ -496,6 +560,224 @@ for (const aliasKind of ["symlink", "hard-link"]) {
     assert.equal(await readFile(captionAlias, "utf8"), captionVtt);
   });
 }
+
+for (const aliasKind of ["symlink", "hard-link"]) {
+  test(`rejects audio extraction before its cache destination can overwrite a ${aliasKind} caption alias`, async (t) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "v2w-app-caption-destination-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const sourcePath = path.join(root, "lesson.mov");
+    const sidecarPath = path.join(root, "lesson.vtt");
+    await writeFile(sourcePath, "local-video");
+    await writeFile(sidecarPath, captionVtt);
+    const before = await stat(sidecarPath);
+    const harness = await makeHarness({
+      kind: "local",
+      root,
+      sourcePath,
+      captionPath: sidecarPath,
+    });
+    const audioPath = path.join(harness.cacheDir, "audio.m4a");
+    if (aliasKind === "symlink") await symlink(sidecarPath, audioPath);
+    else await link(sidecarPath, audioPath);
+
+    await assert.rejects(runPipeline({
+      input: sourcePath,
+      cwd: root,
+      env: { XDG_CACHE_HOME: path.join(root, "cache-parent") },
+    }, harness.services), SourceError);
+
+    const after = await stat(sidecarPath);
+    assert.deepEqual({ dev: after.dev, ino: after.ino }, { dev: before.dev, ino: before.ino });
+    assert.equal(await readFile(sidecarPath, "utf8"), captionVtt);
+    assert.equal(await readFile(audioPath, "utf8"), captionVtt);
+    assert.equal(harness.calls.includes("extract-audio"), false);
+  });
+}
+
+test("rejects a returned temporary path that directly aliases the local caption", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-app-returned-caption-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const sourcePath = path.join(root, "lesson.mov");
+  const sidecarPath = path.join(root, "lesson.vtt");
+  await writeFile(sourcePath, "local-video");
+  await writeFile(sidecarPath, captionVtt);
+  const before = await stat(sidecarPath);
+  const harness = await makeHarness({
+    kind: "local",
+    root,
+    sourcePath,
+    captionPath: sidecarPath,
+    extractedAudioPath: sidecarPath,
+  });
+
+  await assert.rejects(runPipeline({
+    input: sourcePath,
+    cwd: root,
+    env: { XDG_CACHE_HOME: path.join(root, "cache-parent") },
+  }, harness.services), SourceError);
+
+  const after = await stat(sidecarPath);
+  assert.deepEqual({ dev: after.dev, ino: after.ino }, { dev: before.dev, ino: before.ino });
+  assert.equal(await readFile(sidecarPath, "utf8"), captionVtt);
+  assert.equal(harness.calls.includes("transcribe"), false);
+  assert.deepEqual(harness.removed, []);
+});
+
+for (const aliasKind of ["symlink", "hard-link"]) {
+  test(`successful cleanup skips an audio target replaced by a ${aliasKind} caption alias`, async (t) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "v2w-app-cleanup-caption-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const sourcePath = path.join(root, "lesson.mov");
+    const sidecarPath = path.join(root, "lesson.vtt");
+    await writeFile(sourcePath, "local-video");
+    await writeFile(sidecarPath, captionVtt);
+    const sidecarBefore = await stat(sidecarPath);
+    let audioPath;
+    const harness = await makeHarness({
+      kind: "local",
+      root,
+      sourcePath,
+      captionPath: sidecarPath,
+      renderHook: async () => {
+        await rm(audioPath);
+        if (aliasKind === "symlink") await symlink(sidecarPath, audioPath);
+        else await link(sidecarPath, audioPath);
+      },
+    });
+    audioPath = path.join(harness.cacheDir, "audio.m4a");
+
+    const result = await runPipeline({
+      input: sourcePath,
+      cwd: root,
+      env: { XDG_CACHE_HOME: path.join(root, "cache-parent") },
+    }, harness.services);
+
+    assert.equal(result.status, "complete");
+    assert.equal(await readFile(sidecarPath, "utf8"), captionVtt);
+    assert.equal(await readFile(audioPath, "utf8"), captionVtt);
+    assert.deepEqual(
+      { dev: (await stat(sidecarPath)).dev, ino: (await stat(sidecarPath)).ino },
+      { dev: sidecarBefore.dev, ino: sidecarBefore.ino },
+    );
+    assert.deepEqual(harness.removed, []);
+  });
+}
+
+for (const relation of ["equal", "descendant", "ancestor", "symlink alias"]) {
+  test(`rejects output with ${relation} canonical overlap with the fingerprint cache`, async (t) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "v2w-app-isolation-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const harness = await makeHarness({ kind: "youtube", root });
+    let output = harness.cacheDir;
+    if (relation === "descendant") output = path.join(harness.cacheDir, "site");
+    if (relation === "ancestor") output = path.dirname(harness.cacheDir);
+    if (relation === "symlink alias") {
+      output = path.join(root, "cache-alias");
+      await symlink(harness.cacheDir, output);
+    }
+
+    await assert.rejects(runPipeline({
+      input: "https://youtu.be/abc",
+      output,
+      cwd: root,
+      env: { XDG_CACHE_HOME: path.join(root, "cache-parent") },
+    }, harness.services), OutputConflictError);
+
+    assert.equal(harness.calls.includes("download-media"), false);
+  });
+}
+
+test("rejects a generated output that canonically contains its fingerprint cache", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-app-default-isolation-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const sourcePath = path.join(root, "lesson.mov");
+  const sidecarPath = path.join(root, "lesson.vtt");
+  await writeFile(sourcePath, "local-video");
+  await writeFile(sidecarPath, captionVtt);
+  const harness = await makeHarness({
+    kind: "local",
+    root,
+    sourcePath,
+    captionPath: sidecarPath,
+    cacheRoot: path.join(root, "lesson"),
+  });
+
+  await assert.rejects(runPipeline({
+    input: sourcePath,
+    cwd: root,
+    env: { XDG_CACHE_HOME: path.join(root, "cache-parent") },
+  }, harness.services), OutputConflictError);
+
+  assert.equal(harness.calls.includes("probe-media"), false);
+});
+
+test("keeps a completed result and warns while continuing best-effort cleanup", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-app-cleanup-warning-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const warnings = [];
+  const harness = await makeHarness({
+    kind: "youtube",
+    root,
+    removalFailures: ["audio.m4a"],
+  });
+
+  const result = await runPipeline({
+    input: "https://youtu.be/abc",
+    cwd: root,
+    env: { XDG_CACHE_HOME: path.join(root, "cache-parent") },
+    onWarning: (message) => warnings.push(message),
+  }, harness.services);
+
+  assert.equal(result.status, "complete");
+  assert.deepEqual(
+    harness.removed.map((file) => path.basename(file)),
+    ["source.webm", "audio.m4a"],
+  );
+  await assert.rejects(stat(harness.videoPath));
+  assert.equal(await readFile(path.join(harness.cacheDir, "audio.m4a"), "utf8"), "audio");
+  assert.deepEqual(warnings, [
+    `Unable to remove temporary file ${path.join(harness.cacheDir, "audio.m4a")}: cannot remove audio.m4a`,
+  ]);
+  assert.equal(Object.hasOwn(result, "warnings"), false);
+});
+
+test("keeps a completed result when a cleanup identity check fails", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-app-cleanup-identity-warning-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const sourcePath = path.join(root, "lesson.mov");
+  const sidecarPath = path.join(root, "lesson.vtt");
+  await writeFile(sourcePath, "local-video");
+  await writeFile(sidecarPath, captionVtt);
+  let rendered = false;
+  const warnings = [];
+  const harness = await makeHarness({
+    kind: "local",
+    root,
+    sourcePath,
+    captionPath: sidecarPath,
+    renderHook: async () => { rendered = true; },
+  });
+  const matchIdentity = harness.services.pathMatchesFileIdentity;
+  harness.services.pathMatchesFileIdentity = async (...args) => {
+    if (rendered) throw new Error("identity probe failed");
+    return matchIdentity(...args);
+  };
+
+  const result = await runPipeline({
+    input: sourcePath,
+    cwd: root,
+    env: { XDG_CACHE_HOME: path.join(root, "cache-parent") },
+    onWarning: (message) => warnings.push(message),
+  }, harness.services);
+
+  assert.equal(result.status, "complete");
+  assert.deepEqual(harness.removed, []);
+  assert.deepEqual(warnings, [
+    `Unable to remove temporary file ${path.join(harness.cacheDir, "audio.m4a")}: identity probe failed`,
+  ]);
+  assert.equal(await readFile(sourcePath, "utf8"), "local-video");
+  assert.equal(await readFile(sidecarPath, "utf8"), captionVtt);
+});
 
 test("does not clean a downloaded path outside the fingerprint cache", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "v2w-app-cleanup-boundary-"));

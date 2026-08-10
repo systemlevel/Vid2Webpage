@@ -46,6 +46,43 @@ test("keeps every segment midpoint and adds caption and scene captures", () => {
   );
 });
 
+test("rounds clamped fractional requests to the nearest integer millisecond", () => {
+  const plan = buildCapturePlan({
+    segments: [{ startMs: 0, endMs: 1001, text: "odd segment" }],
+    captionCues: [{ startMs: 100, endMs: 301, text: "odd caption" }],
+    sceneTimes: [250.5],
+    frameTimes: [201, 501],
+    durationMs: 1001,
+  });
+
+  assert.deepEqual(plan, [
+    {
+      requestedMs: 201,
+      timestampMs: 201,
+      reasons: ["caption"],
+      associations: [{ segmentIndex: 0, requestedMs: 201, reasons: ["caption"] }],
+      filename: "000000201-caption.jpg",
+    },
+    {
+      requestedMs: 501,
+      timestampMs: 501,
+      reasons: ["primary", "scene"],
+      associations: [{
+        segmentIndex: 0,
+        requestedMs: 501,
+        reasons: ["primary", "scene"],
+      }],
+      filename: "000000501-primary.jpg",
+    },
+  ]);
+  assert.equal(
+    plan.every((capture) => Number.isSafeInteger(capture.requestedMs)
+      && capture.associations.every((association) =>
+        Number.isSafeInteger(association.requestedMs))),
+    true,
+  );
+});
+
 test("coalesces only candidates on the same decoded frame", () => {
   const plan = buildCapturePlan({
     segments,

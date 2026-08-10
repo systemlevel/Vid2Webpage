@@ -16,6 +16,10 @@ function clampToDuration(timestampMs, durationMs) {
   return Math.max(0, Math.min(timestampMs, durationMs - 1));
 }
 
+function requestedMillisecond(timestampMs, durationMs) {
+  return Math.round(clampToDuration(timestampMs, durationMs));
+}
+
 function owningSegment(timestampMs, segments) {
   const containingIndex = segments.findIndex(
     (segment) => segment.startMs <= timestampMs && timestampMs < segment.endMs,
@@ -38,16 +42,16 @@ export function buildCapturePlan({ segments, captionCues, sceneTimes, frameTimes
   const orderedCuts = [...new Set(sceneTimes)].sort((a, b) => a - b);
   const candidates = [
     ...segments.map((segment, segmentIndex) => ({
-      requestedMs: clampToDuration(midpoint(segment), durationMs),
+      requestedMs: requestedMillisecond(midpoint(segment), durationMs),
       reason: "primary",
       segmentIndex,
     })),
     ...captionCues.map((cue) => ({
-      requestedMs: clampToDuration(midpoint(cue), durationMs),
+      requestedMs: requestedMillisecond(midpoint(cue), durationMs),
       reason: "caption",
     })),
     ...orderedCuts.map((cut, index) => ({
-      requestedMs: clampToDuration(
+      requestedMs: requestedMillisecond(
         Math.min(cut + 250, (orderedCuts[index + 1] ?? Infinity) - 1),
         durationMs,
       ),
