@@ -1,0 +1,777 @@
+import assert from "node:assert/strict";
+import {
+  linkSync,
+  lstatSync,
+  renameSync,
+  unlinkSync,
+} from "node:fs";
+import {
+  access,
+  link,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+
+import { OutputConflictError } from "../src/errors.mjs";
+import { capturePublicationExpectation } from "../src/fs.mjs";
+import {
+  escapeHtml,
+  renderOutput,
+  renderPage,
+  youtubeTimestampUrl,
+} from "../src/render.mjs";
+import { openWorkspace } from "../src/workspace.mjs";
+
+const segments = [
+  {
+    startMs: 1_000,
+    endMs: 5_000,
+    text: "Whisper says <buy> & hold",
+  },
+  {
+    startMs: 5_000,
+    endMs: 9_000,
+    text: "Second <segment>",
+  },
+];
+
+const sharedImage = {
+  timestampMs: 3_000,
+  requestedMs: 3_000,
+  reasons: ["primary", "caption"],
+  associations: [
+    { segmentIndex: 0, requestedMs: 3_000, reasons: ["primary"] },
+    { segmentIndex: 1, requestedMs: 3_100, reasons: ["caption"] },
+  ],
+  filename: "000003000-primary.jpg",
+  width: 1_920,
+  height: 1_080,
+};
+
+const manifest = {
+  schemaVersion: 1,
+  status: "building",
+  source: {
+    kind: "youtube",
+    title: "A & B \"<unsafe>\"",
+    webpageUrl: "https://www.youtube.com/watch?v=abc&list=one",
+    fingerprint: "abc",
+  },
+  transcript: { engine: "mlx-whisper", filename: "cached.vtt" },
+  segments,
+  captionCues: [{ startMs: 1_000, endMs: 2_000, text: "caption cue words that must not render" }],
+  images: [
+    sharedImage,
+    {
+      timestampMs: 7_000,
+      requestedMs: 7_000,
+      reasons: ["scene"],
+      associations: [{ segmentIndex: 1, requestedMs: 7_000, reasons: ["scene"] }],
+      filename: "000007000-scene.jpg",
+      width: 1_280,
+      height: 720,
+    },
+  ],
+};
+
+async function createRenderableWorkspace(t, {
+  engine = "mlx-whisper",
+  hooks = {},
+  protectVideo = false,
+} = {}) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-render-workspace-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const videoPath = path.join(root, "video.mov");
+  await writeFile(videoPath, "video-bytes");
+  const source = {
+    kind: "local",
+    input: videoPath,
+    fingerprint: `render-${path.basename(root)}`,
+    title: "Local render",
+    durationMs: 9_000,
+    width: 1_920,
+    height: 1_080,
+  };
+  const videoInfo = await stat(videoPath);
+  const protectedFiles = protectVideo ? [{
+    label: "video",
+    path: videoPath,
+    canonicalPath: videoPath,
+    identity: { dev: videoInfo.dev, ino: videoInfo.ino },
+  }] : [];
+  const workspace = await openWorkspace({
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source,
+    hooks,
+    protectedFiles,
+  });
+  let building = await workspace.loadManifest();
+  const expectedManifest = building;
+  building = await workspace.saveManifest({
+    ...building,
+    transcript: { engine, filename: "cached.vtt" },
+    segments,
+  }, { expectedManifest });
+  for (const image of manifest.images) {
+    building = await workspace.recordFrame(building, structuredClone(image));
+    await writeFile(path.join(workspace.imagesDir, image.filename), "jpeg-bytes");
+  }
+  return { root, workspace, building };
+}
+
+async function fakeRenderPublication({ outputDir, retentionDir, protectedFiles = [] }) {
+  const frozenProtectedFiles = Object.freeze(protectedFiles.map((protectedFile) =>
+    Object.freeze({
+      ...protectedFile,
+      identity: Object.freeze({ ...protectedFile.identity }),
+    })));
+  const targetEntries = [
+    ["transcript", path.join(outputDir, "transcript.vtt")],
+    ["stylesheet", path.join(outputDir, "styles.css")],
+    ["html", path.join(outputDir, "index.html")],
+  ];
+  const expectations = frozenProtectedFiles.length > 0
+    ? await Promise.all(targetEntries.map(([, filePath]) =>
+      capturePublicationExpectation(filePath)))
+    : targetEntries.map(() => undefined);
+  return Object.freeze({
+    protectedFiles: frozenProtectedFiles,
+    retentionDir: frozenProtectedFiles.length > 0 ? retentionDir : undefined,
+    targets: Object.freeze(Object.fromEntries(targetEntries.map(
+      ([name, filePath], index) => [name, Object.freeze({
+        path: filePath,
+        expectedDestination: expectations[index],
+      })],
+    ))),
+  });
+}
+
+const omittedLegacyProtection = Symbol("omitted legacy protection");
+
+async function exerciseProtectedRenderDowngrade(t, {
+  legacyProtectedFiles = omittedLegacyProtection,
+} = {}) {
+  const { root, workspace, building } = await createRenderableWorkspace(t, {
+    protectVideo: true,
+  });
+  const transcriptVttPath = path.join(root, "cached.vtt");
+  const foreignPath = path.join(root, "foreign-render.vtt");
+  const destinationPath = path.join(workspace.outputDir, "transcript.vtt");
+  await writeFile(
+    transcriptVttPath,
+    "WEBVTT\n\n00:00:01.000 --> 00:00:05.000\nOwned render text\n",
+  );
+  await writeFile(foreignPath, "stable-foreign-render");
+  const foreignInfo = await stat(foreignPath);
+  const realWithRenderLease = workspace.withRenderLease.bind(workspace);
+  let injected = false;
+  workspace.withRenderLease = (value, operation, options) => realWithRenderLease(
+    value,
+    async (lease) => {
+      await link(foreignPath, destinationPath);
+      injected = true;
+      return operation(lease);
+    },
+    options,
+  );
+  const renderOptions = {
+    workspace,
+    manifest: building,
+    segments,
+    transcriptVttPath,
+  };
+  if (legacyProtectedFiles !== omittedLegacyProtection) {
+    renderOptions.protectedFiles = legacyProtectedFiles;
+  }
+
+  const [outcome] = await Promise.allSettled([renderOutput(renderOptions)]);
+  const durable = await workspace.loadManifest();
+  const destinationInfo = await stat(destinationPath);
+  return {
+    actual: {
+      injected,
+      outcome: outcome.status,
+      destinationBytes: await readFile(destinationPath, "utf8"),
+      destinationIdentity: { dev: destinationInfo.dev, ino: destinationInfo.ino },
+      foreignBytes: await readFile(foreignPath, "utf8"),
+      manifestStatus: durable.status,
+      manifestRevision: durable.revision,
+    },
+    expected: {
+      injected: true,
+      outcome: "rejected",
+      destinationBytes: "stable-foreign-render",
+      destinationIdentity: { dev: foreignInfo.dev, ino: foreignInfo.ino },
+      foreignBytes: "stable-foreign-render",
+      manifestStatus: "building",
+      manifestRevision: building.revision,
+    },
+  };
+}
+
+test("renders escaped Whisper content and association-aware screenshot galleries", () => {
+  const html = renderPage({ manifest, segments });
+
+  assert.match(html, /A &amp; B &quot;&lt;unsafe&gt;&quot;/);
+  assert.match(html, /Whisper says &lt;buy&gt; &amp; hold/);
+  assert.match(html, /Second &lt;segment&gt;/);
+  assert.doesNotMatch(html, /caption cue words that must not render/);
+  assert.match(html, /<span class="reason">primary<\/span>/);
+  assert.match(html, /<span class="reason">caption<\/span>/);
+  assert.match(html, /<span class="reason">scene<\/span>/);
+
+  const sharedReferences = html.match(/images\/000003000-primary\.jpg/g) ?? [];
+  assert.equal(sharedReferences.length, 4, "one href and src for each associated segment");
+  const imageSources = [...html.matchAll(/<img[^>]+src="(images\/[^\"]+)"/g)]
+    .map((match) => match[1]);
+  assert.deepEqual([...new Set(imageSources)].sort(), [
+    "images/000003000-primary.jpg",
+    "images/000007000-scene.jpg",
+  ]);
+  assert.match(html, /2 screenshots/);
+  assert.doesNotMatch(html, /<video|<audio/i);
+});
+
+test("uses safe YouTube links and local time elements for segment timestamps", () => {
+  const youtubeHtml = renderPage({ manifest, segments });
+  assert.match(
+    youtubeHtml,
+    /href="https:\/\/www\.youtube\.com\/watch\?v=abc&amp;list=one&amp;t=1"/,
+  );
+  assert.match(youtubeHtml, />00:00:01\.000<\/a>/);
+  assert.match(youtubeHtml, /href="https:\/\/www\.youtube\.com\/watch\?v=abc&amp;list=one&amp;t=5">00:00:05\.000<\/a>/);
+  assert.equal(
+    youtubeTimestampUrl("https://www.youtube.com/watch?v=abc&list=one", 4_250),
+    "https://www.youtube.com/watch?v=abc&list=one&t=4",
+  );
+  assert.equal(escapeHtml("\"'<> &"), "&quot;&#39;&lt;&gt; &amp;");
+  assert.throws(() => youtubeTimestampUrl("javascript:alert(1)", 1_000), TypeError);
+
+  const localHtml = renderPage({
+    manifest: {
+      ...manifest,
+      source: { kind: "local", title: "Local <clip>", input: "/video.mov", fingerprint: "local" },
+    },
+    segments,
+  });
+  assert.match(localHtml, /<time datetime="PT1S">00:00:01\.000<\/time>/);
+  assert.doesNotMatch(localHtml, /youtube\.com/);
+});
+
+test("encodes contained image filenames as single URL path segments", () => {
+  const html = renderPage({
+    manifest: {
+      ...manifest,
+      images: [{
+        ...sharedImage,
+        filename: "frame#?%.jpg",
+        associations: [{ segmentIndex: 0, requestedMs: 3_000, reasons: ["primary"] }],
+      }],
+    },
+    segments: [segments[0]],
+  });
+
+  assert.match(html, /href="images\/frame%23%3F%25\.jpg"/);
+  assert.match(html, /src="images\/frame%23%3F%25\.jpg"/);
+});
+
+test("rejects malformed, duplicate, out-of-range, and dot image associations in standalone rendering", () => {
+  const invalidImages = [
+    {
+      ...sharedImage,
+      associations: [
+        { segmentIndex: 0, requestedMs: 3_000, reasons: ["primary"] },
+        { segmentIndex: 0, requestedMs: 3_001, reasons: ["caption"] },
+      ],
+    },
+    {
+      ...sharedImage,
+      associations: [{ segmentIndex: 2, requestedMs: 3_000, reasons: ["primary"] }],
+    },
+    {
+      ...sharedImage,
+      associations: [{ segmentIndex: "0", requestedMs: 3_000, reasons: ["primary"] }],
+    },
+    {
+      ...sharedImage,
+      associations: [{
+        segmentIndex: 0,
+        requestedMs: 3_000,
+        reasons: ["primary"],
+        unexpected: true,
+      }],
+    },
+    { ...sharedImage, filename: "." },
+    { ...sharedImage, filename: ".." },
+  ];
+
+  for (const image of invalidImages) {
+    assert.throws(() => renderPage({ manifest: { ...manifest, images: [image] }, segments }), TypeError);
+  }
+});
+
+test("renders a valid zero-based segment timestamp", () => {
+  const html = renderPage({
+    manifest: {
+      ...manifest,
+      source: { kind: "local", title: "Local", input: "/video.mov", fingerprint: "local" },
+      images: [{
+        ...sharedImage,
+        associations: [{ segmentIndex: 0, requestedMs: 3_000, reasons: ["primary"] }],
+      }],
+    },
+    segments: [{ ...segments[0], startMs: 0 }],
+  });
+
+  assert.match(html, /<time datetime="PT0S">00:00:00\.000<\/time>/);
+});
+
+test("publishes assets and building metadata before one final completion write", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "v2w-render-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const transcriptVttPath = path.join(dir, "cached.vtt");
+  await writeFile(transcriptVttPath, "WEBVTT\n\ncaption cue words that must not render\n");
+  const writes = [];
+  const workspace = {
+    outputDir: path.join(dir, "output"),
+    async withRenderLease(value, operation) {
+      const publication = await fakeRenderPublication({ outputDir: this.outputDir });
+      return operation(Object.freeze({
+        manifest: value,
+        publication,
+        saveManifest: this.saveManifest.bind(this),
+        markComplete: this.markComplete.bind(this),
+      }));
+    },
+    async saveManifest(value) {
+      writes.push({ type: "save", value });
+      assert.equal(await readFile(path.join(this.outputDir, "transcript.vtt"), "utf8"), await readFile(transcriptVttPath, "utf8"));
+      assert.ok((await readFile(path.join(this.outputDir, "styles.css"), "utf8")).length > 0);
+      return { ...value, revision: 8 };
+    },
+    async markComplete(value) {
+      writes.push({ type: "complete", value });
+      assert.ok((await readFile(path.join(this.outputDir, "index.html"), "utf8")).length > 0);
+      return { ...value, status: "complete", revision: 9 };
+    },
+  };
+  await mkdir(workspace.outputDir, { recursive: true });
+
+  const completed = await renderOutput({ workspace, manifest, segments, transcriptVttPath });
+  assert.equal(completed.status, "complete");
+  assert.equal(writes.filter((write) => write.type === "complete").length, 1);
+  assert.deepEqual(writes.map((write) => write.type), ["save", "complete"]);
+  assert.equal(writes[0].value.transcript.filename, "transcript.vtt");
+  assert.deepEqual(writes[0].value.segments, segments);
+});
+
+test("stops before later writes when an earlier render publication step fails", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "v2w-render-failure-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const outputDir = path.join(dir, "output");
+  await mkdir(outputDir);
+  let completions = 0;
+  const workspace = {
+    outputDir,
+    async withRenderLease(value, operation) {
+      const publication = await fakeRenderPublication({ outputDir: this.outputDir });
+      return operation(Object.freeze({
+        manifest: value,
+        publication,
+        saveManifest: this.saveManifest.bind(this),
+        markComplete: this.markComplete.bind(this),
+      }));
+    },
+    async saveManifest() {
+      throw new Error("manifest write failed");
+    },
+    async markComplete() {
+      completions += 1;
+    },
+  };
+  const transcriptVttPath = path.join(dir, "cached.vtt");
+  await writeFile(transcriptVttPath, "WEBVTT\n");
+
+  await assert.rejects(renderOutput({ workspace, manifest, segments, transcriptVttPath }), /manifest write failed/);
+  assert.equal(completions, 0);
+  assert.equal(await readFile(path.join(outputDir, "transcript.vtt"), "utf8"), "WEBVTT\n");
+  await assert.rejects(access(path.join(outputDir, "index.html")));
+});
+
+test("render publication retains a protected hard link introduced at the destination boundary", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "v2w-render-protected-destination-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const outputDir = path.join(dir, "output");
+  const transcriptVttPath = path.join(dir, "cached.vtt");
+  const captionPath = path.join(dir, "lesson.vtt");
+  const destinationPath = path.join(outputDir, "transcript.vtt");
+  const retentionDir = path.join(dir, "retention");
+  await mkdir(outputDir);
+  await mkdir(retentionDir);
+  await writeFile(transcriptVttPath, "WEBVTT\n\nrendered transcript\n");
+  await writeFile(captionPath, "protected-caption-bytes");
+  const captionBefore = await stat(captionPath);
+  await link(captionPath, destinationPath);
+  const workspace = {
+    outputDir,
+    retentionDir,
+    async withRenderLease(value, operation) {
+      const publication = await fakeRenderPublication({
+        outputDir,
+        retentionDir,
+        protectedFiles,
+      });
+      return operation(Object.freeze({
+        manifest: value,
+        publication,
+        async saveManifest(saved) { return saved; },
+        async markComplete(saved) { return { ...saved, status: "complete" }; },
+      }));
+    },
+  };
+  const protectedFiles = [{
+    label: "caption",
+    path: captionPath,
+    canonicalPath: captionPath,
+    identity: { dev: captionBefore.dev, ino: captionBefore.ino },
+  }];
+
+  await assert.rejects(renderOutput({
+    workspace,
+    manifest,
+    segments,
+    transcriptVttPath,
+  }));
+
+  assert.equal(await readFile(captionPath, "utf8"), "protected-caption-bytes");
+  assert.equal(await readFile(destinationPath, "utf8"), "protected-caption-bytes");
+  const captionAfter = await stat(captionPath);
+  const destinationAfter = await stat(destinationPath);
+  assert.deepEqual(
+    { dev: captionAfter.dev, ino: captionAfter.ino },
+    { dev: captionBefore.dev, ino: captionBefore.ino },
+  );
+  assert.deepEqual(
+    { dev: destinationAfter.dev, ino: destinationAfter.ino },
+    { dev: captionBefore.dev, ino: captionBefore.ino },
+  );
+});
+
+test("render publication atomically captures a protected swap at the former rename boundary", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "v2w-render-atomic-capture-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const outputDir = path.join(dir, "output");
+  const transcriptVttPath = path.join(dir, "cached.vtt");
+  const captionPath = path.join(dir, "lesson.vtt");
+  const destinationPath = path.join(outputDir, "transcript.vtt");
+  const retentionDir = path.join(dir, "retention");
+  await mkdir(outputDir);
+  await mkdir(retentionDir);
+  await writeFile(transcriptVttPath, "WEBVTT\n\nrendered transcript\n");
+  await writeFile(captionPath, "protected-caption");
+  await writeFile(destinationPath, "prior-render");
+  const captionBefore = await stat(captionPath);
+  let injected = false;
+  const workspace = {
+    outputDir,
+    retentionDir,
+    async withRenderLease(value, operation) {
+      const publication = await fakeRenderPublication({
+        outputDir,
+        retentionDir,
+        protectedFiles,
+      });
+      return operation(Object.freeze({
+        manifest: value,
+        publication,
+        async saveManifest(saved) { return saved; },
+        async markComplete(saved) { return { ...saved, status: "complete" }; },
+      }));
+    },
+  };
+  const protectedFiles = [{
+    label: "caption",
+    path: captionPath,
+    canonicalPath: captionPath,
+    identity: { dev: captionBefore.dev, ino: captionBefore.ino },
+  }];
+  const fileOps = {
+    rename(from, to) {
+      if (!injected && from === destinationPath) {
+        unlinkSync(destinationPath);
+        linkSync(captionPath, destinationPath);
+        injected = true;
+      }
+      renameSync(from, to);
+    },
+  };
+
+  await assert.rejects(renderOutput({
+    workspace,
+    manifest,
+    segments,
+    transcriptVttPath,
+    fileOps,
+  }));
+
+  assert.equal(injected, true);
+  assert.equal(await readFile(captionPath, "utf8"), "protected-caption");
+  assert.equal(await readFile(destinationPath, "utf8"), "protected-caption");
+  const captionAfter = await stat(captionPath);
+  const destinationAfter = await stat(destinationPath);
+  assert.deepEqual(
+    { dev: captionAfter.dev, ino: captionAfter.ino },
+    { dev: captionBefore.dev, ino: captionBefore.ino },
+  );
+  assert.deepEqual(
+    { dev: destinationAfter.dev, ino: destinationAfter.ino },
+    { dev: captionBefore.dev, ino: captionBefore.ino },
+  );
+});
+
+test("protected render rejects a stable file inserted after expected absence is captured", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "v2w-render-expected-absence-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const outputDir = path.join(dir, "output");
+  const transcriptVttPath = path.join(dir, "cached.vtt");
+  const protectedPath = path.join(dir, "lesson.mov");
+  const foreignPath = path.join(dir, "foreign-render.vtt");
+  const destinationPath = path.join(outputDir, "transcript.vtt");
+  const retentionDir = path.join(dir, "retention");
+  await mkdir(outputDir);
+  await mkdir(retentionDir);
+  await writeFile(transcriptVttPath, "WEBVTT\n\nrendered transcript\n");
+  await writeFile(protectedPath, "protected-video");
+  await writeFile(foreignPath, "stable-foreign-render");
+  const protectedInfo = await stat(protectedPath);
+  const foreignInfo = await stat(foreignPath);
+  const protectedFiles = [{
+    label: "video",
+    path: protectedPath,
+    canonicalPath: protectedPath,
+    identity: { dev: protectedInfo.dev, ino: protectedInfo.ino },
+  }];
+  let injected = false;
+  let manifestSaves = 0;
+  let completions = 0;
+  const workspace = {
+    outputDir,
+    retentionDir,
+    async withRenderLease(value, operation) {
+      const publication = await fakeRenderPublication({
+        outputDir,
+        retentionDir,
+        protectedFiles,
+      });
+      return operation(Object.freeze({
+        manifest: value,
+        publication,
+        async saveManifest(saved) {
+          manifestSaves += 1;
+          return saved;
+        },
+        async markComplete(saved) {
+          completions += 1;
+          return { ...saved, status: "complete" };
+        },
+      }));
+    },
+  };
+  const fileOps = {
+    lstat(filePath) {
+      if (!injected && filePath === retentionDir) {
+        linkSync(foreignPath, destinationPath);
+        injected = true;
+      }
+      return lstatSync(filePath);
+    },
+  };
+
+  await assert.rejects(renderOutput({
+    workspace,
+    manifest,
+    segments,
+    transcriptVttPath,
+    fileOps,
+  }));
+
+  assert.equal(injected, true);
+  assert.equal(manifestSaves, 0);
+  assert.equal(completions, 0);
+  assert.equal(await readFile(destinationPath, "utf8"), "stable-foreign-render");
+  const destinationInfo = await stat(destinationPath);
+  assert.deepEqual(
+    { dev: destinationInfo.dev, ino: destinationInfo.ino },
+    { dev: foreignInfo.dev, ino: foreignInfo.ino },
+  );
+  assert.equal(await readFile(foreignPath, "utf8"), "stable-foreign-render");
+});
+
+test("real protected render cannot be downgraded when the legacy protection argument is omitted", async (t) => {
+  const result = await exerciseProtectedRenderDowngrade(t);
+  assert.deepEqual(result.actual, result.expected);
+});
+
+for (const legacyProtection of ["empty", "mismatched"]) {
+  const article = legacyProtection === "empty" ? "an" : "a";
+  test(`real protected render cannot be downgraded by ${article} ${legacyProtection} legacy protection argument`, async (t) => {
+    let protectedFiles = [];
+    if (legacyProtection === "mismatched") {
+      const unrelatedRoot = await mkdtemp(path.join(os.tmpdir(), "v2w-render-unrelated-"));
+      t.after(() => rm(unrelatedRoot, { recursive: true, force: true }));
+      const unrelatedPath = path.join(unrelatedRoot, "unrelated.mov");
+      await writeFile(unrelatedPath, "unrelated-video");
+      const unrelatedInfo = await stat(unrelatedPath);
+      protectedFiles = [{
+        label: "unrelated",
+        path: unrelatedPath,
+        canonicalPath: unrelatedPath,
+        identity: { dev: unrelatedInfo.dev, ino: unrelatedInfo.ino },
+      }];
+    }
+    const result = await exerciseProtectedRenderDowngrade(t, { legacyProtectedFiles: protectedFiles });
+    assert.deepEqual(result.actual, result.expected);
+  });
+}
+
+test("real protected render succeeds from Workspace protection without a legacy argument", async (t) => {
+  const { root, workspace, building } = await createRenderableWorkspace(t, {
+    protectVideo: true,
+  });
+  const transcriptVttPath = path.join(root, "cached.vtt");
+  await writeFile(
+    transcriptVttPath,
+    "WEBVTT\n\n00:00:01.000 --> 00:00:05.000\nProtected render text\n",
+  );
+
+  const complete = await renderOutput({ workspace, manifest: building, segments, transcriptVttPath });
+
+  assert.equal(complete.status, "complete");
+  assert.equal((await workspace.loadManifest()).status, "complete");
+});
+
+test("completes a real association-aware workspace without duplicating physical screenshots", async (t) => {
+  const { root, workspace, building } = await createRenderableWorkspace(t);
+  const transcriptVttPath = path.join(root, "cached.vtt");
+  await writeFile(transcriptVttPath, "WEBVTT\n\n00:00:01.000 --> 00:00:05.000\nWhisper text\n");
+
+  const complete = await renderOutput({ workspace, manifest: building, segments, transcriptVttPath });
+  const html = await readFile(path.join(workspace.outputDir, "index.html"), "utf8");
+
+  assert.equal(complete.status, "complete");
+  assert.equal((await workspace.loadManifest()).status, "complete");
+  assert.equal((html.match(/images\/000003000-primary\.jpg/g) ?? []).length, 4);
+  assert.match(html, /2 screenshots/);
+});
+
+test("an interrupted protected render replaces its own assets and completes on retry", async (t) => {
+  const interruption = new Error("injected protected render interruption");
+  let interrupt = true;
+  const { root, workspace, building } = await createRenderableWorkspace(t, {
+    protectVideo: true,
+    hooks: {
+      beforeCompletionInventory() {
+        if (interrupt) {
+          interrupt = false;
+          throw interruption;
+        }
+      },
+    },
+  });
+  const transcriptVttPath = path.join(root, "cached.vtt");
+  await writeFile(
+    transcriptVttPath,
+    "WEBVTT\n\n00:00:01.000 --> 00:00:05.000\nWhisper retry text\n",
+  );
+
+  await assert.rejects(renderOutput({
+    workspace,
+    manifest: building,
+    segments,
+    transcriptVttPath,
+  }), (error) => error === interruption);
+  for (const name of ["transcript.vtt", "styles.css", "index.html"]) {
+    assert.ok((await stat(path.join(workspace.outputDir, name))).size > 0);
+  }
+
+  const completed = await renderOutput({
+    workspace,
+    manifest: await workspace.loadManifest(),
+    segments,
+    transcriptVttPath,
+  });
+
+  assert.equal(completed.status, "complete");
+  assert.equal((await workspace.loadManifest()).status, "complete");
+});
+
+test("rejects stale completed rendering before it can overwrite published assets", async (t) => {
+  const { root, workspace, building } = await createRenderableWorkspace(t);
+  const firstTranscript = path.join(root, "first.vtt");
+  const staleTranscript = path.join(root, "stale.vtt");
+  await writeFile(firstTranscript, "WEBVTT\n\nfirst transcript\n");
+  await writeFile(staleTranscript, "WEBVTT\n\nstale transcript\n");
+  await renderOutput({ workspace, manifest: building, segments, transcriptVttPath: firstTranscript });
+
+  await assert.rejects(
+    renderOutput({ workspace, manifest: building, segments, transcriptVttPath: staleTranscript }),
+    OutputConflictError,
+  );
+  assert.equal(await readFile(path.join(workspace.outputDir, "transcript.vtt"), "utf8"), "WEBVTT\n\nfirst transcript\n");
+});
+
+test("concurrent same-revision renders leave artifacts from the sole completed attempt", async (t) => {
+  const { root, workspace, building } = await createRenderableWorkspace(t);
+  const firstTranscript = path.join(root, "first.vtt");
+  const secondTranscript = path.join(root, "second.vtt");
+  const firstText = "WEBVTT\n\nfirst concurrent transcript\n";
+  const secondText = "WEBVTT\n\nsecond concurrent transcript\n";
+  await writeFile(firstTranscript, firstText);
+  await writeFile(secondTranscript, secondText);
+
+  const outcomes = await Promise.allSettled([
+    renderOutput({ workspace, manifest: building, segments, transcriptVttPath: firstTranscript }),
+    renderOutput({ workspace, manifest: building, segments, transcriptVttPath: secondTranscript }),
+  ]);
+  const winner = outcomes.findIndex((outcome) => outcome.status === "fulfilled");
+
+  assert.notEqual(winner, -1);
+  assert.equal(outcomes.filter((outcome) => outcome.status === "fulfilled").length, 1);
+  assert.equal(
+    await readFile(path.join(workspace.outputDir, "transcript.vtt"), "utf8"),
+    winner === 0 ? firstText : secondText,
+  );
+});
+
+test("rejects malformed associations and blank engine before publishing assets", async (t) => {
+  for (const mutate of [
+    (value) => ({
+      ...value,
+      images: [{ ...value.images[0], associations: [
+        ...value.images[0].associations,
+        { segmentIndex: 0, requestedMs: 3_001, reasons: ["primary"] },
+      ] }],
+    }),
+    (value) => ({ ...value, transcript: { ...value.transcript, engine: "  " } }),
+  ]) {
+    const { root, workspace, building } = await createRenderableWorkspace(t);
+    const transcriptVttPath = path.join(root, "candidate.vtt");
+    await writeFile(transcriptVttPath, "WEBVTT\n\ncandidate\n");
+    await assert.rejects(
+      renderOutput({ workspace, manifest: mutate(building), segments, transcriptVttPath }),
+      OutputConflictError,
+    );
+    await assert.rejects(access(path.join(workspace.outputDir, "transcript.vtt")));
+    await assert.rejects(access(path.join(workspace.outputDir, "styles.css")));
+    await assert.rejects(access(path.join(workspace.outputDir, "index.html")));
+  }
+});

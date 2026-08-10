@@ -1,0 +1,31 @@
+:root {
+  color-scheme: light;
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #1c2528;
+  background: #f7f7f4;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { width: min(100% - 2rem, 58rem); margin: 0 auto; padding: 3rem 0 5rem; }
+.page-header { border-bottom: 1px solid #cfd6d2; margin-bottom: 2rem; padding-bottom: 1.5rem; }
+.eyebrow, .metadata, .segment-header, figcaption { color: #526164; font-size: 0.875rem; }
+.eyebrow { letter-spacing: 0.09em; margin: 0 0 0.5rem; text-transform: uppercase; }
+h1 { font-size: clamp(1.75rem, 5vw, 3rem); line-height: 1.1; margin: 0; overflow-wrap: anywhere; }
+.metadata { display: flex; gap: 1rem; margin: 1rem 0 0; }
+.segment { border-bottom: 1px solid #dce2df; padding: 1.5rem 0; }
+.segment-header { display: flex; gap: 0.5rem; }
+.timestamp, .source-link { color: #075c6b; }
+.timestamp:focus-visible, .source-link:focus-visible, .frame:focus-visible { outline: 3px solid #e68a00; outline-offset: 3px; }
+.segment p { font-family: ui-serif, Georgia, serif; font-size: 1.125rem; line-height: 1.55; margin: 0.5rem 0 0; }
+.gallery { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); margin-top: 1rem; }
+.frame-card { margin: 0; min-width: 0; }
+.frame { display: block; }
+.frame img { display: block; height: auto; max-width: 100%; object-fit: cover; width: 100%; }
+figcaption { align-items: center; display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.4rem; }
+.reasons { display: inline-flex; flex-wrap: wrap; gap: 0.25rem; }
+.reason { background: #dcefed; border-radius: 999px; color: #164e59; padding: 0.1rem 0.45rem; }
+@media (max-width: 34rem) {
+  main { width: min(100% - 1.25rem, 58rem); padding-top: 1.5rem; }
+  .gallery { grid-template-columns: 1fr; }
+}

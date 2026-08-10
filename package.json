@@ -1,0 +1,16 @@
+{
+  "name": "vid2webpage",
+  "version": "2.0.0",
+  "description": "Turn a YouTube URL or local video into a transcript webpage",
+  "type": "module",
+  "bin": {
+    "v2w": "bin/v2w.mjs"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
