@@ -79,6 +79,16 @@ async function sourceIdentityIsCurrent(videoPath, identity, fileOps) {
   }
 }
 
+async function pathMatchesProtectedIdentity(filePath, protectedFiles, fileOps) {
+  try {
+    const info = await fileOps.stat(filePath);
+    return protectedFiles.some((protectedFile) =>
+      hasFileIdentity(info, protectedFile?.identity));
+  } catch {
+    return false;
+  }
+}
+
 function pathsReferToSameFileSync(firstPath, secondPath, fileOps) {
   try {
     const first = fileOps.stat(firstPath);
@@ -256,6 +266,7 @@ export async function extractFrames({
   nextTempId = randomUUID,
   fileOps = {},
   frameFileOps = {},
+  protectedFiles = [],
 }) {
   if (manifest?.status !== "building") {
     throw frameError(videoPath, "Frames can only be extracted into a building manifest");
@@ -284,14 +295,22 @@ export async function extractFrames({
       if (await pathsReferToSameFile(videoPath, finalPath)) {
         throw frameError(videoPath, "Frame output must not overwrite the local video");
       }
+      if (await pathMatchesProtectedIdentity(finalPath, protectedFiles, resolvedFileOps)) {
+        throw frameError(finalPath, "Frame output must not alias a protected local file");
+      }
 
       const existing = leasedManifest.images.find((image) => image.filename === capture.filename);
       if (existing) {
         const reuseCandidate = completedFrame(capture, existing);
         if (await lease.canReuseFrame(reuseCandidate)) {
           if (!(await sourceIdentityIsCurrent(videoPath, sourceIdentity, resolvedFileOps))
-            || await pathsReferToSameFile(videoPath, finalPath)) {
-            throw frameError(videoPath, "Reusable frame must not alias the local video");
+            || await pathsReferToSameFile(videoPath, finalPath)
+            || await pathMatchesProtectedIdentity(
+              finalPath,
+              protectedFiles,
+              resolvedFileOps,
+            )) {
+            throw frameError(videoPath, "Reusable frame must not alias a protected local file");
           }
           log?.info?.(`Reusing frame ${capture.filename}`);
           return leasedManifest;
@@ -347,6 +366,7 @@ export async function extractFrames({
           tempFd: reservation.tempFd,
           sourcePath: videoPath,
           sourceIdentity,
+          protectedFiles,
           frame,
         };
         try {

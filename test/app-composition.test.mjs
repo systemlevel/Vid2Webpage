@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { writeFileSync } from "node:fs";
 import {
   access,
   mkdtemp,
@@ -90,10 +91,10 @@ function compositionServices({ root, counters }) {
         frameRate: 30,
       };
     },
-    extractAudio: async ({ outputPath }) => {
+    extractAudio: async ({ output }) => {
       counters.extractAudio += 1;
-      await writeFile(outputPath, "audio");
-      return outputPath;
+      writeFileSync(output.fd, "audio");
+      return undefined;
     },
     loadVocabPrompt: async () => "composition vocabulary",
     transcribeTimed: async ({ cacheDir }) => {

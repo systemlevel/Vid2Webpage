@@ -204,7 +204,13 @@ export function renderPage({ manifest, segments }) {
 `;
 }
 
-export async function renderOutput({ workspace, manifest, segments, transcriptVttPath }) {
+export async function renderOutput({
+  workspace,
+  manifest,
+  segments,
+  transcriptVttPath,
+  protectedFiles = [],
+}) {
   const renderManifest = {
     ...manifest,
     transcript: { ...manifest.transcript, filename: "transcript.vtt" },
@@ -220,10 +226,14 @@ export async function renderOutput({ workspace, manifest, segments, transcriptVt
       segments: renderManifest.segments,
     };
 
-    await copyFileAtomic(transcriptVttPath, transcriptPath);
-    await copyFileAtomic(pageCssPath, stylesheetPath);
+    await copyFileAtomic(transcriptVttPath, transcriptPath, { protectedFiles });
+    await copyFileAtomic(pageCssPath, stylesheetPath, { protectedFiles });
     const savedManifest = await lease.saveManifest(buildingManifest);
-    await writeFileAtomic(htmlPath, renderPage({ manifest: savedManifest, segments }));
+    await writeFileAtomic(
+      htmlPath,
+      renderPage({ manifest: savedManifest, segments }),
+      { protectedFiles },
+    );
     return lease.markComplete(savedManifest);
   });
 }

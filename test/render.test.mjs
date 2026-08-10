@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import {
   access,
+  link,
   mkdir,
   mkdtemp,
   readFile,
   rm,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import os from "node:os";
@@ -288,6 +290,57 @@ test("stops before later writes when an earlier render publication step fails", 
   assert.equal(completions, 0);
   assert.equal(await readFile(path.join(outputDir, "transcript.vtt"), "utf8"), "WEBVTT\n");
   await assert.rejects(access(path.join(outputDir, "index.html")));
+});
+
+test("render publication retains a protected hard link introduced at the destination boundary", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "v2w-render-protected-destination-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const outputDir = path.join(dir, "output");
+  const transcriptVttPath = path.join(dir, "cached.vtt");
+  const captionPath = path.join(dir, "lesson.vtt");
+  const destinationPath = path.join(outputDir, "transcript.vtt");
+  await mkdir(outputDir);
+  await writeFile(transcriptVttPath, "WEBVTT\n\nrendered transcript\n");
+  await writeFile(captionPath, "protected-caption-bytes");
+  const captionBefore = await stat(captionPath);
+  await link(captionPath, destinationPath);
+  const workspace = {
+    outputDir,
+    async withRenderLease(value, operation) {
+      return operation({
+        manifest: value,
+        async saveManifest(saved) { return saved; },
+        async markComplete(saved) { return { ...saved, status: "complete" }; },
+      });
+    },
+  };
+  const protectedFiles = [{
+    label: "caption",
+    path: captionPath,
+    canonicalPath: captionPath,
+    identity: { dev: captionBefore.dev, ino: captionBefore.ino },
+  }];
+
+  await assert.rejects(renderOutput({
+    workspace,
+    manifest,
+    segments,
+    transcriptVttPath,
+    protectedFiles,
+  }));
+
+  assert.equal(await readFile(captionPath, "utf8"), "protected-caption-bytes");
+  assert.equal(await readFile(destinationPath, "utf8"), "protected-caption-bytes");
+  const captionAfter = await stat(captionPath);
+  const destinationAfter = await stat(destinationPath);
+  assert.deepEqual(
+    { dev: captionAfter.dev, ino: captionAfter.ino },
+    { dev: captionBefore.dev, ino: captionBefore.ino },
+  );
+  assert.deepEqual(
+    { dev: destinationAfter.dev, ino: destinationAfter.ino },
+    { dev: captionBefore.dev, ino: captionBefore.ino },
+  );
 });
 
 test("completes a real association-aware workspace without duplicating physical screenshots", async (t) => {

@@ -751,6 +751,7 @@ export async function openWorkspace({
       tempFd,
       sourcePath,
       sourceIdentity,
+      protectedFiles = [],
       frame,
     } = preparedFrame;
     const replacement = validateFrame(frame, imagesDir, { canonical: true });
@@ -775,7 +776,10 @@ export async function openWorkspace({
       || !isValidIdentity(tempIdentity)
       || !Number.isSafeInteger(tempFd) || tempFd < 0
       || typeof sourcePath !== "string" || sourcePath.length === 0
-      || !(sourceIdentity === null || isValidIdentity(sourceIdentity))) {
+      || !(sourceIdentity === null || isValidIdentity(sourceIdentity))
+      || !Array.isArray(protectedFiles)
+      || protectedFiles.some((protectedFile) =>
+        !isPlainObject(protectedFile) || !isValidIdentity(protectedFile.identity))) {
       throw conflict("Prepared frame temp path or identity is invalid");
     }
     return {
@@ -788,6 +792,7 @@ export async function openWorkspace({
       tempFd,
       sourcePath,
       sourceIdentity,
+      protectedFiles,
       frame: replacement,
       token,
     };

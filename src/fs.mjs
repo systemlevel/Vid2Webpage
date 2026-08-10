@@ -1,42 +1,200 @@
 import { randomUUID } from "node:crypto";
 import {
-  copyFile,
   lstat,
   open,
+  readFile,
   realpath,
-  rename,
-  rm,
   stat,
-  writeFile,
 } from "node:fs/promises";
+import {
+  lstatSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+} from "node:fs";
 import path from "node:path";
 
 function temporaryPath(filePath) {
   return `${filePath}.part-${process.pid}-${randomUUID()}`;
 }
 
-async function publishAtomically(filePath, publish) {
-  const temporary = temporaryPath(filePath);
-  let created = false;
-  let published = false;
+function infoIsProtected(info, protectedFiles) {
+  return protectedFiles.some((protectedFile) =>
+    hasFileIdentity(info, protectedFile?.identity));
+}
+
+function pathIsProtected(filePath, protectedFiles) {
+  const resolved = path.resolve(filePath);
+  return protectedFiles.some((protectedFile) =>
+    (typeof protectedFile?.path === "string" && path.resolve(protectedFile.path) === resolved)
+      || (typeof protectedFile?.canonicalPath === "string"
+        && path.resolve(protectedFile.canonicalPath) === resolved));
+}
+
+function statOrNullSync(filePath) {
   try {
-    const handle = await open(temporary, "wx");
-    created = true;
-    await handle.close();
-    await publish(temporary);
-    await rename(temporary, filePath);
-    published = true;
-  } finally {
-    if (created && !published) await rm(temporary, { force: true });
+    return statSync(filePath);
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
   }
 }
 
-export async function writeFileAtomic(filePath, data) {
-  await publishAtomically(filePath, (temporary) => writeFile(temporary, data));
+function lstatOrNullSync(filePath) {
+  try {
+    return lstatSync(filePath);
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
 }
 
-export async function copyFileAtomic(from, to) {
-  await publishAtomically(to, (temporary) => copyFile(from, temporary));
+function assertUnprotectedDestination(filePath, protectedFiles) {
+  const protectedInfo = statOrNullSync(filePath);
+  if (pathIsProtected(filePath, protectedFiles)
+    || (protectedInfo && infoIsProtected(protectedInfo, protectedFiles))) {
+    throw new Error(`Publication destination aliases a protected file: ${filePath}`);
+  }
+}
+
+function publishOwnedTempSync({ filePath, temporary, identity, protectedFiles }) {
+  const current = lstatOrNullSync(temporary);
+  if (!current
+    || !current.isFile()
+    || current.isSymbolicLink()
+    || !hasFileIdentity(current, identity)) {
+    throw new Error(`Owned publication temp identity changed: ${temporary}`);
+  }
+  assertUnprotectedDestination(filePath, protectedFiles);
+  renameSync(temporary, filePath);
+  const published = lstatOrNullSync(filePath);
+  if (!published
+    || !published.isFile()
+    || published.isSymbolicLink()
+    || !hasFileIdentity(published, identity)) {
+    throw new Error(`Published file identity changed: ${filePath}`);
+  }
+}
+
+function cleanupOwnedTempSync(temporary, identity) {
+  const current = lstatOrNullSync(temporary);
+  if (current
+    && current.isFile()
+    && !current.isSymbolicLink()
+    && hasFileIdentity(current, identity)) {
+    unlinkSync(temporary);
+  }
+}
+
+async function reserveOwnedTemp(filePath) {
+  const temporary = temporaryPath(filePath);
+  const handle = await open(temporary, "wx", 0o600);
+  let info;
+  try {
+    info = await handle.stat();
+  } catch (error) {
+    try {
+      await handle.close();
+    } catch (closeError) {
+      if (error && typeof error === "object" && error.cause === undefined) {
+        error.cause = closeError;
+      }
+    }
+    throw error;
+  }
+  if (!info.isFile()) {
+    await handle.close();
+    cleanupOwnedTempSync(temporary, fileIdentity(info));
+    throw new Error(`Owned publication temp is not a regular file: ${temporary}`);
+  }
+  return {
+    filePath,
+    temporary,
+    handle,
+    identity: fileIdentity(info),
+  };
+}
+
+async function verifyOwnedHandle(reservation, { requireNonEmpty = false } = {}) {
+  const info = await reservation.handle.stat();
+  if (!info.isFile()
+    || !hasFileIdentity(info, reservation.identity)
+    || (requireNonEmpty && info.size <= 0)) {
+    throw new Error(`Owned publication handle identity changed: ${reservation.filePath}`);
+  }
+}
+
+async function publishAtomically(filePath, publish, { protectedFiles = [] } = {}) {
+  const reservation = await reserveOwnedTemp(filePath);
+  let published = false;
+  try {
+    await publish(reservation.handle);
+    await verifyOwnedHandle(reservation);
+    publishOwnedTempSync({ ...reservation, protectedFiles });
+    published = true;
+  } finally {
+    try {
+      await reservation.handle.close();
+    } finally {
+      if (!published) cleanupOwnedTempSync(reservation.temporary, reservation.identity);
+    }
+  }
+}
+
+export async function writeFileAtomic(filePath, data, options) {
+  await publishAtomically(filePath, (handle) => handle.writeFile(data), options);
+}
+
+export async function copyFileAtomic(from, to, options) {
+  await publishAtomically(to, async (handle) => handle.writeFile(await readFile(from)), options);
+}
+
+export async function reserveOwnedArtifact(filePath) {
+  const reservation = await reserveOwnedTemp(filePath);
+  let closed = false;
+  let published = false;
+  const close = async () => {
+    if (closed) return;
+    closed = true;
+    await reservation.handle.close();
+  };
+  return Object.freeze({
+    writer: Object.freeze({ fd: reservation.handle.fd }),
+    async publish({ protectedFiles = [] } = {}) {
+      if (published || closed) throw new Error("Owned artifact reservation is no longer active");
+      await verifyOwnedHandle(reservation, { requireNonEmpty: true });
+      publishOwnedTempSync({ ...reservation, protectedFiles });
+      published = true;
+      await close();
+      return { path: filePath, identity: reservation.identity };
+    },
+    async discard() {
+      try {
+        await close();
+      } finally {
+        if (!published) cleanupOwnedTempSync(reservation.temporary, reservation.identity);
+      }
+    },
+  });
+}
+
+export function removeOwnedFile(filePath, {
+  expectedIdentity,
+  protectedFiles = [],
+} = {}) {
+  const current = lstatOrNullSync(filePath);
+  if (!current) return false;
+  if (!current.isFile()
+    || current.isSymbolicLink()
+    || !hasFileIdentity(current, expectedIdentity)) {
+    throw new Error("temporary file ownership changed before removal");
+  }
+  if (pathIsProtected(filePath, protectedFiles)
+    || infoIsProtected(current, protectedFiles)) {
+    throw new Error("temporary file aliases a protected file before removal");
+  }
+  unlinkSync(filePath);
+  return true;
 }
 
 export async function isNonEmptyFile(filePath) {

@@ -90,6 +90,19 @@ function sameFile(firstPath, secondPath, fileOps) {
   return Boolean(first && second && first.dev === second.dev && first.ino === second.ino);
 }
 
+function infoIsProtected(info, protectedFiles) {
+  return Boolean(info) && protectedFiles.some((protectedFile) =>
+    hasFileIdentity(info, protectedFile?.identity));
+}
+
+function pathIsProtected(filePath, protectedFiles) {
+  const resolved = path.resolve(filePath);
+  return protectedFiles.some((protectedFile) =>
+    (typeof protectedFile?.path === "string" && path.resolve(protectedFile.path) === resolved)
+      || (typeof protectedFile?.canonicalPath === "string"
+        && path.resolve(protectedFile.canonicalPath) === resolved));
+}
+
 function verifyStageShell(stage, fileOps) {
   const token = stageToken(stage.generationPath);
   if (!token
@@ -576,6 +589,11 @@ export function publishFrameSync(prepared, finalPath, fileOps) {
   if (sameFile(prepared.sourcePath, finalPath, fileOps)) {
     throw frameConflict("Frame output must not alias the local video");
   }
+  const protectedFiles = prepared.protectedFiles ?? [];
+  if (pathIsProtected(finalPath, protectedFiles)
+    || infoIsProtected(statOrNull(finalPath, fileOps), protectedFiles)) {
+    throw frameConflict("Frame output must not alias a protected local file");
+  }
 
   const priorFinal = lstatOrNull(finalPath, fileOps);
   if (priorFinal) {
@@ -588,6 +606,9 @@ export function publishFrameSync(prepared, finalPath, fileOps) {
     if (!isOwnedRegularFile(backupInfo, fileIdentity(priorFinal))) {
       throw frameConflict("Existing frame backup identity changed");
     }
+    if (infoIsProtected(backupInfo, protectedFiles)) {
+      throw frameConflict("Existing frame output changed or aliases a protected local file");
+    }
     prepared.backupPath = backupPath;
     prepared.backupIdentity = fileIdentity(backupInfo);
     prepared.preserveBackup = true;
@@ -599,6 +620,9 @@ export function publishFrameSync(prepared, finalPath, fileOps) {
     const currentFinal = lstatOrNull(finalPath, fileOps);
     if (!isOwnedRegularFile(currentFinal, fileIdentity(priorFinal))) {
       throw frameConflict("Existing frame output changed or aliases the local video");
+    }
+    if (infoIsProtected(currentFinal, protectedFiles)) {
+      throw frameConflict("Existing frame output changed or aliases a protected local file");
     }
     fileOps.unlink(finalPath);
   }

@@ -1830,6 +1830,42 @@ test("atomic no-overwrite rejects a source alias introduced in the final publica
   assert.equal((await workspace.loadManifest()).revision, 1);
 });
 
+test("frame publication retains a caption hard link introduced after orchestration validation", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-frame-protected-caption-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = await openWorkspace({
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source,
+  });
+  const manifest = await workspace.loadManifest();
+  const manifestBytes = await readFile(workspace.manifestPath, "utf8");
+  const prepared = await preparedFrame(workspace, t);
+  const captionPath = path.join(root, "lesson.vtt");
+  const finalPath = path.join(workspace.imagesDir, prepared.frame.filename);
+  await writeFile(captionPath, "protected-caption-bytes");
+  const captionBefore = await lstat(captionPath);
+  await link(captionPath, finalPath);
+  prepared.protectedFiles = [{
+    label: "caption",
+    path: captionPath,
+    canonicalPath: captionPath,
+    identity: identity(captionBefore),
+  }];
+
+  await assert.rejects(
+    workspace.commitFrame(manifest, prepared),
+    OutputConflictError,
+  );
+
+  assert.equal(await readFile(captionPath, "utf8"), "protected-caption-bytes");
+  assert.equal(await readFile(finalPath, "utf8"), "protected-caption-bytes");
+  assert.deepEqual(identity(await lstat(captionPath)), identity(captionBefore));
+  assert.deepEqual(identity(await lstat(finalPath)), identity(captionBefore));
+  assert.equal(await readFile(workspace.manifestPath, "utf8"), manifestBytes);
+});
+
 test("publication rechecks the retained staged inode synchronously and a real resume cleans the owned residue", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "v2w-stage-publication-recheck-"));
   t.after(() => rm(root, { recursive: true, force: true }));

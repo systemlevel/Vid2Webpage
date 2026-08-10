@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
 import {
+  linkSync,
+  lstatSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import {
   link,
   mkdir,
   mkdtemp,
@@ -51,6 +57,7 @@ async function makeHarness({
   cacheRoot: selectedCacheRoot,
   removalFailures = [],
   renderHook,
+  audioWriteHook,
 } = {}) {
   const calls = [];
   const removed = [];
@@ -182,12 +189,19 @@ async function makeHarness({
       manifest = { ...manifest, source: manifest.source ?? source };
       return workspace;
     },
-    extractAudio: async ({ inputPath, outputPath }) => {
+    extractAudio: async ({ inputPath, output, outputPath, protectedFiles }) => {
       calls.push("extract-audio");
       assert.equal(inputPath, kind === "local" ? sourcePath : videoPath);
-      const selectedPath = extractedAudioPath ?? outputPath;
-      if (!extractedAudioPath) await writeFile(selectedPath, "audio");
-      return selectedPath;
+      if (audioWriteHook) {
+        return audioWriteHook({ output, outputPath, protectedFiles });
+      }
+      if (extractedAudioPath) return extractedAudioPath;
+      if (output) {
+        writeFileSync(output.fd, "audio");
+        return undefined;
+      }
+      await writeFile(outputPath, "audio");
+      return outputPath;
     },
     loadVocabPrompt: async () => {
       calls.push("load-vocab");
@@ -238,9 +252,18 @@ async function makeHarness({
         filename: "000004000-primary.jpg",
       }];
     },
-    extractFrames: async ({ videoPath: requestedVideoPath, captures, manifest: value }) => {
+    extractFrames: async ({
+      videoPath: requestedVideoPath,
+      captures,
+      manifest: value,
+      protectedFiles,
+    }) => {
       calls.push("extract-frames");
       assert.equal(requestedVideoPath, kind === "local" ? sourcePath : videoPath);
+      assert.deepEqual(
+        protectedFiles.map((protectedFile) => protectedFile.label),
+        kind === "local" ? ["video", ...(captionPath ? ["caption"] : [])] : [],
+      );
       assert.ok(calls.indexOf("save-manifest") < calls.indexOf("extract-frames"));
       assert.equal(value.segments[0].text, "Whisper words");
       assert.equal(Object.hasOwn(captures[0], "segmentIndex"), false);
@@ -258,9 +281,19 @@ async function makeHarness({
         }],
       };
     },
-    renderOutput: async ({ workspace: requestedWorkspace, manifest: value, segments, transcriptVttPath }) => {
+    renderOutput: async ({
+      workspace: requestedWorkspace,
+      manifest: value,
+      segments,
+      transcriptVttPath,
+      protectedFiles,
+    }) => {
       calls.push("render-output");
       assert.equal(requestedWorkspace, workspace);
+      assert.deepEqual(
+        protectedFiles.map((protectedFile) => protectedFile.label),
+        kind === "local" ? ["video", ...(captionPath ? ["caption"] : [])] : [],
+      );
       assert.equal(segments[0].text, "Whisper words");
       assert.doesNotMatch(JSON.stringify(segments), /caption poison|returned cue poison/);
       assert.equal(transcriptVttPath, path.join(cacheDir, "transcript.vtt"));
@@ -309,6 +342,55 @@ async function makeHarness({
 
   return { calls, removed, services, workspace, cacheDir, videoPath };
 }
+
+test("audio extraction writes only through its owned capability when the final path becomes a protected hard link", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-app-audio-capability-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const sourcePath = path.join(root, "lesson.mov");
+  const sidecarPath = path.join(root, "lesson.vtt");
+  await writeFile(sourcePath, "local-video");
+  await writeFile(sidecarPath, captionVtt);
+  const sourceBefore = await stat(sourcePath);
+  const sidecarBefore = await stat(sidecarPath);
+  let audioPath;
+  const harness = await makeHarness({
+    kind: "local",
+    root,
+    sourcePath,
+    captionPath: sidecarPath,
+    audioWriteHook: async ({ output, outputPath }) => {
+      if (output) {
+        await link(sidecarPath, audioPath);
+        writeFileSync(output.fd, "owned-audio");
+        return undefined;
+      }
+      await link(sidecarPath, outputPath);
+      await writeFile(outputPath, "unsafe-audio");
+      return outputPath;
+    },
+  });
+  audioPath = path.join(harness.cacheDir, "audio.m4a");
+
+  await assert.rejects(runPipeline({
+    input: sourcePath,
+    cwd: root,
+    env: { XDG_CACHE_HOME: path.join(root, "cache-parent") },
+  }, harness.services), SourceError);
+
+  assert.equal(await readFile(sourcePath, "utf8"), "local-video");
+  assert.equal(await readFile(sidecarPath, "utf8"), captionVtt);
+  assert.equal(await readFile(audioPath, "utf8"), captionVtt);
+  const sourceAfter = await stat(sourcePath);
+  const sidecarAfter = await stat(sidecarPath);
+  assert.deepEqual(
+    { dev: sourceAfter.dev, ino: sourceAfter.ino },
+    { dev: sourceBefore.dev, ino: sourceBefore.ino },
+  );
+  assert.deepEqual(
+    { dev: sidecarAfter.dev, ino: sidecarAfter.ino },
+    { dev: sidecarBefore.dev, ino: sidecarBefore.ino },
+  );
+});
 
 for (const kind of ["local", "youtube"]) {
   test(`runs the complete ${kind} flow with Whisper-authoritative text`, async (t) => {
@@ -662,6 +744,71 @@ for (const aliasKind of ["symlink", "hard-link"]) {
     assert.deepEqual(harness.removed, []);
   });
 }
+
+test("cleanup retains and warns when its owned audio target swaps to a protected hard link at removal", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-app-cleanup-removal-race-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const sourcePath = path.join(root, "lesson.mov");
+  const sidecarPath = path.join(root, "lesson.vtt");
+  await writeFile(sourcePath, "local-video");
+  await writeFile(sidecarPath, captionVtt);
+  const sidecarBefore = await stat(sidecarPath);
+  const warnings = [];
+  let rendered = false;
+  let swapped = false;
+  const harness = await makeHarness({
+    kind: "local",
+    root,
+    sourcePath,
+    captionPath: sidecarPath,
+    renderHook: async () => { rendered = true; },
+  });
+  const audioPath = path.join(harness.cacheDir, "audio.m4a");
+  const matchIdentity = harness.services.pathMatchesFileIdentity;
+  harness.services.pathMatchesFileIdentity = async (file, protectedFile) => {
+    const matches = await matchIdentity(file, protectedFile);
+    if (rendered
+      && !swapped
+      && file === audioPath
+      && protectedFile.label === "caption") {
+      unlinkSync(audioPath);
+      linkSync(sidecarPath, audioPath);
+      swapped = true;
+    }
+    return matches;
+  };
+  const unsafeRemove = harness.services.removeTemporary;
+  harness.services.removeTemporary = async (file, options) => {
+    if (!options?.expectedIdentity) return unsafeRemove(file);
+    const current = lstatSync(file);
+    if (current.dev !== options.expectedIdentity.dev
+      || current.ino !== options.expectedIdentity.ino) {
+      throw new Error("temporary file ownership changed before removal");
+    }
+    unlinkSync(file);
+    return undefined;
+  };
+
+  const completed = await runPipeline({
+    input: sourcePath,
+    cwd: root,
+    env: { XDG_CACHE_HOME: path.join(root, "cache-parent") },
+    onWarning: (message) => warnings.push(message),
+  }, harness.services);
+
+  assert.equal(completed.status, "complete");
+  assert.equal(swapped, true);
+  assert.equal(await readFile(sidecarPath, "utf8"), captionVtt);
+  assert.equal(await readFile(audioPath, "utf8"), captionVtt);
+  const sidecarAfter = await stat(sidecarPath);
+  assert.deepEqual(
+    { dev: sidecarAfter.dev, ino: sidecarAfter.ino },
+    { dev: sidecarBefore.dev, ino: sidecarBefore.ino },
+  );
+  assert.deepEqual(warnings, [
+    `Unable to remove temporary file ${audioPath}: temporary file ownership changed before removal`,
+  ]);
+});
 
 for (const relation of ["equal", "descendant", "ancestor", "symlink alias"]) {
   test(`rejects output with ${relation} canonical overlap with the fingerprint cache`, async (t) => {

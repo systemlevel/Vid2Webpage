@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { writeFileSync } from "node:fs";
 import { link, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -62,8 +63,15 @@ test("audio extraction writes AAC without touching the source", async (t) => {
   const inputPath = path.join(dir, "source.mov");
   const outputPath = path.join(dir, "audio.m4a");
   await writeFile(inputPath, "source video");
-  const run = async (_command, args) => {
-    await writeFile(args.at(-1), "aac");
+  const run = async (command, args, options) => {
+    assert.equal(command, "ffmpeg");
+    assert.deepEqual(args, [
+      "-y", "-i", inputPath,
+      "-vn", "-acodec", "aac", "-b:a", "128k",
+      "-f", "ipod", "/dev/fd/3",
+    ]);
+    assert.equal(Number.isSafeInteger(options.stdio[3]), true);
+    writeFileSync(options.stdio[3], "aac");
     return { code: 0, stdout: "", stderr: "" };
   };
   assert.deepEqual(buildExtractAudioArgs(inputPath, outputPath), [

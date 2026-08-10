@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -17,6 +17,8 @@ import {
   isNonEmptyFile,
   pathMatchesFileIdentity,
   pathsReferToSameFile,
+  removeOwnedFile,
+  reserveOwnedArtifact,
 } from "./fs.mjs";
 import { discoverLocalCaption, extractAudio, probeMedia } from "./media.mjs";
 import { defaultCacheRoot, preflight } from "./preflight.mjs";
@@ -67,7 +69,7 @@ export const DEFAULT_SERVICES = Object.freeze({
   preflight,
   probeMedia,
   readText: (file) => readFile(file, "utf8"),
-  removeTemporary: (file) => rm(file, { force: true }),
+  removeTemporary: removeOwnedFile,
   renderOutput,
   safeOutputName,
   transcribeTimed,
@@ -138,11 +140,29 @@ async function transcribeAuthoritatively({
 }) {
   const audioOutputPath = path.join(cacheDir, "audio.m4a");
   await rejectProtectedAlias(audioOutputPath, protectedFiles, services, "Audio output");
-  const audioPath = await services.extractAudio({
-    inputPath: videoPath,
-    outputPath: audioOutputPath,
-  });
-  await rejectProtectedAlias(audioPath, protectedFiles, services, "Extracted audio");
+  const audioReservation = await reserveOwnedArtifact(audioOutputPath);
+  let audioArtifact;
+  try {
+    try {
+      const extractionResult = await services.extractAudio({
+        inputPath: videoPath,
+        output: audioReservation.writer,
+        protectedFiles,
+      });
+      if (extractionResult !== undefined) {
+        throw new SourceError("Audio extraction must use only the provided output capability");
+      }
+      audioArtifact = await audioReservation.publish({ protectedFiles });
+    } catch (error) {
+      if (error instanceof SourceError) throw error;
+      throw new SourceError(`Unable to publish extracted audio: ${audioOutputPath}`, {
+        cause: error,
+      });
+    }
+  } finally {
+    await audioReservation.discard();
+  }
+  const audioPath = audioArtifact.path;
   const canonicalVttPath = path.join(cacheDir, "transcript.vtt");
   await rejectProtectedAlias(
     canonicalVttPath,
@@ -176,6 +196,7 @@ async function transcribeAuthoritatively({
     );
   }
   return {
+    audioArtifact,
     audioPath,
     engine: transcript.engine,
     vttPath: canonicalVttPath,
@@ -247,12 +268,17 @@ async function cleanupAfterSuccess({
   protectedFiles,
   services,
 }) {
-  for (const file of new Set(files)) {
+  const uniqueFiles = new Map(files.map((file) => [file.path, file]));
+  for (const fileRecord of uniqueFiles.values()) {
+    const file = fileRecord.path;
     if (!isContainedCacheFile(file, cacheDir)) continue;
     try {
       if ((await Promise.all(protectedFiles.map((protectedFile) =>
         services.pathMatchesFileIdentity(file, protectedFile)))).some(Boolean)) continue;
-      await services.removeTemporary(file);
+      await services.removeTemporary(file, {
+        expectedIdentity: fileRecord.identity,
+        protectedFiles,
+      });
     } catch (error) {
       try {
         onWarning(
@@ -263,6 +289,13 @@ async function cleanupAfterSuccess({
       }
     }
   }
+}
+
+async function ownedTemporary(file, services) {
+  return {
+    path: file,
+    identity: (await services.captureFileIdentity(file)).identity,
+  };
 }
 
 function manifestSource({ classified, metadata, fingerprint, mediaInfo, title }) {
@@ -328,7 +361,7 @@ export async function runPipeline(
       url: classified.url,
       cacheDir,
     });
-    cleanupFiles.push(videoPath);
+    cleanupFiles.push(await ownedTemporary(videoPath, services));
     captionPath = await services.downloadYoutubeCaption({
       url: classified.url,
       cacheDir,
@@ -402,7 +435,7 @@ export async function runPipeline(
       protectedFiles,
       services,
     });
-    cleanupFiles.push(transcript.audioPath);
+    cleanupFiles.push(transcript.audioArtifact);
   }
 
   const captionCues = await optionalCaptionCues(captionPath, services);
@@ -437,6 +470,7 @@ export async function runPipeline(
     captures,
     workspace,
     manifest,
+    protectedFiles,
   });
   for (const filename of ["transcript.vtt", "styles.css", "index.html"]) {
     await rejectProtectedAlias(
@@ -452,6 +486,7 @@ export async function runPipeline(
     manifest,
     segments: transcript.segments,
     transcriptVttPath: transcript.vttPath,
+    protectedFiles,
   });
 
   await cleanupAfterSuccess({

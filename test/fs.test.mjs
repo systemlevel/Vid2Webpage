@@ -7,6 +7,7 @@ import {
   readFile,
   realpath,
   rm,
+  stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -20,6 +21,7 @@ import {
   copyFileAtomic,
   isNonEmptyFile,
   pathMatchesFileIdentity,
+  removeOwnedFile,
   writeFileAtomic,
 } from "../src/fs.mjs";
 
@@ -98,4 +100,34 @@ test("captured file identity recognizes direct, symlink, and hard-link aliases",
   assert.equal(await pathMatchesFileIdentity(symbolic, captured), true);
   assert.equal(await pathMatchesFileIdentity(hard, captured), true);
   assert.equal(await pathMatchesFileIdentity(path.join(dir, "missing.vtt"), captured), false);
+});
+
+test("owned removal retains a protected hard link that replaced the recorded artifact", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "v2w-owned-removal-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const audioPath = path.join(dir, "audio.m4a");
+  const captionPath = path.join(dir, "caption.vtt");
+  await writeFile(audioPath, "owned-audio");
+  await writeFile(captionPath, "protected-caption");
+  const audioIdentity = await stat(audioPath);
+  const protectedCaption = {
+    ...(await captureFileIdentity(captionPath)),
+    path: captionPath,
+    label: "caption",
+  };
+  await rm(audioPath);
+  await link(captionPath, audioPath);
+
+  assert.throws(() => removeOwnedFile(audioPath, {
+    expectedIdentity: { dev: audioIdentity.dev, ino: audioIdentity.ino },
+    protectedFiles: [protectedCaption],
+  }), /ownership changed/);
+  assert.equal(await readFile(captionPath, "utf8"), "protected-caption");
+  assert.equal(await readFile(audioPath, "utf8"), "protected-caption");
+  const captionAfter = await stat(captionPath);
+  const aliasAfter = await stat(audioPath);
+  assert.deepEqual(
+    { dev: aliasAfter.dev, ino: aliasAfter.ino },
+    { dev: captionAfter.dev, ino: captionAfter.ino },
+  );
 });

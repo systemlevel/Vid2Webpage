@@ -1,7 +1,14 @@
+import { fstatSync } from "node:fs";
 import path from "node:path";
 
 import { SourceError } from "./errors.mjs";
-import { isNonEmptyFile, pathsReferToSameFile } from "./fs.mjs";
+import {
+  captureFileIdentity,
+  hasFileIdentity,
+  isNonEmptyFile,
+  pathsReferToSameFile,
+  reserveOwnedArtifact,
+} from "./fs.mjs";
 import { runCommand } from "./process.mjs";
 
 function mediaError(videoPath, message, cause) {
@@ -18,6 +25,27 @@ function frameRate(value) {
 
 export function buildExtractAudioArgs(inputPath, outputPath) {
   return ["-y", "-i", inputPath, "-vn", "-acodec", "aac", "-b:a", "128k", outputPath];
+}
+
+function buildCapabilityAudioArgs(inputPath, childFd) {
+  return [
+    "-y", "-i", inputPath,
+    "-vn", "-acodec", "aac", "-b:a", "128k",
+    "-f", "ipod", `/dev/fd/${childFd}`,
+  ];
+}
+
+function verifyAudioCapability(output, protectedFiles, { requireNonEmpty = false } = {}) {
+  if (!Number.isSafeInteger(output?.fd) || output.fd < 0) {
+    throw new TypeError("Audio output capability is invalid");
+  }
+  const info = fstatSync(output.fd);
+  if (!info.isFile()
+    || (requireNonEmpty && info.size <= 0)
+    || protectedFiles.some((protectedFile) =>
+      hasFileIdentity(info, protectedFile?.identity))) {
+    throw new Error("Audio output capability is not an owned non-protected file");
+  }
 }
 
 export async function probeMedia(videoPath, { run = runCommand } = {}) {
@@ -75,20 +103,66 @@ export async function probeMedia(videoPath, { run = runCommand } = {}) {
   };
 }
 
-export async function extractAudio({ inputPath, outputPath, run = runCommand }) {
-  if (await pathsReferToSameFile(inputPath, outputPath)) {
-    throw mediaError(inputPath, "Audio output must not overwrite local video");
+export async function extractAudio({
+  inputPath,
+  output,
+  outputPath,
+  protectedFiles = [],
+  run = runCommand,
+}) {
+  if (!output) {
+    if (typeof outputPath !== "string" || outputPath.length === 0) {
+      throw mediaError(inputPath, "Audio output capability is required");
+    }
+    if (await pathsReferToSameFile(inputPath, outputPath)) {
+      throw mediaError(inputPath, "Audio output must not overwrite local video");
+    }
+    const inputIdentity = {
+      ...(await captureFileIdentity(inputPath)),
+      path: inputPath,
+      label: "video",
+    };
+    const effectiveProtectedFiles = protectedFiles.some((protectedFile) =>
+      hasFileIdentity(protectedFile?.identity, inputIdentity.identity))
+      ? protectedFiles
+      : [...protectedFiles, inputIdentity];
+    const reservation = await reserveOwnedArtifact(outputPath);
+    try {
+      await extractAudio({
+        inputPath,
+        output: reservation.writer,
+        protectedFiles: effectiveProtectedFiles,
+        run,
+      });
+      return (await reservation.publish({
+        protectedFiles: effectiveProtectedFiles,
+      })).path;
+    } finally {
+      await reservation.discard();
+    }
   }
+
+  verifyAudioCapability(output, protectedFiles);
+  const childFd = 3;
   let result;
   try {
-    result = await run("ffmpeg", buildExtractAudioArgs(inputPath, outputPath));
+    result = await run(
+      "ffmpeg",
+      buildCapabilityAudioArgs(inputPath, childFd),
+      { stdio: ["ignore", "pipe", "pipe", output.fd] },
+    );
   } catch (error) {
     throw mediaError(inputPath, "Unable to extract audio", error);
   }
-  if (result.code !== 0 || !(await isNonEmptyFile(outputPath))) {
+  try {
+    verifyAudioCapability(output, protectedFiles, { requireNonEmpty: true });
+  } catch (error) {
+    throw mediaError(inputPath, "Unable to extract audio", error);
+  }
+  if (result.code !== 0) {
     throw mediaError(inputPath, "Unable to extract audio");
   }
-  return outputPath;
+  return undefined;
 }
 
 export async function discoverLocalCaption({
