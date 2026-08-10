@@ -629,6 +629,9 @@ export async function openWorkspace({
     const backupPath = typeof stage.backupPath === "string"
       ? path.resolve(stage.backupPath)
       : undefined;
+    const backupStatePath = typeof stage.backupStatePath === "string"
+      ? path.resolve(stage.backupStatePath)
+      : undefined;
     if (!token || !/^[0-9a-f-]+$/u.test(token)
       || path.dirname(generationPath) !== path.resolve(imagesDir)
       || path.dirname(ownerPath) !== generationPath
@@ -640,7 +643,11 @@ export async function openWorkspace({
       || (backupPath !== undefined
         && (path.dirname(backupPath) !== generationPath
           || path.basename(backupPath) !== `previous-${token}`
-          || !isValidIdentity(stage.backupIdentity)))) {
+          || !isValidIdentity(stage.backupIdentity)))
+      || (backupStatePath !== undefined
+        && (path.dirname(backupStatePath) !== generationPath
+          || path.basename(backupStatePath) !== `prior-${token}.json`
+          || !isValidIdentity(stage.backupStateIdentity)))) {
       throw conflict("Frame stage cleanup path or identity is invalid");
     }
     return {
@@ -649,6 +656,7 @@ export async function openWorkspace({
       ownerPath,
       tempPath,
       backupPath,
+      backupStatePath,
     };
   }
 
@@ -688,6 +696,16 @@ export async function openWorkspace({
   async function commitPreparedFrame(current, preparedFrame) {
     const prepared = validatePreparedFrame(preparedFrame);
     const finalPath = assertSafeFilename(prepared.frame.filename, imagesDir);
+    prepared.priorRevision = current.revision;
+    prepared.priorFrame = current.images.find((image) =>
+      image.filename === prepared.frame.filename) ?? null;
+    const reflectStageState = () => {
+      preparedFrame.backupPath = prepared.backupPath;
+      preparedFrame.backupIdentity = prepared.backupIdentity;
+      preparedFrame.backupStatePath = prepared.backupStatePath;
+      preparedFrame.backupStateIdentity = prepared.backupStateIdentity;
+      preparedFrame.preserveBackup = prepared.preserveBackup;
+    };
     const images = [
       ...current.images.filter((image) => image.filename !== prepared.frame.filename),
       prepared.frame,
@@ -703,9 +721,7 @@ export async function openWorkspace({
     try {
       publishFrameSync(prepared, finalPath, resolvedFrameFileOps);
     } catch (error) {
-      preparedFrame.backupPath = prepared.backupPath;
-      preparedFrame.backupIdentity = prepared.backupIdentity;
-      preparedFrame.preserveBackup = prepared.preserveBackup;
+      reflectStageState();
       if (error instanceof FrameStageConflictError) throw conflict(error.message);
       throw error;
     }
@@ -722,6 +738,7 @@ export async function openWorkspace({
         throw conflict("Frame manifest failure injection must be synchronous");
       }
       writtenManifest = await writeManifest(nextManifest);
+      prepared.preserveBackup = false;
     } catch (error) {
       try {
         rollbackFramePublicationSync(prepared, finalPath, resolvedFrameFileOps);
@@ -730,15 +747,11 @@ export async function openWorkspace({
           error.cause = rollbackError;
         }
       }
-      preparedFrame.backupPath = prepared.backupPath;
-      preparedFrame.backupIdentity = prepared.backupIdentity;
-      preparedFrame.preserveBackup = prepared.preserveBackup;
+      reflectStageState();
       throw error;
     }
 
-    preparedFrame.backupPath = prepared.backupPath;
-    preparedFrame.backupIdentity = prepared.backupIdentity;
-    preparedFrame.preserveBackup = prepared.preserveBackup;
+    reflectStageState();
     return writtenManifest;
   }
 
@@ -757,6 +770,7 @@ export async function openWorkspace({
       }
       const blockedStages = recoverFrameStagesSync(imagesDir, resolvedFrameFileOps, {
         preserveGeneration,
+        manifest: current,
       });
       if (blockedStages.length > 0) {
         throw conflict(`Abandoned frame generation changed during recovery: ${blockedStages[0]}`);

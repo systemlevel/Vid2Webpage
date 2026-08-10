@@ -354,6 +354,8 @@ export async function extractFrames({
         } finally {
           reservation.backupPath = preparedFrame.backupPath;
           reservation.backupIdentity = preparedFrame.backupIdentity;
+          reservation.backupStatePath = preparedFrame.backupStatePath;
+          reservation.backupStateIdentity = preparedFrame.backupStateIdentity;
           reservation.preserveBackup = preparedFrame.preserveBackup;
         }
         log?.info?.(`Extracted frame ${capture.filename}`);

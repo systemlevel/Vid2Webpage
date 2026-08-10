@@ -7,12 +7,15 @@ import {
   rmdirSync,
   statSync,
   unlinkSync,
+  writeFileSync,
 } from "node:fs";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 import { fileIdentity, hasFileIdentity } from "./fs.mjs";
 
 const generationPattern = /^\.v2w-frame-stage-([0-9a-f-]+)$/u;
+const backupStateSchemaVersion = 1;
 
 const nativeFrameFileOps = {
   fstat: fstatSync,
@@ -23,6 +26,7 @@ const nativeFrameFileOps = {
   rmdir: rmdirSync,
   stat: statSync,
   unlink: unlinkSync,
+  writeFile: writeFileSync,
 };
 
 export class FrameStageConflictError extends Error {
@@ -175,8 +179,25 @@ export function cleanupFrameStageSync(stage, fileOps) {
   if (stage.tempIdentity) {
     unlinkOwnedRegularFile(stage.tempPath, stage.tempIdentity, fileOps, errors);
   }
+  let backupRemoved = true;
   if (stage.backupPath && stage.backupIdentity && !stage.preserveBackup) {
-    unlinkOwnedRegularFile(stage.backupPath, stage.backupIdentity, fileOps, errors);
+    backupRemoved = unlinkOwnedRegularFile(
+      stage.backupPath,
+      stage.backupIdentity,
+      fileOps,
+      errors,
+    );
+  }
+  if (backupRemoved
+    && stage.backupStatePath
+    && stage.backupStateIdentity
+    && !stage.preserveBackup) {
+    unlinkOwnedRegularFile(
+      stage.backupStatePath,
+      stage.backupStateIdentity,
+      fileOps,
+      errors,
+    );
   }
   removeOwnerLast(stage, fileOps, errors);
 
@@ -277,7 +298,116 @@ function removeCapturedGeneration(snapshot, fileOps) {
   return lstatOrNull(snapshot.generationPath, fileOps) === null;
 }
 
-export function recoverFrameStagesSync(imagesDir, fileOps, { preserveGeneration } = {}) {
+function currentManifestFrame(manifest, filename) {
+  return manifest.images.find((frame) => frame.filename === filename) ?? null;
+}
+
+function readPriorBackupState(snapshot, imagesDir, fileOps) {
+  const stateName = backupStateFilename(snapshot.token);
+  const backupName = `previous-${snapshot.token}`;
+  const stateMember = snapshot.members.find((member) => member.name === stateName);
+  const backupMember = snapshot.members.find((member) => member.name === backupName);
+  if (!stateMember && !backupMember) return null;
+  if (!stateMember) return false;
+
+  let state;
+  try {
+    state = JSON.parse(fileOps.readFile(stateMember.path, "utf8"));
+  } catch {
+    return false;
+  }
+  let currentStateInfo;
+  try {
+    currentStateInfo = lstatOrNull(stateMember.path, fileOps);
+  } catch {
+    return false;
+  }
+  const finalPath = typeof state?.filename === "string"
+    ? path.resolve(imagesDir, state.filename)
+    : "";
+  if (!isOwnedRegularFile(currentStateInfo, stateMember.identity)
+    || state?.schemaVersion !== backupStateSchemaVersion
+    || state.token !== snapshot.token
+    || typeof state.filename !== "string"
+    || state.filename !== path.basename(state.filename)
+    || path.extname(state.filename).toLowerCase() !== ".jpg"
+    || path.dirname(finalPath) !== path.resolve(imagesDir)
+    || !Number.isSafeInteger(state.priorRevision)
+    || state.priorRevision < 0
+    || state.nextRevision !== state.priorRevision + 1
+    || !(state.priorFrame === null || typeof state.priorFrame === "object")
+    || !state.nextFrame || typeof state.nextFrame !== "object"
+    || state.nextFrame.filename !== state.filename
+    || (state.priorFrame !== null && state.priorFrame.filename !== state.filename)
+    || !isSafeIdentity(state.tempIdentity)
+    || !isSafeIdentity(state.backupIdentity)
+    || !(state.sourceIdentity === null || isSafeIdentity(state.sourceIdentity))
+    || (backupMember
+      && !hasFileIdentity(backupMember.identity, state.backupIdentity))) {
+    return false;
+  }
+  return { backupMember, finalPath, state };
+}
+
+function recoverPriorBackup(snapshot, imagesDir, manifest, fileOps) {
+  const recovery = readPriorBackupState(snapshot, imagesDir, fileOps);
+  if (recovery === null) return null;
+  if (recovery === false || !manifest) return false;
+  const { backupMember, finalPath, state } = recovery;
+  const currentFrame = currentManifestFrame(manifest, state.filename);
+  let finalInfo;
+  try {
+    finalInfo = lstatOrNull(finalPath, fileOps);
+  } catch {
+    return false;
+  }
+
+  const committed = manifest.revision === state.nextRevision
+    && isDeepStrictEqual(currentFrame, state.nextFrame);
+  if (committed) {
+    if (!isOwnedRegularFile(finalInfo, state.tempIdentity)) return false;
+    return removeCapturedGeneration(snapshot, fileOps);
+  }
+
+  const priorManifest = state.priorFrame !== null
+    && manifest.revision === state.priorRevision
+    && isDeepStrictEqual(currentFrame, state.priorFrame);
+  if (!priorManifest) return false;
+  if (state.sourceIdentity
+    && hasFileIdentity(state.backupIdentity, state.sourceIdentity)) return false;
+
+  if (!isOwnedRegularFile(finalInfo, state.backupIdentity)) {
+    if (!backupMember
+      || !hasFileIdentity(backupMember.identity, state.backupIdentity)) return false;
+    if (finalInfo) {
+      const removablePublished = isOwnedRegularFile(finalInfo, state.tempIdentity);
+      const removableAnchored = finalInfo.isFile()
+        && !finalInfo.isSymbolicLink()
+        && Number.isSafeInteger(finalInfo.nlink)
+        && finalInfo.nlink > 1;
+      if (!removablePublished && !removableAnchored) return false;
+      try {
+        fileOps.unlink(finalPath);
+      } catch {
+        return false;
+      }
+    }
+    try {
+      fileOps.link(backupMember.path, finalPath);
+      finalInfo = lstatOrNull(finalPath, fileOps);
+    } catch {
+      return false;
+    }
+    if (!isOwnedRegularFile(finalInfo, state.backupIdentity)) return false;
+  }
+  return removeCapturedGeneration(snapshot, fileOps);
+}
+
+export function recoverFrameStagesSync(
+  imagesDir,
+  fileOps,
+  { preserveGeneration, manifest } = {},
+) {
   const blocked = [];
   const entries = fileOps.readdir(imagesDir, { withFileTypes: true });
   for (const entry of entries) {
@@ -287,7 +417,15 @@ export function recoverFrameStagesSync(imagesDir, fileOps, { preserveGeneration 
     if (preserveGeneration
       && path.resolve(preserveGeneration) === path.resolve(generationPath)) continue;
     const snapshot = captureGeneration(generationPath, token, fileOps);
-    if (!snapshot || !removeCapturedGeneration(snapshot, fileOps)) blocked.push(generationPath);
+    if (!snapshot) {
+      blocked.push(generationPath);
+      continue;
+    }
+    const priorRecovery = recoverPriorBackup(snapshot, imagesDir, manifest, fileOps);
+    if (priorRecovery === true) continue;
+    if (priorRecovery === false || !removeCapturedGeneration(snapshot, fileOps)) {
+      blocked.push(generationPath);
+    }
   }
   return blocked;
 }
@@ -296,22 +434,62 @@ function frameConflict(message, cause) {
   return new FrameStageConflictError(message, cause ? { cause } : undefined);
 }
 
+function backupStateFilename(token) {
+  return `prior-${token}.json`;
+}
+
+function isSafeIdentity(identity) {
+  return identity !== null
+    && typeof identity === "object"
+    && Number.isSafeInteger(identity.dev)
+    && identity.dev >= 0
+    && Number.isSafeInteger(identity.ino)
+    && identity.ino >= 0;
+}
+
+function writePriorBackupState(prepared, fileOps) {
+  const statePath = path.join(
+    prepared.generationPath,
+    backupStateFilename(prepared.token),
+  );
+  const state = {
+    schemaVersion: backupStateSchemaVersion,
+    token: prepared.token,
+    filename: prepared.frame.filename,
+    priorRevision: prepared.priorRevision,
+    priorFrame: prepared.priorFrame,
+    nextRevision: prepared.priorRevision + 1,
+    nextFrame: prepared.frame,
+    tempIdentity: prepared.tempIdentity,
+    backupIdentity: prepared.backupIdentity,
+    sourceIdentity: prepared.sourceIdentity,
+  };
+  fileOps.writeFile(statePath, `${JSON.stringify(state)}\n`, {
+    flag: "wx",
+    mode: 0o600,
+  });
+  const stateInfo = lstatOrNull(statePath, fileOps);
+  if (!stateInfo || !stateInfo.isFile() || stateInfo.isSymbolicLink()) {
+    throw frameConflict("Existing frame backup state identity changed");
+  }
+  prepared.backupStatePath = statePath;
+  prepared.backupStateIdentity = fileIdentity(stateInfo);
+}
+
 function restoreBackupAfterPublishFailure(prepared, finalPath, fileOps, failure) {
   if (!prepared.backupIdentity) return;
+  prepared.preserveBackup = true;
   try {
     const finalInfo = lstatOrNull(finalPath, fileOps);
     if (!finalInfo) {
       fileOps.link(prepared.backupPath, finalPath);
+    }
+    const restored = lstatOrNull(finalPath, fileOps);
+    if (isOwnedRegularFile(restored, prepared.backupIdentity)) {
       prepared.preserveBackup = false;
       return;
     }
-    if (hasFileIdentity(finalInfo, prepared.backupIdentity)) {
-      prepared.preserveBackup = false;
-      return;
-    }
-    prepared.preserveBackup = true;
   } catch (restoreError) {
-    prepared.preserveBackup = true;
     if (failure && typeof failure === "object" && failure.cause === undefined) {
       failure.cause = restoreError;
     }
@@ -345,14 +523,14 @@ export function publishFrameSync(prepared, finalPath, fileOps) {
     }
     prepared.backupPath = backupPath;
     prepared.backupIdentity = fileIdentity(backupInfo);
+    prepared.preserveBackup = true;
+    writePriorBackupState(prepared, fileOps);
 
     if (sameFile(prepared.sourcePath, backupPath, fileOps)) {
-      prepared.preserveBackup = true;
       throw frameConflict("Existing frame output changed or aliases the local video");
     }
     const currentFinal = lstatOrNull(finalPath, fileOps);
     if (!isOwnedRegularFile(currentFinal, fileIdentity(priorFinal))) {
-      prepared.preserveBackup = true;
       throw frameConflict("Existing frame output changed or aliases the local video");
     }
     fileOps.unlink(finalPath);
@@ -383,26 +561,20 @@ export function publishFrameSync(prepared, finalPath, fileOps) {
 
 export function rollbackFramePublicationSync(prepared, finalPath, fileOps) {
   if (!prepared.backupIdentity) return;
+  prepared.preserveBackup = true;
   const backupInfo = lstatOrNull(prepared.backupPath, fileOps);
   if (!isOwnedRegularFile(backupInfo, prepared.backupIdentity)) {
-    prepared.preserveBackup = true;
     return;
   }
   const finalInfo = lstatOrNull(finalPath, fileOps);
   if (isOwnedRegularFile(finalInfo, prepared.tempIdentity)) {
     fileOps.unlink(finalPath);
     fileOps.link(prepared.backupPath, finalPath);
-    prepared.preserveBackup = false;
-    return;
-  }
-  if (!finalInfo) {
+  } else if (!finalInfo) {
     fileOps.link(prepared.backupPath, finalPath);
-    prepared.preserveBackup = false;
-    return;
   }
-  if (hasFileIdentity(finalInfo, prepared.backupIdentity)) {
+  const restored = lstatOrNull(finalPath, fileOps);
+  if (isOwnedRegularFile(restored, prepared.backupIdentity)) {
     prepared.preserveBackup = false;
-    return;
   }
-  prepared.preserveBackup = true;
 }

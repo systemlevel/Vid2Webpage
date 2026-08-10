@@ -177,6 +177,22 @@ async function frameStageNames(imagesDir) {
   return (await readdir(imagesDir)).filter((entry) => entry.startsWith(".v2w-frame-stage-"));
 }
 
+async function assertProtectedPriorBackup(imagesDir, expectedBytes) {
+  const [stageName, ...extraStages] = await frameStageNames(imagesDir);
+  assert.ok(stageName);
+  assert.deepEqual(extraStages, []);
+  const stagePath = path.join(imagesDir, stageName);
+  const token = stageName.slice(".v2w-frame-stage-".length);
+  const entries = await readdir(stagePath);
+  const ownerNames = entries.filter((entry) => entry === `owner-${token}`);
+  const backupNames = entries.filter((entry) => entry === `previous-${token}`);
+  assert.deepEqual(ownerNames, [`owner-${token}`]);
+  assert.deepEqual(backupNames, [`previous-${token}`]);
+  assert.equal(await readFile(path.join(stagePath, ownerNames[0]), "utf8"), token);
+  assert.equal(await readFile(path.join(stagePath, backupNames[0]), "utf8"), expectedBytes);
+  return { stagePath, token };
+}
+
 test("creates cache, output, images, and an atomic building manifest", async (t) => {
   const workspace = await createWorkspace(t);
   const manifest = await workspace.loadManifest();
@@ -876,6 +892,190 @@ test("prior final is restored after no-overwrite publication failure and resumed
   assert.equal(recovered.revision, 2);
   assert.equal(await readFile(finalPath, "utf8"), "recovered-jpeg");
   assert.equal((await resumed.markComplete(recovered)).status, "complete");
+});
+
+test("prior backup survives a temp lstat failure after final unlink and real resume completes", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-prior-temp-lstat-failure-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const videoPath = path.join(root, "source-video.mov");
+  await writeFile(videoPath, "source-video-bytes");
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source: { ...source, input: videoPath },
+  };
+  const planned = capture();
+  delete planned.width;
+  delete planned.height;
+  const initialWorkspace = await openWorkspace(options);
+  const initial = await extractFrames({
+    videoPath,
+    captures: [planned],
+    workspace: initialWorkspace,
+    manifest: await initialWorkspace.loadManifest(),
+    run: frameRunner("prior-jpeg"),
+    log: { info() {} },
+  });
+  const finalPath = path.join(initialWorkspace.imagesDir, planned.filename);
+  const lstatFailure = Object.assign(new Error("injected post-unlink temp lstat failure"), {
+    code: "EIO",
+  });
+  let priorFinalUnlinked = false;
+  let injected = false;
+  const failingWorkspace = await openWorkspace({
+    ...options,
+    frameFileOps: {
+      lstat(filePath) {
+        if (priorFinalUnlinked
+          && !injected
+          && path.basename(filePath) === planned.filename
+          && path.basename(path.dirname(filePath)).startsWith(".v2w-frame-stage-")) {
+          injected = true;
+          throw lstatFailure;
+        }
+        return lstatSync(filePath);
+      },
+      unlink(filePath) {
+        unlinkSync(filePath);
+        if (filePath === finalPath) priorFinalUnlinked = true;
+      },
+    },
+  });
+  const changed = { ...planned, timestampMs: planned.timestampMs + 1 };
+
+  await assert.rejects(extractFrames({
+    videoPath,
+    captures: [changed],
+    workspace: failingWorkspace,
+    manifest: initial,
+    run: frameRunner("failed-new-jpeg"),
+    log: { info() {} },
+  }), (error) => error instanceof SourceError && error.cause === lstatFailure);
+
+  assert.equal(injected, true);
+  assert.equal((await failingWorkspace.loadManifest()).revision, initial.revision);
+  await assert.rejects(access(finalPath));
+  await assertProtectedPriorBackup(failingWorkspace.imagesDir, "prior-jpeg");
+
+  const resumed = await openWorkspace(options);
+  const recovered = await extractFrames({
+    videoPath,
+    captures: [changed],
+    workspace: resumed,
+    manifest: await resumed.loadManifest(),
+    run: async (command, args) => {
+      if (command === "ffmpeg") {
+        assert.equal(await readFile(finalPath, "utf8"), "prior-jpeg");
+        await writeFile(args.at(-1), "recovered-jpeg");
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      return {
+        code: 0,
+        stdout: JSON.stringify({ streams: [{ width: 640, height: 360 }] }),
+        stderr: "",
+      };
+    },
+    log: { info() {} },
+  });
+  assert.equal(recovered.revision, initial.revision + 1);
+  assert.equal(recovered.images[0].timestampMs, changed.timestampMs);
+  assert.equal(await readFile(finalPath, "utf8"), "recovered-jpeg");
+  assert.equal((await resumed.markComplete(recovered)).status, "complete");
+  assert.deepEqual(await readdir(resumed.imagesDir), [planned.filename]);
+});
+
+test("rollback relink failure retains prior backup and real resume restores then completes", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v2w-prior-rollback-relink-failure-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const videoPath = path.join(root, "source-video.mov");
+  await writeFile(videoPath, "source-video-bytes");
+  const options = {
+    cacheRoot: path.join(root, "cache"),
+    fingerprint: source.fingerprint,
+    outputDir: path.join(root, "output"),
+    source: { ...source, input: videoPath },
+  };
+  const planned = capture();
+  delete planned.width;
+  delete planned.height;
+  const initialWorkspace = await openWorkspace(options);
+  const initial = await extractFrames({
+    videoPath,
+    captures: [planned],
+    workspace: initialWorkspace,
+    manifest: await initialWorkspace.loadManifest(),
+    run: frameRunner("prior-jpeg"),
+    log: { info() {} },
+  });
+  const finalPath = path.join(initialWorkspace.imagesDir, planned.filename);
+  const manifestFailure = new Error("injected frame manifest failure");
+  const relinkFailure = Object.assign(new Error("injected rollback relink failure"), {
+    code: "EIO",
+  });
+  let injected = false;
+  const failingWorkspace = await openWorkspace({
+    ...options,
+    hooks: {
+      beforeFrameManifestWrite() {
+        throw manifestFailure;
+      },
+    },
+    frameFileOps: {
+      link(from, to) {
+        if (!injected
+          && to === finalPath
+          && path.basename(from).startsWith("previous-")) {
+          injected = true;
+          throw relinkFailure;
+        }
+        linkSync(from, to);
+      },
+    },
+  });
+  const changed = { ...planned, timestampMs: planned.timestampMs + 1 };
+
+  await assert.rejects(extractFrames({
+    videoPath,
+    captures: [changed],
+    workspace: failingWorkspace,
+    manifest: initial,
+    run: frameRunner("failed-new-jpeg"),
+    log: { info() {} },
+  }), (error) => error instanceof SourceError
+    && error.cause === manifestFailure
+    && manifestFailure.cause === relinkFailure);
+
+  assert.equal(injected, true);
+  assert.equal((await failingWorkspace.loadManifest()).revision, initial.revision);
+  await assert.rejects(access(finalPath));
+  await assertProtectedPriorBackup(failingWorkspace.imagesDir, "prior-jpeg");
+
+  const resumed = await openWorkspace(options);
+  const recovered = await extractFrames({
+    videoPath,
+    captures: [changed],
+    workspace: resumed,
+    manifest: await resumed.loadManifest(),
+    run: async (command, args) => {
+      if (command === "ffmpeg") {
+        assert.equal(await readFile(finalPath, "utf8"), "prior-jpeg");
+        await writeFile(args.at(-1), "recovered-jpeg");
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      return {
+        code: 0,
+        stdout: JSON.stringify({ streams: [{ width: 640, height: 360 }] }),
+        stderr: "",
+      };
+    },
+    log: { info() {} },
+  });
+  assert.equal(recovered.revision, initial.revision + 1);
+  assert.equal(recovered.images[0].timestampMs, changed.timestampMs);
+  assert.equal(await readFile(finalPath, "utf8"), "recovered-jpeg");
+  assert.equal((await resumed.markComplete(recovered)).status, "complete");
+  assert.deepEqual(await readdir(resumed.imagesDir), [planned.filename]);
 });
 
 test("post-manifest backup cleanup failure leaves a committed stage that resume recovers", async (t) => {
